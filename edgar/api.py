@@ -34,6 +34,7 @@ from research_cli_base.http_client import retry_wait_seconds
 
 from edgar import __version__ as CLI_VERSION
 from edgar import compute
+from edgar import insiders as insiders_mod
 from edgar.cache import EdgarCache, ttl_for_url
 from edgar.state import StateStore
 from edgar import mirror as mirror_mod
@@ -790,7 +791,8 @@ class EdgarClient(BaseAPIClient):
                         unit: Optional[str] = None, limit: int = 20,
                         suggest_on_404: bool = True,
                         period_type: Optional[str] = None,
-                        as_of: Optional[str] = None) -> dict:
+                        as_of: Optional[str] = None,
+                        since: Optional[str] = None) -> dict:
         """Return all facts for a single company concept.
 
         `as_of` filters to facts whose `filed` date is on or before that date,
@@ -823,6 +825,8 @@ class EdgarClient(BaseAPIClient):
                     continue
                 if as_of and item.get("filed", "") > as_of:
                     continue
+                if since and item.get("filed", "") < since:
+                    continue
                 facts.append(item)
 
         # Back-fill restatement state across all same-period siblings before
@@ -848,6 +852,7 @@ class EdgarClient(BaseAPIClient):
                               unit: Optional[str] = None, limit: int = 20,
                               period_type: Optional[str] = None,
                               as_of: Optional[str] = None,
+                              since: Optional[str] = None,
                               canonical_union: bool = False) -> dict:
         """Return facts for a friendly concept alias, choosing the freshest candidate tag.
 
@@ -860,7 +865,7 @@ class EdgarClient(BaseAPIClient):
             taxonomy, tag, resolved_unit = candidates[0]
             return self.company_concept(
                 identifier, taxonomy, tag, unit=resolved_unit, limit=limit,
-                period_type=period_type, as_of=as_of,
+                period_type=period_type, as_of=as_of, since=since,
             )
 
         errors = []
@@ -869,6 +874,7 @@ class EdgarClient(BaseAPIClient):
             result = self.company_concept(
                 identifier, taxonomy, tag, unit=resolved_unit, limit=limit,
                 suggest_on_404=False, period_type=period_type, as_of=as_of,
+                since=since,
             )
             if "error" in result:
                 errors.append(result["error"])
@@ -1430,6 +1436,70 @@ class EdgarClient(BaseAPIClient):
 
         return out
 
+    def insiders(self, identifier: str | int, since: Optional[str] = None,
+                 limit: int = 50, max_form4_fetches: int = 50) -> dict:
+        """Aggregate Form 4 transactions for a filer.
+
+        Walks recent Form 4 filings, fetches the primary XML for each, and
+        aggregates by reporting owner + transaction code. `since` filters to
+        filings on or after that date; `limit` caps how many Form 4s are
+        fetched (default 50, hard ceiling 200).
+        """
+        company = self.resolve_company(identifier)
+        if "error" in company:
+            return company
+        cik = company["cik"]
+        max_form4_fetches = min(max_form4_fetches, 200)
+        result = self.submissions(identifier, form="4", limit=max_form4_fetches,
+                                  start_date=since)
+        if "error" in result:
+            return result
+
+        transactions: list[dict] = []
+        fetched = 0
+        failed = 0
+        for filing in result.get("filings", []):
+            url = filing.get("primary_doc_url") or ""
+            if not url:
+                continue
+            # SEC's `primaryDocument` for Form 4 points at the styled XML
+            # (e.g. `xslF345X06/wk-form4_*.xml`). The raw schema-conformant XML
+            # lives at the same filename without the stylesheet directory.
+            raw_url = re.sub(r"/xslF345X[0-9]+/", "/", url)
+            try:
+                xml = self._get_text(raw_url)
+            except Exception:
+                failed += 1
+                continue
+            parsed = insiders_mod.parse_form4_xml(xml)
+            if "error" in parsed:
+                failed += 1
+                continue
+            fetched += 1
+            owner = parsed.get("reporting_owner", {})
+            for tx in (parsed.get("non_derivative_transactions", [])
+                       + parsed.get("derivative_transactions", [])):
+                tx2 = dict(tx)
+                tx2["owner_name"] = owner.get("name", "")
+                tx2["owner_cik"] = owner.get("cik", "")
+                tx2["officer_title"] = owner.get("officer_title", "")
+                tx2["is_director"] = owner.get("is_director", False)
+                tx2["is_officer"] = owner.get("is_officer", False)
+                tx2["filed"] = filing.get("filingDate", "")
+                tx2["accession"] = filing.get("accessionNumber", "")
+                transactions.append(tx2)
+
+        agg = insiders_mod.aggregate(transactions)
+        return {
+            "cik": cik, "ticker": company.get("ticker", ""),
+            "name": company.get("name", ""),
+            "since": since,
+            "form4s_fetched": fetched, "form4s_failed": failed,
+            "transactions": transactions[:limit],
+            "transactions_total": len(transactions),
+            **agg,
+        }
+
     def quality(self, identifier: str | int, period_type: str = "annual",
                 as_of: Optional[str] = None) -> dict:
         """Earnings-quality and balance-sheet-quality flags.
@@ -1747,7 +1817,9 @@ class EdgarClient(BaseAPIClient):
 
     def mirror_filer(self, identifier: str | int, db_path: str,
                      include_facts: bool = True,
-                     include_documents_for_form: Optional[str] = None) -> dict:
+                     include_documents_for_form: Optional[str] = None,
+                     with_bodies_for_form: Optional[str] = None,
+                     bodies_limit: int = 20) -> dict:
         """Mirror one filer's submissions + companyfacts (and optionally
         per-filing document indices) into a local SQLite database.
 
@@ -1771,6 +1843,32 @@ class EdgarClient(BaseAPIClient):
                 facts_doc = self._get(f"/api/xbrl/companyfacts/CIK{cik}.json")
                 if "error" not in facts_doc:
                     facts_counts = mirror_mod.ingest_companyfacts(conn, cik, facts_doc)
+
+            body_counts = {"bodies_inserted": 0, "bodies_truncated": 0,
+                            "bodies_failed": 0, "bodies_total_bytes": 0}
+            if with_bodies_for_form:
+                pending = mirror_mod.filings_needing_bodies(
+                    conn, cik, form=with_bodies_for_form, limit=bodies_limit,
+                )
+                for row in pending:
+                    url = row.get("primary_doc_url") or ""
+                    if not url:
+                        continue
+                    try:
+                        html = self._get_text(url)
+                    except Exception:
+                        body_counts["bodies_failed"] += 1
+                        continue
+                    text = html_to_text(html)
+                    out = mirror_mod.ingest_filing_body(
+                        conn, row["cik"], row["accession"], row["form"],
+                        row["filed"], row["primary_doc_url"], text,
+                    )
+                    if out.get("inserted"):
+                        body_counts["bodies_inserted"] += 1
+                        body_counts["bodies_total_bytes"] += out.get("body_length", 0)
+                        if out.get("truncated"):
+                            body_counts["bodies_truncated"] += 1
 
             doc_counts = {"docs_inserted": 0}
             if include_documents_for_form:
@@ -1803,22 +1901,39 @@ class EdgarClient(BaseAPIClient):
                 "cik": cik, "ticker": company.get("ticker", ""),
                 "name": company.get("name", ""),
                 "db_path": str(db_path),
-                **sub_counts, **facts_counts, **doc_counts,
+                **sub_counts, **facts_counts, **doc_counts, **body_counts,
             }
 
     def search_mirror(self, db_path: str, query: str, form: Optional[str] = None,
                       since: Optional[str] = None,
                       ciks: Optional[list[str]] = None,
-                      limit: int = 50) -> dict:
-        """Full-text search a mirror SQLite database via the filings_fts table."""
+                      limit: int = 50,
+                      mode: str = "auto") -> dict:
+        """Full-text search a mirror SQLite database.
+
+        `mode` selects the FTS table:
+        - `"bodies"`: search ingested filing-body text (richer, depends on
+          `mirror --with-bodies` having run).
+        - `"metadata"`: search filing form/items/description (lightweight).
+        - `"auto"` (default): bodies if any exist, otherwise metadata.
+        """
         with mirror_mod.open_db(db_path) as conn:
             try:
-                rows = mirror_mod.search_filings(conn, query, form=form, since=since,
-                                                 ciks=ciks, limit=limit)
+                if mode == "auto":
+                    body_count = conn.execute(
+                        "SELECT COUNT(*) FROM filing_bodies"
+                    ).fetchone()[0]
+                    mode = "bodies" if body_count else "metadata"
+                if mode == "bodies":
+                    rows = mirror_mod.search_bodies(conn, query, form=form,
+                                                    since=since, ciks=ciks, limit=limit)
+                else:
+                    rows = mirror_mod.search_filings(conn, query, form=form,
+                                                     since=since, ciks=ciks, limit=limit)
             except sqlite3.OperationalError as exc:
                 return {"error": f"FTS query failed: {exc}", "matches": []}
-            return {"query": query, "matches": rows, "total": len(rows),
-                    "db_path": str(db_path)}
+            return {"query": query, "mode": mode, "matches": rows,
+                    "total": len(rows), "db_path": str(db_path)}
 
     def search_efts(self, query: str, form: Optional[str] = None,
                     since: Optional[str] = None,
@@ -2336,6 +2451,7 @@ class EdgarClient(BaseAPIClient):
         lc = anchor("liabilities_current")
         inv = anchor("inventory")
 
+        shares_outstanding = anchor("shares_outstanding")
         ratios = [
             compute.gross_margin(revenue, cogs, gross_profit),
             compute.operating_margin(revenue, operating_income),
@@ -2351,6 +2467,9 @@ class EdgarClient(BaseAPIClient):
             compute.net_debt(debt, std, cash),
             compute.free_cash_flow(ocf, capex),
             compute.fcf_margin(revenue, ocf, capex),
+            compute.book_value_per_share(equity, shares_outstanding),
+            compute.fcf_per_share(ocf, capex, shares_outstanding),
+            compute.sales_per_share(revenue, shares_outstanding),
         ]
         not_applicable = [
             {"metric": "pe_ratio", "reason": "requires market price (out of scope without price feed)"},

@@ -99,7 +99,8 @@ def test_concept_accepts_input_file_batch(monkeypatch, tmp_path):
 
     class FakeClient:
         def company_concept_alias(self, identifier, concept, unit=None, limit=20,
-                                  period_type=None, as_of=None, canonical_union=False):
+                                  period_type=None, as_of=None, since=None,
+                                  canonical_union=False):
             return {
                 "identifier": identifier,
                 "cik": identifier,
@@ -326,8 +327,39 @@ def test_filings_json_keeps_envelope(monkeypatch):
 
 def test_help_includes_new_v2_commands():
     result = CliRunner().invoke(main, ["--help"])
-    for cmd in ("mirror", "search", "statements", "quality", "verify", "dashboard"):
+    for cmd in ("mirror", "search", "statements", "quality", "verify", "dashboard",
+                "insiders"):
         assert cmd in result.output, f"missing {cmd}"
+
+
+def test_export_csv_writes_facts(tmp_path, monkeypatch):
+    """End-to-end test that --export-csv flushes the primary tabular slice."""
+    csv_path = tmp_path / "out.csv"
+
+    class FakeClient:
+        edgar_cache = None
+        _cache_calls: list = []
+        def company_concept_alias(self, identifier, concept, **kwargs):
+            return {
+                "cik": "1", "name": "Test", "tag": "Revenues",
+                "facts": [
+                    {"end": "2025-12-31", "val": 100, "filed": "2026-01-01"},
+                    {"end": "2024-12-31", "val": 90, "filed": "2025-01-01"},
+                ],
+            }
+        def _envelope(self, d):
+            return d
+
+    monkeypatch.setattr("edgar.cli.get_client",
+                        lambda use_cache=True, cache_max_mb=None: FakeClient())
+    result = CliRunner().invoke(
+        main,
+        ["--export-csv", str(csv_path), "concept", "TEST", "revenue", "--json-output"],
+    )
+    assert result.exit_code == 0
+    text = csv_path.read_text(encoding="utf-8")
+    assert "end,val,filed" in text or "end" in text.split("\n")[0]
+    assert "100" in text and "90" in text
 
 
 def test_cache_stats_honors_global_cache_max_mb():

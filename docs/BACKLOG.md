@@ -3,7 +3,57 @@
 This tracks test-drive feedback and the next command ideas. Priorities favor
 misleading-output fixes before convenience features.
 
-## Last Shipped — 10x Features and Fall-Short Closeout
+## Last Shipped — Filing Bodies, Insiders, Per-Share, CSV Export
+
+Builds directly on the previous tranche's mirror foundation.
+
+**Filing-body indexing (the 10x of the 10x)**
+- New `filing_bodies` + `filing_bodies_fts` tables in the mirror schema.
+- `edgar mirror IDENTIFIERS --to PATH --with-bodies-for FORM --bodies-limit N`
+  fetches each filing's primary document, strips HTML to plain text, and
+  indexes into FTS5 with a 4 MB-per-document byte cap (truncation tracked).
+- `edgar search QUERY --db PATH --mode auto|bodies|metadata` runs FTS5 over
+  filing text. Returns SEC-style highlighted snippets (e.g. `« supply chain »`).
+- Live verified: `mirror NVDA --with-bodies-for 10-K --bodies-limit 5`
+  ingests 5 filings in 2.3s; `search "supply chain" --db ...` returns 3 hits
+  with year-over-year language drift visible.
+
+**Form 4 insider aggregation**
+- New `edgar/insiders.py` module: parses Form 4 XML (using
+  `xml.etree.ElementTree`), maps transaction codes (P/S/A/M/...) to
+  semantic categories.
+- `edgar insiders TICKER --since YYYY-MM-DD --max-fetch N` aggregates by
+  reporting owner + transaction code, returns acquired/disposed shares and
+  dollar value totals plus a per-insider rollup.
+- Handles SEC's stylesheet-rendered URL pattern (`xslF345X*/wf-form4_*.xml`)
+  by stripping the stylesheet directory to find the raw schema-conformant XML.
+- Live verified: NVDA last 8 Form 4s show $239M net insider selling, with
+  Jensen Huang ($79.7M), Ajay Puri ($67.3M), and Mark Stevens ($38.5M) as
+  the top sellers.
+
+**Per-share metrics**
+- Three new derived metrics with formula+provenance: `bvps`, `fcf_per_share`,
+  `sales_per_share`. Wired into `edgar ratios` automatically.
+- NVDA FY26: BVPS $6.47, FCF/share $3.98, Sales/share $8.89.
+
+**Concept incremental queries**
+- `edgar concept --since YYYY-MM-DD` filters to facts filed on/after that
+  date, paralleling the existing `--as-of`. Threads through
+  `company_concept` and `company_concept_alias`.
+
+**CSV export**
+- New global `--export-csv PATH` flag writes the primary tabular slice of
+  any command's result to CSV. Auto-picks the best list-of-dicts field
+  (facts/matches/filings/concepts/events/ratios/metrics/transactions/...).
+- Non-scalar cells are flattened to JSON strings so the CSV stays well-formed.
+- Lives entirely outside the existing JSON path — agents that don't pass
+  `--export-csv` see no behavior change.
+
+Tests: 100 passing (was 93). New regressions cover Form 4 XML parsing,
+transaction aggregation, body ingestion + truncation, FTS body search, the
+per-share metrics, and the CSV export end-to-end through the CLI.
+
+## Previously Shipped — 10x Features and Fall-Short Closeout
 
 This pass shipped the items I called out as the qualitative gap and the real
 limitations (excluding market data, which is being handled separately).
@@ -206,20 +256,20 @@ agents on edge cases. Each has a brief note on what would be needed.
 - [x] Add `edgar statements TICKER --statement income|balance|cash --period-type annual|quarterly` for normalized statement JSON with provenance + coverage %.
 - [ ] Add `edgar history TICKER revenue --periods 20 --annual` for deduplicated time series. (Closely related to `edgar trend` and `edgar concept` with period filters; standalone command not yet added.)
 - [x] Add `edgar peers TICKER --candidates @group --by sic --limit 10` (SIC-matched against a candidate set; SEC ticker map lacks SIC so dynamic universe scan would be expensive).
-- [ ] Add `edgar export` to write command outputs to CSV / SQLite with schema metadata. (NDJSON shipped; CSV/SQLite pending.)
+- [x] Add `--export-csv PATH` global flag that writes any command's primary tabular slice to CSV. SQLite export deferred (`mirror` is the natural place for a SQLite write; ad-hoc export less critical).
 
 ## Filing Text And Ownership
 
 - [ ] Add `edgar item TICKER 10-K --section "Risk Factors" --as-of YYYY-MM-DD` for targeted filing sections. *(Deferred — Item-aware HTML parsing varies per filer; needs a per-form section parser.)*
 - [ ] Add `edgar changes TICKER --since YYYY-MM-DD` to diff same-form sections. *(Deferred — depends on item extraction.)*
-- [ ] Add `edgar insiders TICKER --since 90d` to aggregate Form 4 transactions by insider and code. *(Deferred — Form 4 XML pipeline + transaction code semantics is a real project.)*
+- [x] Add `edgar insiders TICKER --since YYYY-MM-DD` to parse Form 4 XML and aggregate by reporting owner + transaction code. Strips SEC's stylesheet wrapper to find raw XML; maps codes to semantic categories.
 - [ ] Add `edgar holders TICKER --quarter 2025Q4` for 13F/13G/SC 13G holder summaries. *(Deferred — 13F XML aggregation across filings is a real project.)*
 - [x] Improve earnings narrative extraction so table dumps do not become giant unreadable highlights.
 
 ## Local Research Moat
 
-- [x] Add `edgar mirror IDENTIFIERS --to ./edgar.sqlite` for incremental local submissions+facts ingestion. (Filing-text body indexing still pending; current FTS5 indexes filing metadata, not document bodies.)
-- [x] Add `edgar search QUERY [--db PATH | live EFTS]` for full-text search across filings. Mirror path uses FTS5 over metadata; default path wraps SEC EFTS for content search.
+- [x] Add `edgar mirror IDENTIFIERS --to ./edgar.sqlite` for incremental local submissions+facts ingestion. Filing-body ingestion via `--with-bodies-for FORM` shipped (4 MB/document cap with truncation tracking).
+- [x] Add `edgar search QUERY [--db PATH | live EFTS]` for full-text search across filings. Mirror path uses FTS5 over metadata or filing-body text (`--mode auto|bodies|metadata`); default path wraps SEC EFTS.
 - [x] `edgar watch` is covered by `edgar subscribe add` + `edgar pending` + `edgar mark-seen` triple, with state in `~/.edgar/state.json`.
 - [ ] Add offline-first mode that refuses live SEC calls and reports cache misses cleanly.
 
@@ -267,7 +317,7 @@ Foundation principle: every derived number returns `{value, formula, inputs:[{ta
 - [x] Add `edgar growth TICKER -c METRIC --basis yoy,qoq,cagr3,cagr5`.
 - [x] Add `edgar reconstruct TICKER -c {ebitda|fcf|net_debt|nwc|tangible_book}`.
 - [x] Add `edgar quality TICKER` with accruals_ratio / ocf_to_ni / ar_to_revenue / sbc_to_revenue / inventory_days / restatement_count_recent flags.
-- [ ] Add per-share normalizations to `metrics`: BVPS, FCF/share, sales/share. *(Pending — `eps`/`diluted_eps`/`shares` already in canonical set; per-share derivations not yet wired.)*
+- [x] Add per-share normalizations to `ratios`: `bvps`, `fcf_per_share`, `sales_per_share`. Each carries formula + inputs.
 - [ ] Honor `is_restated`/`superseded_by` in every computed metric so trend slopes do not mix restated with original. *(Tied to the bulk-walk deferral above.)*
 - [x] Document canonical definitions for ambiguous metrics in [`docs/definitions.md`](definitions.md).
 - [x] Skip market-data ratios (P/E, EV/EBITDA, dividend yield) — listed as `not_applicable` in the ratios envelope.
@@ -285,7 +335,7 @@ Cache today is a flat 15-minute TTL. That is wrong on both sides — over-caches
 - [x] Surgical invalidation: `edgar cache invalidate '*CIK0000320193*'` (positional glob pattern).
 - [ ] Restatement detection during cache refresh: diff prior cached `companyfacts` against new value at `EdgarCache.set()` time. *(Deferred — has subtle correctness implications; surfaced today via `edgar audit-trail` and `edgar delta`.)*
 - [x] Persistent state at `~/.edgar/state.json` keyed by `(cik, form)` with last-seen accession and filed date.
-- [x] Composable `--since-last-fetch` flag on `filings`, `company`, and `events`. *(Pending: `concept`, `metrics`, `brief` — those need a different state model since they are not form-keyed.)*
+- [x] Composable `--since-last-fetch` flag on `filings`, `company`, and `events`. `concept` now also accepts `--since YYYY-MM-DD` for filed-date-based incremental queries.
 - [x] Add `edgar delta TICKER` returning `{new_filings, restated_facts, summary}`. Combines with `--use-state` for high-water replay.
 - [x] Subscribe/drain pattern: `edgar subscribe add/remove/list`, `edgar pending`, `edgar mark-seen ACCESSION`.
 - [x] Stream new filings as NDJSON via `edgar pending --ndjson` (one event per line).

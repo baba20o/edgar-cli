@@ -485,6 +485,54 @@ def tangible_book_value(equity: Optional[dict], goodwill: Optional[dict] = None,
                      caveats=["Goodwill / Intangibles treated as zero when missing."])
 
 
+def book_value_per_share(equity: Optional[dict], shares: Optional[dict]) -> dict:
+    eq = _value_or_none(equity)
+    sh = _value_or_none(shares)
+    if eq is None or sh in (None, 0):
+        return _envelope("bvps", None,
+                         "StockholdersEquity / SharesOutstanding",
+                         [_input_record("StockholdersEquity", equity),
+                          _input_record("SharesOutstanding", shares)],
+                         caveats=["Uses period-end shares; some sources use weighted-average diluted shares."])
+    return _envelope("bvps", eq / sh,
+                     "StockholdersEquity / SharesOutstanding",
+                     [_input_record("StockholdersEquity", equity),
+                      _input_record("SharesOutstanding", shares)],
+                     caveats=["Uses period-end shares; some sources use weighted-average diluted shares."])
+
+
+def fcf_per_share(operating_cash_flow: Optional[dict], capex: Optional[dict],
+                  shares: Optional[dict]) -> dict:
+    fcf = free_cash_flow(operating_cash_flow, capex)
+    fcf_v = fcf.get("value")
+    sh = _value_or_none(shares)
+    inputs = [_input_record("OperatingCashFlow", operating_cash_flow),
+              _input_record("CapEx", capex),
+              _input_record("SharesOutstanding", shares)]
+    if fcf_v is None or sh in (None, 0):
+        return _envelope("fcf_per_share", None,
+                         "(OperatingCashFlow - CapEx) / SharesOutstanding",
+                         inputs)
+    return _envelope("fcf_per_share", fcf_v / sh,
+                     "(OperatingCashFlow - CapEx) / SharesOutstanding",
+                     inputs,
+                     caveats=fcf.get("caveats", []))
+
+
+def sales_per_share(revenue: Optional[dict], shares: Optional[dict]) -> dict:
+    rev = _value_or_none(revenue)
+    sh = _value_or_none(shares)
+    if rev is None or sh in (None, 0):
+        return _envelope("sales_per_share", None,
+                         "Revenue / SharesOutstanding",
+                         [_input_record("Revenue", revenue),
+                          _input_record("SharesOutstanding", shares)])
+    return _envelope("sales_per_share", rev / sh,
+                     "Revenue / SharesOutstanding",
+                     [_input_record("Revenue", revenue),
+                      _input_record("SharesOutstanding", shares)])
+
+
 def working_capital(assets_current: Optional[dict], liabilities_current: Optional[dict]) -> dict:
     ac = _value_or_none(assets_current)
     lc = _value_or_none(liabilities_current)

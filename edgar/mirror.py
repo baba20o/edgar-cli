@@ -108,7 +108,32 @@ CREATE VIRTUAL TABLE IF NOT EXISTS filings_fts USING fts5(
     items,
     primary_document
 );
+
+CREATE TABLE IF NOT EXISTS filing_bodies (
+    cik TEXT NOT NULL,
+    accession TEXT NOT NULL,
+    form TEXT,
+    filed TEXT,
+    primary_document TEXT,
+    body_length INTEGER,
+    fetched_at TEXT,
+    truncated INTEGER DEFAULT 0,
+    PRIMARY KEY (cik, accession)
+);
+CREATE INDEX IF NOT EXISTS idx_bodies_cik_form ON filing_bodies(cik, form, filed DESC);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS filing_bodies_fts USING fts5(
+    cik UNINDEXED,
+    accession UNINDEXED,
+    form UNINDEXED,
+    filed UNINDEXED,
+    body
+);
 """
+
+# Hard cap on per-document body size to keep the database bounded. Content
+# beyond this is dropped with `truncated=1` recorded so callers can detect it.
+DEFAULT_BODY_MAX_BYTES = 4 * 1024 * 1024  # 4 MB of plain text per filing
 
 
 @contextmanager
@@ -279,6 +304,87 @@ def _escape_fts_query(query: str) -> str:
         return query  # caller is using FTS syntax explicitly
     cleaned = query.replace('"', '""')
     return f'"{cleaned}"'
+
+
+def ingest_filing_body(conn: sqlite3.Connection, cik: str, accession: str,
+                       form: str, filed: str, primary_document: str,
+                       body_text: str,
+                       max_bytes: int = DEFAULT_BODY_MAX_BYTES) -> dict:
+    """Insert a filing's plain-text body into both `filing_bodies` and the
+    `filing_bodies_fts` virtual table. Idempotent: existing rows are skipped."""
+    body_text = body_text or ""
+    truncated = 0
+    if len(body_text.encode("utf-8")) > max_bytes:
+        # Truncate at character boundary that fits within byte budget.
+        body_text = body_text.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
+        truncated = 1
+    fetched_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        conn.execute("""
+            INSERT INTO filing_bodies(cik, accession, form, filed,
+                                       primary_document, body_length,
+                                       fetched_at, truncated)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (cik, accession, form, filed, primary_document,
+              len(body_text), fetched_at, truncated))
+        conn.execute("""
+            INSERT INTO filing_bodies_fts(cik, accession, form, filed, body)
+            VALUES (?, ?, ?, ?, ?)
+        """, (cik, accession, form, filed, body_text))
+        conn.commit()
+        return {"inserted": True, "truncated": bool(truncated),
+                "body_length": len(body_text)}
+    except sqlite3.IntegrityError:
+        return {"inserted": False, "already_present": True}
+
+
+def search_bodies(conn: sqlite3.Connection, query: str,
+                  form: Optional[str] = None, since: Optional[str] = None,
+                  ciks: Optional[list[str]] = None,
+                  limit: int = 25,
+                  snippet_chars: int = 240) -> list[dict]:
+    """Full-text search filing bodies. Returns rows with snippets."""
+    sql = (
+        "SELECT b.cik, b.accession, b.form, b.filed, "
+        "bb.primary_document, fi.name, "
+        "snippet(filing_bodies_fts, 4, '«', '»', ' … ', 16) AS snippet "
+        "FROM filing_bodies_fts b "
+        "LEFT JOIN filing_bodies bb ON b.cik = bb.cik AND b.accession = bb.accession "
+        "LEFT JOIN filers fi ON b.cik = fi.cik "
+        "WHERE filing_bodies_fts MATCH ?"
+    )
+    params: list[Any] = [_escape_fts_query(query)]
+    if form:
+        sql += " AND b.form = ?"
+        params.append(form.upper())
+    if since:
+        sql += " AND b.filed >= ?"
+        params.append(since)
+    if ciks:
+        placeholders = ",".join("?" * len(ciks))
+        sql += f" AND b.cik IN ({placeholders})"
+        params.extend(ciks)
+    sql += " ORDER BY b.filed DESC LIMIT ?"
+    params.append(limit)
+    return [dict(row) for row in conn.execute(sql, params)]
+
+
+def filings_needing_bodies(conn: sqlite3.Connection, cik: str,
+                           form: Optional[str] = None,
+                           limit: int = 50) -> list[dict]:
+    """Return filings (newest first) that don't yet have a body row."""
+    sql = ("SELECT f.cik, f.accession, f.form, f.filed, f.primary_doc_url "
+           "FROM filings f LEFT JOIN filing_bodies b "
+           "ON f.cik = b.cik AND f.accession = b.accession "
+           "WHERE f.cik = ? AND b.accession IS NULL "
+           "AND f.primary_doc_url != ''")
+    params: list[Any] = [cik]
+    if form:
+        sql += " AND f.form = ?"
+        params.append(form.upper())
+    sql += " ORDER BY f.filed DESC LIMIT ?"
+    params.append(limit)
+    return [dict(row) for row in conn.execute(sql, params)]
 
 
 def search_filings(conn: sqlite3.Connection, query: str,

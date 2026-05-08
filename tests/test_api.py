@@ -1185,6 +1185,144 @@ def test_populate_restatement_state_marks_priors():
 # --- Phase 7-9: quality / verify / dashboard ---
 
 
+def test_mirror_filing_bodies_round_trip(tmp_path):
+    from edgar.mirror import open_db, ingest_filing_body, search_bodies
+
+    with open_db(tmp_path / "m.sqlite") as conn:
+        # First filer (gives the FTS table real names to join against).
+        conn.execute("INSERT INTO filers(cik, name) VALUES (?, ?)", ("0001", "Acme Inc."))
+        conn.commit()
+        out = ingest_filing_body(
+            conn, "0001", "x-1", "10-K", "2025-01-01",
+            "acme.htm", "Our supply chain is concentrated in Asia.",
+        )
+        assert out["inserted"] is True
+        # Second insertion of same accession is a no-op.
+        out2 = ingest_filing_body(
+            conn, "0001", "x-1", "10-K", "2025-01-01",
+            "acme.htm", "Anything else",
+        )
+        assert out2.get("already_present") is True
+
+        # Body search finds the inserted text and emits a snippet.
+        rows = search_bodies(conn, "supply chain")
+        assert len(rows) == 1
+        assert rows[0]["accession"] == "x-1"
+        assert "supply chain" in rows[0]["snippet"].lower()
+
+
+def test_mirror_filing_bodies_truncate_at_byte_cap(tmp_path):
+    from edgar.mirror import open_db, ingest_filing_body
+
+    big = "x" * (5 * 1024 * 1024)  # 5 MB > 4 MB cap
+    with open_db(tmp_path / "m.sqlite") as conn:
+        out = ingest_filing_body(conn, "0002", "x-2", "10-K", "2025-01-01",
+                                  "big.htm", big, max_bytes=1024)
+        assert out["truncated"] is True
+        assert out["body_length"] <= 1024
+
+
+# --- Phase 2: insiders ---
+
+
+def test_form4_xml_parses_transactions():
+    from edgar.insiders import parse_form4_xml
+
+    xml = """<?xml version="1.0"?>
+    <ownershipDocument>
+      <schemaVersion>X0508</schemaVersion>
+      <documentType>4</documentType>
+      <periodOfReport>2026-03-20</periodOfReport>
+      <issuer>
+        <issuerCik>0001045810</issuerCik>
+        <issuerName>NVIDIA CORP</issuerName>
+        <issuerTradingSymbol>NVDA</issuerTradingSymbol>
+      </issuer>
+      <reportingOwner>
+        <reportingOwnerId>
+          <rptOwnerCik>0001000001</rptOwnerCik>
+          <rptOwnerName>Test Insider</rptOwnerName>
+        </reportingOwnerId>
+        <reportingOwnerRelationship>
+          <isDirector>1</isDirector>
+          <isOfficer>1</isOfficer>
+          <officerTitle>CFO</officerTitle>
+        </reportingOwnerRelationship>
+      </reportingOwner>
+      <nonDerivativeTable>
+        <nonDerivativeTransaction>
+          <securityTitle><value>Common Stock</value></securityTitle>
+          <transactionDate><value>2026-03-20</value></transactionDate>
+          <transactionCoding>
+            <transactionCode>S</transactionCode>
+          </transactionCoding>
+          <transactionAmounts>
+            <transactionShares><value>1000</value></transactionShares>
+            <transactionPricePerShare><value>120.50</value></transactionPricePerShare>
+            <transactionAcquiredDisposedCode><value>D</value></transactionAcquiredDisposedCode>
+          </transactionAmounts>
+          <postTransactionAmounts>
+            <sharesOwnedFollowingTransaction><value>9000</value></sharesOwnedFollowingTransaction>
+          </postTransactionAmounts>
+        </nonDerivativeTransaction>
+      </nonDerivativeTable>
+    </ownershipDocument>
+    """
+    out = parse_form4_xml(xml)
+    assert out["issuer"]["ticker"] == "NVDA"
+    assert out["reporting_owner"]["name"] == "Test Insider"
+    assert out["reporting_owner"]["officer_title"] == "CFO"
+    txs = out["non_derivative_transactions"]
+    assert len(txs) == 1
+    tx = txs[0]
+    assert tx["code"] == "S"
+    assert tx["direction"] == "dispose"
+    assert tx["shares"] == 1000
+    assert tx["price_per_share"] == 120.50
+    assert tx["transaction_value"] == 1000 * 120.50
+
+
+def test_form4_aggregate_groups_by_owner_and_code():
+    from edgar.insiders import aggregate
+
+    txs = [
+        {"owner_name": "Tim Cook", "code": "S", "direction": "dispose",
+         "shares": 1000, "transaction_value": 100_000, "code_meaning": "Sale",
+         "is_director": False, "is_officer": True, "officer_title": "CEO"},
+        {"owner_name": "Tim Cook", "code": "S", "direction": "dispose",
+         "shares": 500, "transaction_value": 50_000, "code_meaning": "Sale",
+         "is_director": False, "is_officer": True, "officer_title": "CEO"},
+        {"owner_name": "Luca Maestri", "code": "P", "direction": "acquire",
+         "shares": 100, "transaction_value": 10_000, "code_meaning": "Purchase",
+         "is_director": False, "is_officer": True, "officer_title": "CFO"},
+    ]
+    out = aggregate(txs)
+    by_name = {i["name"]: i for i in out["insiders"]}
+    assert by_name["Tim Cook"]["disposed_shares"] == 1500
+    assert by_name["Tim Cook"]["disposed_value"] == 150_000
+    assert by_name["Luca Maestri"]["acquired_value"] == 10_000
+    assert out["summary"]["net_value"] == 10_000 - 150_000
+
+
+# --- Phase 3: per-share metrics ---
+
+
+def test_compute_book_value_per_share():
+    from edgar.compute import book_value_per_share
+
+    out = book_value_per_share({"val": 1000}, {"val": 100})
+    assert out["value"] == 10.0
+    assert "StockholdersEquity / SharesOutstanding" in out["formula"]
+
+
+def test_compute_fcf_per_share_propagates_caveats():
+    from edgar.compute import fcf_per_share
+
+    out = fcf_per_share({"val": 100}, {"val": 30}, {"val": 70})
+    assert out["value"] == 1.0
+    assert any("FCF capex scope" in c for c in out["caveats"])
+
+
 def test_quality_flags_have_provenance(tmp_path):
     from edgar.compute import _input_record
 

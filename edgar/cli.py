@@ -24,12 +24,72 @@ click.UsageError.exit_code = 5
 def _json(data) -> None:
     click.echo(json.dumps(data, indent=2, default=str))
     _maybe_webhook(data)
+    _maybe_export_csv(data)
 
 
 def _ndjson(rows) -> None:
     for row in rows:
         click.echo(json.dumps(row, default=str, separators=(",", ":")))
     _maybe_webhook(rows)
+    _maybe_export_csv(rows)
+
+
+def _maybe_export_csv(payload) -> None:
+    """If --export-csv was set, write the primary tabular slice to that path."""
+    try:
+        ctx = click.get_current_context(silent=True)
+    except RuntimeError:
+        return
+    path = ctx.obj.get("export_csv") if ctx and ctx.obj else None
+    if not path:
+        return
+    rows = payload if isinstance(payload, list) else _rows_for_export(payload)
+    if not rows:
+        return
+    written = _export_csv(rows, path)
+    click.echo(f"# wrote {written} rows to {path}", err=True)
+
+
+def _export_csv(rows: list[dict], path: Path) -> int:
+    """Write a list of dicts to CSV. Returns rows written. Headers are the
+    union of keys across all rows, with first-seen order preserved."""
+    import csv
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return 0
+    headers: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for key in row.keys():
+            if key not in seen:
+                headers.append(key)
+                seen.add(key)
+    with path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=headers, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            if isinstance(row, dict):
+                # Flatten non-scalar values to JSON strings so CSV stays clean.
+                flat = {k: (json.dumps(v, default=str)
+                            if isinstance(v, (list, dict)) else v)
+                        for k, v in row.items()}
+                writer.writerow(flat)
+    return len(rows)
+
+
+def _rows_for_export(result: dict) -> list[dict]:
+    """Pick the most useful list-of-dicts payload from a result envelope."""
+    if not isinstance(result, dict):
+        return []
+    for key in ("facts", "matches", "filings", "concepts", "documents",
+                "events", "rows", "ratios", "metrics", "transactions",
+                "results", "lines", "flags", "checks", "peers", "frames"):
+        rows = result.get(key)
+        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+            return rows
+    return []
 
 
 def _maybe_webhook(payload) -> None:
@@ -318,8 +378,12 @@ def _batch_failed(results: list[dict]) -> bool:
               help="Bound the local cache to this size in MB (LRU eviction).")
 @click.option("--webhook", default=None,
               help="POST result JSON to this URL after the command completes (fire-and-forget)")
+@click.option("--export-csv", "export_csv",
+              type=click.Path(dir_okay=False, path_type=Path), default=None,
+              help="Also write the primary tabular result to a CSV file")
 @click.pass_context
-def main(ctx, debug: bool, no_cache: bool, cache_max_mb, webhook: str | None):
+def main(ctx, debug: bool, no_cache: bool, cache_max_mb, webhook: str | None,
+         export_csv: Optional[Path]):
     """SEC EDGAR public data CLI."""
     if debug:
         logging.basicConfig(level=logging.DEBUG)
@@ -327,6 +391,7 @@ def main(ctx, debug: bool, no_cache: bool, cache_max_mb, webhook: str | None):
     ctx.obj["no_cache"] = no_cache
     ctx.obj["cache_max_mb"] = cache_max_mb
     ctx.obj["webhook"] = webhook
+    ctx.obj["export_csv"] = export_csv
 
 
 @main.command("search-companies")
@@ -436,6 +501,8 @@ def facts(ctx, identifier, limit, taxonomy, tag_filter, markdown, json_output, n
 @click.option("--instant", is_flag=True, help="Only instant facts")
 @click.option("--as-of", "as_of", default=None, callback=_validate_date_option,
               help="Only return facts filed on/before YYYY-MM-DD (eliminates look-ahead bias)")
+@click.option("--since", "since", default=None, callback=_validate_date_option,
+              help="Only return facts filed on/after YYYY-MM-DD (concept-keyed incremental)")
 @click.option("--canonical", is_flag=True,
               help="Union facts across all candidate tags for the alias (deduped on start/end/accn)")
 @click.option("--explain", "explain", is_flag=True,
@@ -445,7 +512,7 @@ def facts(ctx, identifier, limit, taxonomy, tag_filter, markdown, json_output, n
 @output_options
 @click.pass_context
 def concept(ctx, args, unit, limit, deltas, annual, quarterly, ytd, instant,
-            as_of, canonical, explain,
+            as_of, since, canonical, explain,
             tickers, input_file, batch, cite, markdown, json_output, ndjson):
     """Show facts for one company XBRL concept or alias."""
     client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
@@ -463,13 +530,13 @@ def concept(ctx, args, unit, limit, deltas, annual, quarterly, ytd, instant,
     if len(terms) == 1:
         fetch = lambda identifier: client.company_concept_alias(
             identifier, terms[0], unit=unit, limit=limit, period_type=period_type,
-            as_of=as_of, canonical_union=canonical,
+            as_of=as_of, since=since, canonical_union=canonical,
         )
     elif len(terms) == 2:
         taxonomy, tag = terms
         fetch = lambda identifier: client.company_concept(
             identifier, taxonomy, tag, unit=unit, limit=limit, period_type=period_type,
-            as_of=as_of,
+            as_of=as_of, since=since,
         )
     else:
         raise click.UsageError("Use either: concept IDENTIFIER ALIAS or concept IDENTIFIER TAXONOMY TAG")
@@ -1263,9 +1330,14 @@ def _output_schemas() -> dict:
 @click.option("--no-facts", is_flag=True, help="Skip companyfacts ingestion (mirror submissions only)")
 @click.option("--documents-for", default=None,
               help="Also ingest filing-index documents for the latest 5 filings of this form (e.g. 10-K)")
+@click.option("--with-bodies-for", default=None,
+              help="Also fetch and FTS-index plain-text filing bodies for this form (e.g. 10-K)")
+@click.option("--bodies-limit", default=20, show_default=True, type=PositiveInt,
+              help="Max filings to fetch bodies for per filer (per --with-bodies-for run)")
 @output_options
 @click.pass_context
-def mirror(ctx, identifiers, db_path, no_facts, documents_for, markdown, json_output, ndjson):
+def mirror(ctx, identifiers, db_path, no_facts, documents_for,
+           with_bodies_for, bodies_limit, markdown, json_output, ndjson):
     """Mirror filer submissions + facts to a local SQLite database (incremental)."""
     client = get_client(use_cache=not ctx.obj["no_cache"],
                        cache_max_mb=ctx.obj.get("cache_max_mb"))
@@ -1275,6 +1347,8 @@ def mirror(ctx, identifiers, db_path, no_facts, documents_for, markdown, json_ou
         result = client.mirror_filer(
             ident, db_path=str(db_path), include_facts=not no_facts,
             include_documents_for_form=documents_for,
+            with_bodies_for_form=with_bodies_for,
+            bodies_limit=bodies_limit,
         )
         summaries.append(result)
     payload = client._envelope({"results": summaries, "db_path": str(db_path),
@@ -1308,15 +1382,21 @@ def mirror(ctx, identifiers, db_path, no_facts, documents_for, markdown, json_ou
               help="Only filings on/before YYYY-MM-DD (live SEC EFTS only)")
 @click.option("--tickers", default=None,
               help="Comma-separated identifiers (or @group) to scope the search")
+@click.option("--mode", default="auto", show_default=True,
+              type=click.Choice(["auto", "bodies", "metadata"]),
+              help="Mirror search mode: bodies (filing text), metadata (form/items), or auto")
 @click.option("--limit", "-n", default=25, show_default=True, type=PositiveInt)
 @output_options
 @click.pass_context
-def search(ctx, query, db_path, form, since, until, tickers, limit,
+def search(ctx, query, db_path, form, since, until, tickers, mode, limit,
            markdown, json_output, ndjson):
     """Full-text search filings.
 
-    With `--db PATH` searches the local SQLite mirror via FTS5 (fast, scoped).
-    Without it, queries SEC's live EDGAR Full-Text Search service.
+    With `--db PATH` searches the local SQLite mirror via FTS5. If filing
+    bodies have been ingested (`mirror --with-bodies-for FORM`), `--mode bodies`
+    or the default `auto` searches filing text. `--mode metadata` searches
+    form/items/description only. Without `--db`, queries SEC's live EDGAR
+    Full-Text Search.
     """
     client = get_client(use_cache=not ctx.obj["no_cache"],
                        cache_max_mb=ctx.obj.get("cache_max_mb"))
@@ -1330,7 +1410,7 @@ def search(ctx, query, db_path, form, since, until, tickers, limit,
                 cik_list.append(company["cik"])
     if db_path:
         result = client.search_mirror(str(db_path), query, form=form, since=since,
-                                       ciks=cik_list, limit=limit)
+                                       ciks=cik_list, limit=limit, mode=mode)
     else:
         primary_cik = cik_list[0] if cik_list else None
         result = client.search_efts(query, form=form, since=since, until=until,
@@ -1390,6 +1470,61 @@ def dashboard(ctx, identifier, markdown, json_output, ndjson):
         f"Quality flags: {result.get('quality', {}).get('flagged_count', 0)} of {len(result.get('quality', {}).get('flags', []))}",
     ])
     console.print(Panel(body, title=f"Dashboard: {result.get('name', '')}", expand=False))
+
+
+@main.command()
+@click.argument("identifier")
+@click.option("--since", default=None, callback=_validate_date_option,
+              help="Only Form 4 filings on/after YYYY-MM-DD")
+@click.option("--limit", "-n", default=50, show_default=True, type=PositiveInt,
+              help="Max transactions to return after aggregation")
+@click.option("--max-fetch", default=50, show_default=True, type=PositiveInt,
+              help="Max Form 4 filings to download (hard ceiling 200)")
+@output_options
+@click.pass_context
+def insiders(ctx, identifier, since, limit, max_fetch, markdown, json_output, ndjson):
+    """Aggregate Form 4 insider transactions for a filer."""
+    client = get_client(use_cache=not ctx.obj["no_cache"],
+                       cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.insiders(identifier, since=since, limit=limit,
+                              max_form4_fetches=max_fetch)
+    result = _finalize(client, result)
+    _error_exit(result)
+    if ndjson:
+        _ndjson(result.get("transactions", []))
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+    s = result.get("summary", {})
+    body = "\n".join([
+        f"Form 4 filings parsed: {result.get('form4s_fetched', 0)}"
+        f"  failed: {result.get('form4s_failed', 0)}",
+        f"Transactions: {result.get('transactions_total', 0)}",
+        f"Acquired: {_format_value(s.get('acquired_shares'))} shares "
+        f"(${_format_value(s.get('acquired_value'))})",
+        f"Disposed: {_format_value(s.get('disposed_shares'))} shares "
+        f"(${_format_value(s.get('disposed_value'))})",
+        f"Net: {_format_value(s.get('net_shares'))} shares "
+        f"(${_format_value(s.get('net_value'))})",
+    ])
+    console.print(Panel(body, title=f"Insiders: {result.get('name', identifier)}", expand=False))
+    rows = []
+    for ins in result.get("insiders", [])[:10]:
+        rows.append([
+            ins["name"], ins.get("title", ""),
+            "D" if ins.get("is_director") else "",
+            "O" if ins.get("is_officer") else "",
+            ins["transactions"],
+            _format_value(ins.get("acquired_shares")),
+            _format_value(ins.get("disposed_shares")),
+            _format_value(ins.get("acquired_value") - ins.get("disposed_value")),
+        ])
+    headers = ["Insider", "Title", "Dir", "Off", "#Tx", "Acq Sh", "Disp Sh", "Net $"]
+    if markdown:
+        click.echo(_markdown_table(headers, rows))
+        return
+    console.print(_simple_table("Insider rollup", headers, rows))
 
 
 @main.command()
