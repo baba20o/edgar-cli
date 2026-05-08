@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import webbrowser
+from pathlib import Path
 
 import click
 from rich.console import Console
@@ -22,6 +24,15 @@ def _json(data) -> None:
 def _error_exit(result: dict) -> None:
     if "error" in result:
         click.echo(f"Error: {result['error']}", err=True)
+        suggestions = result.get("suggestions") or []
+        if suggestions:
+            click.echo("Suggestions:", err=True)
+            for suggestion in suggestions[:8]:
+                click.echo(
+                    f"  {suggestion.get('taxonomy', '')} {suggestion.get('tag', '')}"
+                    f"  ({suggestion.get('label', '')})",
+                    err=True,
+                )
         raise click.Abort()
 
 
@@ -48,7 +59,7 @@ def _markdown_table(headers: list[str], rows: list[list]) -> str:
 
 def output_options(fn):
     fn = click.option("--json-output", "-j", is_flag=True, help="Output raw JSON")(fn)
-    fn = click.option("--markdown", "-m", is_flag=True, help="Output markdown")(fn)
+    fn = click.option("--markdown", "-m", is_flag=True, help="Output markdown; best for agents and reports")(fn)
     return fn
 
 
@@ -81,13 +92,15 @@ def search_companies(ctx, query, limit, json_output, markdown):
 @click.option("--form", "form_type", default=None, help="Only show a form type, e.g. 10-K")
 @click.option("--start-date", default=None, help="Only filings on/after YYYY-MM-DD")
 @click.option("--end-date", default=None, help="Only filings on/before YYYY-MM-DD")
+@click.option("--all", "all_history", is_flag=True, help="Search historical filing chunks too")
 @click.option("--show-urls", is_flag=True, help="Show filing URLs in table output")
 @output_options
 @click.pass_context
-def company(ctx, identifier, limit, form_type, start_date, end_date, show_urls, json_output, markdown):
+def company(ctx, identifier, limit, form_type, start_date, end_date, all_history, show_urls, json_output, markdown):
     """Show company profile and recent filings for a ticker or CIK."""
     result = get_client(use_cache=not ctx.obj["no_cache"]).submissions(
-        identifier, limit=limit, form=form_type, start_date=start_date, end_date=end_date,
+        identifier, limit=limit, form=form_type, start_date=start_date,
+        end_date=end_date, all_history=all_history,
     )
     _output_company(result, json_output, markdown, show_urls=show_urls)
 
@@ -98,13 +111,15 @@ def company(ctx, identifier, limit, form_type, start_date, end_date, show_urls, 
 @click.option("--form", "form_type", default=None, help="Only show a form type, e.g. 8-K")
 @click.option("--start-date", default=None, help="Only filings on/after YYYY-MM-DD")
 @click.option("--end-date", default=None, help="Only filings on/before YYYY-MM-DD")
+@click.option("--all", "all_history", is_flag=True, help="Search historical filing chunks too")
 @click.option("--show-urls", is_flag=True, help="Show filing URLs in table output")
 @output_options
 @click.pass_context
-def filings(ctx, identifier, limit, form_type, start_date, end_date, show_urls, json_output, markdown):
+def filings(ctx, identifier, limit, form_type, start_date, end_date, all_history, show_urls, json_output, markdown):
     """Show recent filings for a ticker or CIK."""
     result = get_client(use_cache=not ctx.obj["no_cache"]).submissions(
-        identifier, limit=limit, form=form_type, start_date=start_date, end_date=end_date,
+        identifier, limit=limit, form=form_type, start_date=start_date,
+        end_date=end_date, all_history=all_history,
     )
     _output_filings(result, f"Recent Filings: {identifier}", json_output, markdown, show_urls=show_urls)
 
@@ -130,14 +145,15 @@ def facts(ctx, identifier, limit, taxonomy, tag_filter, json_output, markdown):
 @click.argument("tag")
 @click.option("--unit", "-u", default=None, help="Restrict to one unit, e.g. USD")
 @click.option("--limit", "-n", default=20, show_default=True, help="Facts to show")
+@click.option("--deltas", is_flag=True, help="Show change vs previous displayed period")
 @output_options
 @click.pass_context
-def concept(ctx, identifier, taxonomy, tag, unit, limit, json_output, markdown):
+def concept(ctx, identifier, taxonomy, tag, unit, limit, deltas, json_output, markdown):
     """Show facts for one company XBRL concept."""
     result = get_client(use_cache=not ctx.obj["no_cache"]).company_concept(
         identifier, taxonomy, tag, unit=unit, limit=limit,
     )
-    _output_concept_facts(result, json_output, markdown)
+    _output_concept_facts(result, json_output, markdown, deltas=deltas)
 
 
 @main.command()
@@ -156,6 +172,96 @@ def frame(ctx, taxonomy, tag, unit, frame, limit, sort_by, json_output, markdown
         taxonomy, tag, unit, frame, limit=limit, sort_by=sort_by,
     )
     _output_frame(result, json_output, markdown)
+
+
+@main.command()
+@click.argument("identifier")
+@click.option("--form", "form_type", default="10-K", show_default=True, help="Latest form type to open")
+@click.option("--all", "all_history", is_flag=True, help="Search historical filing chunks too")
+@click.option("--print-only", is_flag=True, help="Print URL without launching a browser")
+@click.pass_context
+def open(ctx, identifier, form_type, all_history, print_only):
+    """Open the latest filing index for a ticker or CIK."""
+    result = get_client(use_cache=not ctx.obj["no_cache"]).latest_filing(
+        identifier, form=form_type, all_history=all_history,
+    )
+    _error_exit(result)
+    url = result.get("filing_url", "")
+    click.echo(url)
+    if not print_only and url:
+        webbrowser.open(url)
+
+
+@main.command()
+@click.argument("accession_or_url")
+@click.option("--cik", default=None, help="CIK required when passing only an accession number")
+@click.option("--download", type=click.Path(file_okay=False, path_type=Path), default=None,
+              help="Download listed documents/exhibits to this directory")
+@click.option("--type-filter", default=None, help="Only include document types containing this text")
+@output_options
+@click.pass_context
+def exhibits(ctx, accession_or_url, cik, download, type_filter, json_output, markdown):
+    """List or download documents/exhibits from a filing."""
+    result = get_client(use_cache=not ctx.obj["no_cache"]).filing_documents_for_accession(
+        accession_or_url, cik=cik,
+    )
+    _error_exit(result)
+    if type_filter:
+        needle = type_filter.upper()
+        result["documents"] = [
+            doc for doc in result.get("documents", [])
+            if needle in doc.get("type", "").upper()
+        ]
+    if download:
+        _download_documents(result, download)
+    _output_documents(result, json_output, markdown)
+
+
+@main.command()
+@click.argument("identifier")
+@output_options
+@click.pass_context
+def earnings(ctx, identifier, json_output, markdown):
+    """Summarize the latest Item 2.02 earnings 8-K and exhibit."""
+    result = get_client(use_cache=not ctx.obj["no_cache"]).latest_earnings(identifier)
+    _output_earnings(result, json_output, markdown)
+
+
+@main.command()
+@click.argument("identifier")
+@click.option("--limit", "-n", default=20, show_default=True, help="Recent 8-Ks to inspect")
+@output_options
+@click.pass_context
+def events(ctx, identifier, limit, json_output, markdown):
+    """Detect notable recent 8-K events."""
+    result = get_client(use_cache=not ctx.obj["no_cache"]).events(identifier, limit=limit)
+    _output_events(result, json_output, markdown)
+
+
+@main.command()
+@click.argument("identifiers", nargs=-1, required=True)
+@click.option("--concept", "-c", required=True, help="Concept alias or tag, e.g. revenue or Assets")
+@click.option("--taxonomy", "-t", default=None, help="Taxonomy override, e.g. us-gaap")
+@click.option("--unit", "-u", default=None, help="Unit override, e.g. USD")
+@click.option("--periods", "-n", default=4, show_default=True, help="Periods per company")
+@output_options
+@click.pass_context
+def compare(ctx, identifiers, concept, taxonomy, unit, periods, json_output, markdown):
+    """Compare one concept across companies."""
+    result = get_client(use_cache=not ctx.obj["no_cache"]).compare_concept(
+        list(identifiers), concept, taxonomy=taxonomy, unit=unit, periods=periods,
+    )
+    _output_compare(result, json_output, markdown)
+
+
+@main.command()
+@click.argument("identifier")
+@output_options
+@click.pass_context
+def brief(ctx, identifier, json_output, markdown):
+    """Build a compact company brief."""
+    result = get_client(use_cache=not ctx.obj["no_cache"]).brief(identifier)
+    _output_brief(result, json_output, markdown)
 
 
 @main.command("bulk-urls")
@@ -316,35 +422,49 @@ def _output_concepts(result: dict, json_output: bool, markdown: bool) -> None:
         return
 
     table = Table(title=f"XBRL Concepts: {result.get('name', '')}")
-    table.add_column("Tag", style="magenta", no_wrap=False, overflow="fold")
+    table.add_column("Taxonomy", style="cyan", no_wrap=True)
+    table.add_column("Tag", style="magenta", no_wrap=True)
+    table.add_column("Label")
+    table.add_column("Units", no_wrap=True)
+    table.add_column("Facts", justify="right", no_wrap=True)
     table.add_column("Latest Filed", style="green", no_wrap=True)
     for row in rows:
-        table.add_row(str(row[1]), str(row[5]))
+        table.add_row(*[str(cell) for cell in row])
     table.caption = f"Showing {len(rows)} of {result.get('total', len(rows))} concepts"
     console.print(table)
 
 
-def _output_concept_facts(result: dict, json_output: bool, markdown: bool) -> None:
+def _output_concept_facts(result: dict, json_output: bool, markdown: bool,
+                          deltas: bool = False) -> None:
     _error_exit(result)
     if json_output:
         _json(result)
         return
 
+    facts = _add_deltas(result.get("facts", [])) if deltas else result.get("facts", [])
     rows = []
-    for fact in result.get("facts", []):
-        rows.append([
+    for fact in facts:
+        row = [
             fact.get("filed", ""),
             _format_period(fact),
             fact.get("frame", ""),
             fact.get("form", ""),
             _format_value(fact.get("val", ""), fact.get("unit", "")),
-            fact.get("accn", ""),
-        ])
+        ]
+        if deltas:
+            row.append(_format_delta(fact.get("_delta_pct")))
+        row.append(fact.get("accn", ""))
+        rows.append(row)
+
+    headers = ["Filed", "Period", "Frame", "Form", "Value"]
+    if deltas:
+        headers.append("Change")
+    headers.append("Accession")
 
     title = f"{result.get('taxonomy', '')}/{result.get('tag', '')}: {result.get('name', '')}"
     if markdown:
         click.echo(f"## {title}\n")
-        click.echo(_markdown_table(["Filed", "Period", "Frame", "Form", "Value", "Accession"], rows))
+        click.echo(_markdown_table(headers, rows))
         return
 
     table = Table(title=title)
@@ -353,46 +473,260 @@ def _output_concept_facts(result: dict, json_output: bool, markdown: bool) -> No
     table.add_column("Frame", no_wrap=True)
     table.add_column("Form", style="cyan", no_wrap=True)
     table.add_column("Value", justify="right", no_wrap=True)
+    if deltas:
+        table.add_column("Change", justify="right", no_wrap=True)
+    table.add_column("Accession", style="magenta", no_wrap=True)
     for row in rows:
-        table.add_row(*[str(cell) for cell in row[:-1]])
+        table.add_row(*[str(cell) for cell in row])
     table.caption = result.get("label", "")
     console.print(table)
 
 
-def _output_frame(result: dict, json_output: bool, markdown: bool) -> None:
+def _output_documents(result: dict, json_output: bool, markdown: bool) -> None:
+    _error_exit(result)
+    if json_output:
+        _json(result)
+        return
+
+    rows = [
+        [
+            doc.get("sequence", ""),
+            doc.get("type", ""),
+            doc.get("document", ""),
+            _truncate(doc.get("description", ""), 72),
+            doc.get("url", ""),
+        ]
+        for doc in result.get("documents", [])
+    ]
+    if markdown:
+        click.echo(_markdown_table(["Seq", "Type", "Document", "Description", "URL"], rows))
+        return
+
+    table = Table(title=f"Documents: {result.get('accessionNumber', '')}")
+    table.add_column("Seq", no_wrap=True)
+    table.add_column("Type", style="cyan", no_wrap=True)
+    table.add_column("Document", style="magenta")
+    table.add_column("Description")
+    for row in rows:
+        table.add_row(*[str(cell) for cell in row[:-1]])
+    console.print(table)
+
+
+def _output_earnings(result: dict, json_output: bool, markdown: bool) -> None:
+    _error_exit(result)
+    if json_output:
+        _json(result)
+        return
+
+    filing = result.get("filing", {})
+    exhibit = result.get("exhibit") or {}
+    highlights = [[h.get("text", "")] for h in result.get("highlights", [])]
+    if markdown:
+        click.echo(f"## Earnings: {result.get('name', '')}\n")
+        click.echo(_markdown_table(["Filed", "Accession", "Filing URL"], [[
+            filing.get("filingDate", ""), filing.get("accessionNumber", ""), filing.get("filing_url", ""),
+        ]]))
+        if exhibit:
+            click.echo("\n### Exhibit\n")
+            click.echo(_markdown_table(["Type", "Document", "URL"], [[
+                exhibit.get("type", ""), exhibit.get("document", ""), exhibit.get("url", ""),
+            ]]))
+        if highlights:
+            click.echo("\n### Highlights\n")
+            click.echo(_markdown_table(["Text"], highlights))
+        return
+
+    console.print(Panel(
+        "\n".join([
+            f"Filed: {filing.get('filingDate', '')}",
+            f"Accession: {filing.get('accessionNumber', '')}",
+            f"Exhibit: {exhibit.get('type', '')} {exhibit.get('document', '')}".strip(),
+            filing.get("filing_url", ""),
+        ]),
+        title=f"Earnings: {result.get('name', '')}",
+        expand=False,
+    ))
+    for item in result.get("highlights", [])[:8]:
+        console.print(f"- {item.get('text', '')}")
+
+
+def _output_events(result: dict, json_output: bool, markdown: bool) -> None:
+    _error_exit(result)
+    if json_output:
+        _json(result)
+        return
+
+    rows = [
+        [
+            event.get("filingDate", ""),
+            ", ".join(event.get("event_types", [])),
+            event.get("items", ""),
+            event.get("accessionNumber", ""),
+            next(iter(event.get("snippets", {}).values()), ""),
+        ]
+        for event in result.get("events", [])
+    ]
+    if markdown:
+        click.echo(_markdown_table(["Filed", "Events", "Items", "Accession", "Snippet"], rows))
+        return
+
+    table = Table(title=f"Events: {result.get('name', '')}")
+    table.add_column("Filed", style="green", no_wrap=True)
+    table.add_column("Events")
+    table.add_column("Items", no_wrap=True)
+    table.add_column("Accession", style="magenta", no_wrap=True)
+    for row in rows:
+        table.add_row(*[str(cell) for cell in row[:-1]])
+    console.print(table)
+
+
+def _output_compare(result: dict, json_output: bool, markdown: bool) -> None:
     _error_exit(result)
     if json_output:
         _json(result)
         return
 
     rows = []
-    for fact in result.get("facts", []):
-        rows.append([
-            fact.get("cik", ""),
-            _truncate(fact.get("entityName", ""), 44),
-            fact.get("loc", ""),
-            fact.get("end", ""),
-            _format_value(fact.get("val", ""), result.get("unit", "")),
-            fact.get("accn", ""),
-        ])
-
-    title = f"{result.get('taxonomy', '')}/{result.get('tag', '')}/{result.get('unit', '')}/{result.get('frame', '')}"
+    for company in result.get("companies", []):
+        if company.get("error"):
+            rows.append([company.get("identifier", ""), "ERROR", company["error"], "", ""])
+            continue
+        for fact in company.get("facts", []):
+            rows.append([
+                company.get("identifier", ""),
+                company.get("name", ""),
+                _format_period(fact),
+                fact.get("frame", ""),
+                _format_value(fact.get("val", ""), company.get("unit", "")),
+            ])
     if markdown:
-        click.echo(f"## {title}\n")
-        click.echo(_markdown_table(["CIK", "Entity", "Location", "End", "Value", "Accession"], rows))
+        click.echo(_markdown_table(["Identifier", "Company", "Period", "Frame", "Value"], rows))
         return
 
-    table = Table(title=title)
-    table.add_column("CIK", style="magenta", no_wrap=True)
-    table.add_column("Entity")
-    table.add_column("Location", no_wrap=True)
-    table.add_column("End", style="green", no_wrap=True)
-    table.add_column("Value", justify="right")
-    table.add_column("Accession", style="cyan", no_wrap=True)
+    table = Table(title=f"Compare: {result.get('taxonomy')}/{result.get('tag')}")
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Company")
+    table.add_column("Period", no_wrap=True)
+    table.add_column("Frame", no_wrap=True)
+    table.add_column("Value", justify="right", no_wrap=True)
     for row in rows:
         table.add_row(*[str(cell) for cell in row])
-    table.caption = f"Showing {len(rows)} of {result.get('total', len(rows))} facts"
     console.print(table)
+
+
+def _output_brief(result: dict, json_output: bool, markdown: bool) -> None:
+    _error_exit(result)
+    if json_output:
+        _json(result)
+        return
+
+    profile = result.get("profile", {})
+    metric_rows = [
+        [
+            metric.get("metric", ""),
+            metric.get("tag", ""),
+            _format_period(metric.get("fact", {})),
+            _format_value(metric.get("fact", {}).get("val", ""), metric.get("unit", "")),
+        ]
+        for metric in result.get("metrics", [])
+    ]
+    event_rows = [
+        [
+            event.get("filingDate", ""),
+            ", ".join(event.get("event_types", [])),
+            event.get("accessionNumber", ""),
+        ]
+        for event in result.get("events", [])
+    ]
+    if markdown:
+        click.echo(f"## {profile.get('name', '')}\n")
+        click.echo(_markdown_table(["CIK", "Tickers", "Exchange", "SIC"], [[
+            profile.get("cik", ""), ", ".join(profile.get("tickers", [])),
+            ", ".join(profile.get("exchanges", [])), profile.get("sicDescription", ""),
+        ]]))
+        click.echo("\n### Latest Filings\n")
+        _output_filings(profile, "Latest Filings", False, True)
+        earnings = result.get("earnings") or {}
+        if earnings:
+            filing = earnings.get("filing", {})
+            click.echo("\n### Latest Earnings\n")
+            click.echo(_markdown_table(["Filed", "Accession", "URL"], [[
+                filing.get("filingDate", ""),
+                filing.get("accessionNumber", ""),
+                filing.get("filing_url", ""),
+            ]]))
+        click.echo("\n### Key Metrics\n")
+        click.echo(_markdown_table(["Metric", "Tag", "Period", "Value"], metric_rows))
+        click.echo("\n### Recent Events\n")
+        click.echo(_markdown_table(["Filed", "Events", "Accession"], event_rows))
+        return
+
+    _output_company(profile, False, False)
+    earnings = result.get("earnings") or {}
+    if earnings:
+        filing = earnings.get("filing", {})
+        console.print(Panel(
+            "\n".join([
+                f"Filed: {filing.get('filingDate', '')}",
+                f"Accession: {filing.get('accessionNumber', '')}",
+                filing.get("filing_url", ""),
+            ]),
+            title="Latest Earnings",
+            expand=False,
+        ))
+    console.print(_simple_table("Key Metrics", ["Metric", "Tag", "Period", "Value"], metric_rows))
+    if event_rows:
+        console.print(_simple_table("Recent Events", ["Filed", "Events", "Accession"], event_rows))
+
+
+def _simple_table(title: str, headers: list[str], rows: list[list]) -> Table:
+    table = Table(title=title)
+    for header in headers:
+        table.add_column(header)
+    for row in rows:
+        table.add_row(*[str(cell) for cell in row])
+    return table
+
+
+def _download_documents(result: dict, directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    import requests
+
+    headers = {"User-Agent": "edgar-cli/0.1.0 baba200@greenmountaincomputing.com"}
+    for doc in result.get("documents", []):
+        url = doc.get("url", "")
+        if not url:
+            continue
+        target = directory / Path(doc.get("document") or "document").name
+        response = requests.get(url, headers=headers, timeout=60)
+        response.raise_for_status()
+        target.write_bytes(response.content)
+
+
+def _add_deltas(facts: list[dict]) -> list[dict]:
+    rows = [dict(fact) for fact in facts]
+    for index, row in enumerate(rows):
+        if index + 1 >= len(rows):
+            continue
+        current = _number_or_none(row.get("val"))
+        previous = _number_or_none(rows[index + 1].get("val"))
+        if current is None or previous in (None, 0):
+            continue
+        row["_delta_pct"] = (current - previous) / abs(previous) * 100
+    return rows
+
+
+def _number_or_none(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_delta(value) -> str:
+    if value is None:
+        return ""
+    return f"{value:+.1f}%"
 
 
 def _format_value(value, unit: str = "") -> str:
@@ -433,6 +767,42 @@ def _format_period(fact: dict) -> str:
     if start and end:
         return f"{start}..{end}"
     return end or start
+
+
+def _output_frame(result: dict, json_output: bool, markdown: bool) -> None:
+    _error_exit(result)
+    if json_output:
+        _json(result)
+        return
+
+    rows = []
+    for fact in result.get("facts", []):
+        rows.append([
+            fact.get("cik", ""),
+            _truncate(fact.get("entityName", ""), 44),
+            fact.get("loc", ""),
+            fact.get("end", ""),
+            _format_value(fact.get("val", ""), result.get("unit", "")),
+            fact.get("accn", ""),
+        ])
+
+    title = f"{result.get('taxonomy', '')}/{result.get('tag', '')}/{result.get('unit', '')}/{result.get('frame', '')}"
+    if markdown:
+        click.echo(f"## {title}\n")
+        click.echo(_markdown_table(["CIK", "Entity", "Location", "End", "Value", "Accession"], rows))
+        return
+
+    table = Table(title=title)
+    table.add_column("CIK", style="magenta", no_wrap=True)
+    table.add_column("Entity")
+    table.add_column("Location", no_wrap=True)
+    table.add_column("End", style="green", no_wrap=True)
+    table.add_column("Value", justify="right")
+    table.add_column("Accession", style="cyan", no_wrap=True)
+    for row in rows:
+        table.add_row(*[str(cell) for cell in row])
+    table.caption = f"Showing {len(rows)} of {result.get('total', len(rows))} facts"
+    console.print(table)
 
 
 if __name__ == "__main__":

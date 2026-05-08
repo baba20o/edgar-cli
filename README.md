@@ -37,6 +37,7 @@ edgar company AAPL
 edgar company 0000320193 --limit 5
 edgar company MSFT --form 10-K --markdown
 edgar company AAPL --form 10-K --start-date 2024-01-01 --end-date 2024-12-31
+edgar company NVDA --form S-1 --all
 ```
 
 ### `filings` - Recent filings
@@ -45,6 +46,7 @@ edgar company AAPL --form 10-K --start-date 2024-01-01 --end-date 2024-12-31
 edgar filings TSLA --limit 20
 edgar filings GOOGL --form 8-K
 edgar filings NVDA --form S-1 --start-date 2020-01-01 --show-urls
+edgar filings NVDA --form S-1 --all --markdown
 ```
 
 ### `facts` - Available XBRL concepts for one company
@@ -59,6 +61,7 @@ edgar facts MSFT --limit 100 --json-output
 ```bash
 edgar concept AAPL us-gaap Assets --unit USD
 edgar concept MSFT us-gaap Revenues --limit 12 --markdown
+edgar concept AAPL us-gaap RevenueFromContractWithCustomerExcludingAssessedTax --deltas
 ```
 
 ### `frame` - Cross-company XBRL frame
@@ -66,6 +69,52 @@ edgar concept MSFT us-gaap Revenues --limit 12 --markdown
 ```bash
 edgar frame us-gaap Assets USD CY2024Q4I --limit 25
 edgar frame us-gaap Revenues USD CY2024 --sort name --markdown
+```
+
+### `open` - Open or print the latest filing index URL
+
+```bash
+edgar open AAPL --form 10-K
+edgar open AGL --form 8-K --print-only
+```
+
+### `exhibits` - List or download documents from a filing
+
+```bash
+edgar exhibits 0001628280-26-031254 --cik 1831097
+edgar exhibits https://www.sec.gov/Archives/edgar/data/1831097/000162828026031254/0001628280-26-031254-index.htm --type-filter EX-99 --markdown
+edgar exhibits 0001628280-26-031254 --cik 1831097 --download ./downloads/agiliti
+```
+
+### `earnings` - Latest Item 2.02 earnings 8-K summary
+
+```bash
+edgar earnings AAPL
+edgar earnings AGL --markdown
+```
+
+### `events` - Recent notable 8-K events
+
+```bash
+edgar events AGL --limit 10
+edgar events TSLA --markdown
+```
+
+### `compare` - Compare a concept across companies
+
+Common aliases include `revenue`, `net_income`, `operating_income`, `cash`,
+`assets`, `liabilities`, `debt`, `eps`, and `shares`.
+
+```bash
+edgar compare AAPL MSFT GOOGL --concept revenue --periods 4
+edgar compare AAPL MSFT --concept Assets --unit USD --markdown
+```
+
+### `brief` - Compact company brief
+
+```bash
+edgar brief AAPL
+edgar brief AGL --markdown
 ```
 
 ### `bulk-urls` - Official nightly bulk archive URLs
@@ -92,7 +141,8 @@ Most data commands support three output modes:
 
 Human table output abbreviates numeric values, hides long filing URLs by
 default, and keeps raw values in `--json-output`. Use `--show-urls` on filing
-commands when you want filing index URLs in the table.
+commands when you want filing index URLs in the table. For agent-to-agent work
+or narrow terminals, prefer `--markdown`; it avoids rich-table truncation.
 
 ## API Scope
 
@@ -123,9 +173,12 @@ python -m edgar --help
   CLI uses a shared local limiter of 5 requests per second.
 - Responses are cached in `~/.edgar_cache` for 15 minutes. Use `--no-cache`
   when freshness matters.
-- Filing commands currently search SEC's recent filing set. If older historical
-  chunks exist, the CLI warns instead of silently implying full-history coverage.
-  Full `--all` history fetching is tracked in `docs/BACKLOG.md`.
+- Filing commands search SEC's recent filing set by default. If older
+  historical chunks exist, the CLI warns instead of silently implying
+  full-history coverage. Use `--all` to fetch historical chunks from
+  `filings.files[]` when researching older IPO-era forms.
+- `concept` suggests similar company-specific XBRL tags when SEC returns a 404,
+  which helps with issuer-specific tags like revenue concepts.
 
 ## License
 
