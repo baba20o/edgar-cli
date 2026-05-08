@@ -324,6 +324,12 @@ def test_filings_json_keeps_envelope(monkeypatch):
     assert payload.get("filings")
 
 
+def test_help_includes_new_v2_commands():
+    result = CliRunner().invoke(main, ["--help"])
+    for cmd in ("mirror", "search", "statements", "quality", "verify", "dashboard"):
+        assert cmd in result.output, f"missing {cmd}"
+
+
 def test_cache_stats_honors_global_cache_max_mb():
     result = CliRunner().invoke(main, ["--cache-max-mb", "5", "cache", "stats", "--json-output"])
     assert result.exit_code == 0

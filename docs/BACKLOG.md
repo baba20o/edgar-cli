@@ -3,7 +3,67 @@
 This tracks test-drive feedback and the next command ideas. Priorities favor
 misleading-output fixes before convenience features.
 
-## Last Shipped — Full End-to-End Sweep
+## Last Shipped — 10x Features and Fall-Short Closeout
+
+This pass shipped the items I called out as the qualitative gap and the real
+limitations (excluding market data, which is being handled separately).
+
+**SQLite mirror + search**
+- New `edgar/mirror.py` module: schema for filers/filings/facts/documents
+  plus `filings_fts` (FTS5) virtual table.
+- `edgar mirror IDENTIFIERS --to ./edgar.sqlite` for incremental ingestion of
+  submissions + companyfacts + (optionally) per-filing document indices.
+  Re-runs are deduplicated by `(cik, accession)`.
+- `edgar search QUERY --db PATH` searches the local FTS5 index over filing
+  metadata (form, items, description, primary_document).
+- `edgar search QUERY` (no `--db`) wraps SEC's live EFTS service for content
+  search across all filers, including `--tickers`/`--form`/`--since`/`--until`.
+
+**Per-fact restatement back-population**
+- `EdgarClient._populate_restatement_state` walks same-period siblings on
+  every `concept` call; older facts whose value differs from the latest are
+  flagged `is_restated=True` with a `superseded_by` accession pointer.
+- New fields on every fact: `is_restated`, `superseded_by`,
+  `latest_known_value`, `prior_values`. `restated_facts_in_window` summary
+  added to the response envelope.
+
+**Trend change-point detection (real signal)**
+- `compute.detect_change_point` replaced the naive slope/threshold label
+  with a slope-difference binary segmentation. Linear growth no longer
+  produces spurious change points; real trend shifts (NVDA revenue
+  accelerating in Q1 FY26) get correctly labeled.
+- New labels: `accelerating`, `decelerating`, `re-decelerating`,
+  `inflecting`, in addition to `expanding`/`contracting`/`stable`.
+- Trend summary now includes `change_point_end` and `segment_slopes`.
+
+**Canonical alias expansion**
+- 18 new aliases: `accounts_receivable`, `accounts_payable`,
+  `deferred_revenue`, `accrued_liabilities`, `income_tax_expense`,
+  `deferred_tax_assets`, `deferred_tax_liabilities`,
+  `operating_lease_liabilities`, `operating_lease_rou_assets`,
+  `depreciation`, `amortization_intangibles`, `stock_compensation`,
+  `investing_cash_flow`, `financing_cash_flow`, `dividends_paid`,
+  `share_repurchases`, `interest_expense`, `goodwill`, `intangibles`,
+  `retained_earnings`, `shares_outstanding`.
+
+**Statements / quality / verify / dashboard**
+- `edgar statements TICKER --statement income|balance|cash` composes the
+  canonical aliases into a normalized financial statement envelope per
+  period, including a `coverage` percentage and per-line provenance.
+- `edgar quality TICKER` returns earnings-quality flags: `accruals_ratio`,
+  `ocf_to_ni`, `ar_to_revenue`, `sbc_to_revenue`, `inventory_days`,
+  `restatement_count_recent`. Each flag has a formula, threshold, and
+  `flagged: bool`.
+- `edgar verify TICKER` performs cross-statement consistency checks:
+  EPS↔NI/shares (5% tolerance), GP↔Revenue−COGS (1% tolerance). Each check
+  returns expected/actual/delta/tolerance/passed.
+- `edgar dashboard TICKER` is a one-call composite: profile + 7 metrics +
+  8 ratios + 5 events + earnings highlights + quality flags. Uses the
+  existing primitives so new commands automatically flow through.
+
+Tests: 93 passing (was 85 before this push).
+
+## Previously Shipped — Full End-to-End Sweep
 
 This pass closed every tractable backlog item and added clear deferral notes
 for the genuinely multi-day projects.
@@ -143,7 +203,7 @@ agents on edge cases. Each has a brief note on what would be needed.
 ## Batch And Statements
 
 - [x] Add predefined bundles: `income-statement`, `balance-sheet`, `cash-flow`, `quality`, `liquidity`, `capital-structure` (consumed via `metrics --bundle GROUP`).
-- [ ] Add `edgar statements TICKER --statement income --period CY2025` for normalized statement JSON. (Deferred — needs full canonical mapping; `metrics --bundle income-statement` covers 80%.)
+- [x] Add `edgar statements TICKER --statement income|balance|cash --period-type annual|quarterly` for normalized statement JSON with provenance + coverage %.
 - [ ] Add `edgar history TICKER revenue --periods 20 --annual` for deduplicated time series. (Closely related to `edgar trend` and `edgar concept` with period filters; standalone command not yet added.)
 - [x] Add `edgar peers TICKER --candidates @group --by sic --limit 10` (SIC-matched against a candidate set; SEC ticker map lacks SIC so dynamic universe scan would be expensive).
 - [ ] Add `edgar export` to write command outputs to CSV / SQLite with schema metadata. (NDJSON shipped; CSV/SQLite pending.)
@@ -158,8 +218,8 @@ agents on edge cases. Each has a brief note on what would be needed.
 
 ## Local Research Moat
 
-- [ ] Add `edgar mirror TICKER --since YYYY-MM-DD --to ./edgar.sqlite` for local submissions, facts, documents, and filing text. *(Deferred — multi-day project; foundation for `edgar search`.)*
-- [ ] Add `edgar search "query" --form 10-K --since YYYY-MM-DD --tickers FILE_OR_GROUP` over mirrored filings or SEC full-text search. *(Deferred — depends on mirror or wraps SEC EFTS.)*
+- [x] Add `edgar mirror IDENTIFIERS --to ./edgar.sqlite` for incremental local submissions+facts ingestion. (Filing-text body indexing still pending; current FTS5 indexes filing metadata, not document bodies.)
+- [x] Add `edgar search QUERY [--db PATH | live EFTS]` for full-text search across filings. Mirror path uses FTS5 over metadata; default path wraps SEC EFTS for content search.
 - [x] `edgar watch` is covered by `edgar subscribe add` + `edgar pending` + `edgar mark-seen` triple, with state in `~/.edgar/state.json`.
 - [ ] Add offline-first mode that refuses live SEC calls and reports cache misses cleanly.
 
@@ -167,7 +227,7 @@ agents on edge cases. Each has a brief note on what would be needed.
 
 - [x] Add `--as-of YYYY-MM-DD` to every data command (concept, ttm, ratios, trend, growth, reconstruct, delta).
 - [x] Add `edgar audit-trail TICKER --concept ALIAS --period CY2024` with restatement detection.
-- [ ] Walk later filings to populate `is_restated`, `superseded_by` on every returned fact. *(Deferred — needs bulk pre-walk; `audit-trail` surfaces restatements today on demand.)*
+- [x] Walk same-period sibling facts to populate `is_restated`, `superseded_by`, `latest_known_value`, and `prior_values` on every fact returned by `concept`.
 - [x] Add `edgar amendments TICKER --since YYYY-MM-DD` to chain primary filings to their `/A` amendments. (Reports the chain; section-level diff between amendment and primary is part of the deferred `edgar changes`.)
 
 ## Discovery
@@ -186,9 +246,9 @@ agents on edge cases. Each has a brief note on what would be needed.
 ## Filer Intelligence
 
 - [x] Add `edgar dei TICKER` for entity-level metadata (filer status, fiscal year end, addresses, former names).
-- [ ] Add `edgar dashboard TICKER` composite envelope. *(Deferred — most useful once mirror+search land; today agents can compose `metrics` + `events` + `earnings` + `dei` themselves.)*
+- [x] Add `edgar dashboard TICKER` composite envelope (profile + metrics + ratios + events + earnings + quality).
 - [ ] Add `edgar governance TICKER --year 2025` DEF 14A parsing. *(Deferred — proxy parsing is its own project.)*
-- [ ] Add `edgar verify TICKER --period CY2025` cross-statement consistency checks. *(Deferred — needs accurate canonical mappings; could ship a v1 with caveats but punted to keep trustworthiness high.)*
+- [x] Add `edgar verify TICKER --period-type ...` cross-statement consistency checks (EPS↔NI/shares, GP↔Rev−COGS).
 
 ## Composability
 
@@ -206,7 +266,7 @@ Foundation principle: every derived number returns `{value, formula, inputs:[{ta
 - [x] Add `edgar trend TICKER -c METRIC --periods N` with slope and a categorical label.
 - [x] Add `edgar growth TICKER -c METRIC --basis yoy,qoq,cagr3,cagr5`.
 - [x] Add `edgar reconstruct TICKER -c {ebitda|fcf|net_debt|nwc|tangible_book}`.
-- [ ] Add `edgar quality TICKER` covering earnings-quality flags. *(Deferred — needs accruals + working-capital change tagging; safer to ship after `--since-last-fetch` on concept lands.)*
+- [x] Add `edgar quality TICKER` with accruals_ratio / ocf_to_ni / ar_to_revenue / sbc_to_revenue / inventory_days / restatement_count_recent flags.
 - [ ] Add per-share normalizations to `metrics`: BVPS, FCF/share, sales/share. *(Pending — `eps`/`diluted_eps`/`shares` already in canonical set; per-share derivations not yet wired.)*
 - [ ] Honor `is_restated`/`superseded_by` in every computed metric so trend slopes do not mix restated with original. *(Tied to the bulk-walk deferral above.)*
 - [x] Document canonical definitions for ambiguous metrics in [`docs/definitions.md`](definitions.md).

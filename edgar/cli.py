@@ -1256,6 +1256,253 @@ def _output_schemas() -> dict:
     }
 
 
+@main.command()
+@click.argument("identifiers", nargs=-1, required=True)
+@click.option("--to", "db_path", type=click.Path(dir_okay=False, path_type=Path), required=True,
+              help="Path to the SQLite database (created if missing)")
+@click.option("--no-facts", is_flag=True, help="Skip companyfacts ingestion (mirror submissions only)")
+@click.option("--documents-for", default=None,
+              help="Also ingest filing-index documents for the latest 5 filings of this form (e.g. 10-K)")
+@output_options
+@click.pass_context
+def mirror(ctx, identifiers, db_path, no_facts, documents_for, markdown, json_output, ndjson):
+    """Mirror filer submissions + facts to a local SQLite database (incremental)."""
+    client = get_client(use_cache=not ctx.obj["no_cache"],
+                       cache_max_mb=ctx.obj.get("cache_max_mb"))
+    expanded = _expand_groups(list(identifiers), client=client)
+    summaries = []
+    for ident in expanded:
+        result = client.mirror_filer(
+            ident, db_path=str(db_path), include_facts=not no_facts,
+            include_documents_for_form=documents_for,
+        )
+        summaries.append(result)
+    payload = client._envelope({"results": summaries, "db_path": str(db_path),
+                                 "total": len(summaries)})
+    if ndjson:
+        _ndjson(summaries)
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(payload)
+        return
+    rows = [[r.get("ticker") or r.get("identifier", ""), r.get("name", ""),
+             r.get("filings_inserted", "—"), r.get("facts_inserted", "—"),
+             r.get("docs_inserted", "—"), r.get("error", "")]
+            for r in summaries]
+    headers = ["Ticker", "Name", "Filings+", "Facts+", "Docs+", "Error"]
+    title = f"Mirror to {db_path}"
+    if markdown:
+        click.echo(_markdown_table(headers, rows))
+        return
+    console.print(_simple_table(title, headers, rows))
+
+
+@main.command()
+@click.argument("query")
+@click.option("--db", "db_path", type=click.Path(dir_okay=False, path_type=Path), default=None,
+              help="Search the local SQLite mirror at this path (uses FTS5)")
+@click.option("--form", default=None, help="Restrict to a specific form")
+@click.option("--since", default=None, callback=_validate_date_option,
+              help="Only filings on/after YYYY-MM-DD")
+@click.option("--until", default=None, callback=_validate_date_option,
+              help="Only filings on/before YYYY-MM-DD (live SEC EFTS only)")
+@click.option("--tickers", default=None,
+              help="Comma-separated identifiers (or @group) to scope the search")
+@click.option("--limit", "-n", default=25, show_default=True, type=PositiveInt)
+@output_options
+@click.pass_context
+def search(ctx, query, db_path, form, since, until, tickers, limit,
+           markdown, json_output, ndjson):
+    """Full-text search filings.
+
+    With `--db PATH` searches the local SQLite mirror via FTS5 (fast, scoped).
+    Without it, queries SEC's live EDGAR Full-Text Search service.
+    """
+    client = get_client(use_cache=not ctx.obj["no_cache"],
+                       cache_max_mb=ctx.obj.get("cache_max_mb"))
+    cik_list = None
+    if tickers:
+        ids = _expand_groups(_split_input_values(tickers), client=client)
+        cik_list = []
+        for ident in ids:
+            company = client.resolve_company(ident)
+            if "error" not in company:
+                cik_list.append(company["cik"])
+    if db_path:
+        result = client.search_mirror(str(db_path), query, form=form, since=since,
+                                       ciks=cik_list, limit=limit)
+    else:
+        primary_cik = cik_list[0] if cik_list else None
+        result = client.search_efts(query, form=form, since=since, until=until,
+                                     cik=primary_cik, limit=limit)
+    result = _finalize(client, result)
+    _error_exit(result)
+    matches = result.get("matches", [])
+    if ndjson:
+        _ndjson(matches)
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+    rows = []
+    for m in matches:
+        rows.append([
+            m.get("filed", ""), m.get("form", ""),
+            (m.get("display_names") or [m.get("name", "")])[0] if isinstance(m.get("display_names"), list) else m.get("name", ""),
+            m.get("accession", ""),
+            (m.get("highlight") or [m.get("description", "")])[0] if m.get("highlight") else (m.get("description") or "")[:80],
+        ])
+    headers = ["Filed", "Form", "Filer", "Accession", "Match"]
+    title = f"Search: {query!r}" + (" (mirror)" if db_path else " (live EFTS)")
+    if markdown:
+        click.echo(_markdown_table(headers, rows))
+        return
+    console.print(_simple_table(title, headers, rows))
+
+
+@main.command()
+@click.argument("identifier")
+@output_options
+@click.pass_context
+def dashboard(ctx, identifier, markdown, json_output, ndjson):
+    """One-call composite snapshot: profile + metrics + ratios + events + quality."""
+    client = get_client(use_cache=not ctx.obj["no_cache"],
+                       cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.dashboard(identifier)
+    result = _finalize(client, result)
+    _error_exit(result)
+    if ndjson:
+        _ndjson([result])
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+    profile = result.get("profile", {})
+    body = "\n".join([
+        f"CIK: {result.get('cik', '')}",
+        f"SIC: {profile.get('sic', '')} {profile.get('sicDescription', '')}",
+        f"Fiscal year end: {profile.get('fiscalYearEnd', '')}",
+        f"Exchanges: {', '.join(profile.get('exchanges', []))}",
+        f"Latest filings: {len(profile.get('latest_filings', []))}",
+        f"Metrics: {len(result.get('metrics', []))}",
+        f"Ratios: {len(result.get('ratios', []))}",
+        f"Recent events: {len(result.get('events', []))}",
+        f"Quality flags: {result.get('quality', {}).get('flagged_count', 0)} of {len(result.get('quality', {}).get('flags', []))}",
+    ])
+    console.print(Panel(body, title=f"Dashboard: {result.get('name', '')}", expand=False))
+
+
+@main.command()
+@click.argument("identifier")
+@click.option("--period-type", default="annual",
+              type=click.Choice(["annual", "quarterly", "ytd"]), show_default=True)
+@click.option("--as-of", "as_of", default=None, callback=_validate_date_option)
+@output_options
+@click.pass_context
+def quality(ctx, identifier, period_type, as_of, markdown, json_output, ndjson):
+    """Earnings-quality flags: accruals, OpCF/NI divergence, AR creep, SBC, restatements."""
+    client = get_client(use_cache=not ctx.obj["no_cache"],
+                       cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.quality(identifier, period_type=period_type, as_of=as_of)
+    result = _finalize(client, result)
+    _error_exit(result)
+    if ndjson:
+        _ndjson(result.get("flags", []))
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+    rows = []
+    for f in result.get("flags", []):
+        v = f.get("value")
+        rows.append([
+            f["flag"],
+            f"{v:.4f}" if isinstance(v, float) else (str(v) if v is not None else "—"),
+            "FLAG" if f.get("flagged") else "",
+            f.get("threshold", ""),
+            f.get("formula", "")[:60],
+        ])
+    headers = ["Flag", "Value", "Status", "Threshold", "Formula"]
+    title = (f"Quality: {result.get('name', identifier)} "
+             f"({result.get('flagged_count', 0)}/{len(result.get('flags', []))} flagged)")
+    if markdown:
+        click.echo(_markdown_table(headers, rows))
+        return
+    console.print(_simple_table(title, headers, rows))
+
+
+@main.command()
+@click.argument("identifier")
+@click.option("--period-type", default="annual",
+              type=click.Choice(["annual", "quarterly", "ytd"]), show_default=True)
+@click.option("--as-of", "as_of", default=None, callback=_validate_date_option)
+@output_options
+@click.pass_context
+def verify(ctx, identifier, period_type, as_of, markdown, json_output, ndjson):
+    """Cross-statement consistency checks (EPS↔NI/shares, GP↔Rev−COGS, ...)."""
+    client = get_client(use_cache=not ctx.obj["no_cache"],
+                       cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.verify(identifier, period_type=period_type, as_of=as_of)
+    result = _finalize(client, result)
+    _error_exit(result)
+    if ndjson:
+        _ndjson(result.get("checks", []))
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+    rows = [[c["check"], "PASS" if c.get("passed") else "FAIL",
+             _format_value(c.get("expected")), _format_value(c.get("actual")),
+             _format_value(c.get("delta")), c.get("formula", "")[:60]]
+            for c in result.get("checks", [])]
+    headers = ["Check", "Status", "Expected", "Actual", "Delta", "Formula"]
+    title = (f"Verify: {result.get('name', identifier)} "
+             f"({result.get('passed', 0)}/{result.get('total', 0)} passed)")
+    if markdown:
+        click.echo(_markdown_table(headers, rows))
+        return
+    console.print(_simple_table(title, headers, rows))
+
+
+@main.command()
+@click.argument("identifier")
+@click.option("--statement", default="income", show_default=True,
+              type=click.Choice(["income", "balance", "cash"]))
+@click.option("--period-type", default="annual",
+              type=click.Choice(["annual", "quarterly", "ytd"]), show_default=True)
+@click.option("--as-of", "as_of", default=None, callback=_validate_date_option)
+@output_options
+@click.pass_context
+def statements(ctx, identifier, statement, period_type, as_of, markdown, json_output, ndjson):
+    """Compose a normalized financial statement (income/balance/cash flow)."""
+    client = get_client(use_cache=not ctx.obj["no_cache"],
+                       cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.statement(identifier, statement=statement,
+                              period_type=period_type, as_of=as_of)
+    result = _finalize(client, result)
+    _error_exit(result)
+    if ndjson:
+        _ndjson(result.get("lines", []))
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+    rows = [[l["line"], _format_value(l.get("value"), l.get("unit", "")),
+             l.get("tag", "—") or "—",
+             l.get("end", "—") or l.get("start", "—") or "—",
+             "yes" if l.get("is_restated") else "",
+             l.get("error", "missing" if l.get("missing") else "")]
+            for l in result.get("lines", [])]
+    headers = ["Line", "Value", "Tag", "Period End", "Restated", "Note"]
+    title = (f"{statement.title()} statement: {result.get('name', identifier)} "
+             f"({result.get('period_end') or 'latest'}, "
+             f"coverage {int(result.get('coverage', 0)*100)}%)")
+    if markdown:
+        click.echo(_markdown_table(headers, rows))
+        return
+    console.print(_simple_table(title, headers, rows))
+
+
 @main.command("audit-trail")
 @click.argument("identifier")
 @click.option("--concept", "-c", required=True, help="Concept alias (e.g. revenue, net_income)")

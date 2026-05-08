@@ -896,6 +896,7 @@ def test_compute_ttm_sums_four_quarters():
 def test_compute_trend_label_categorizes():
     from edgar.compute import trend_summary
 
+    # Linear growth — no change point, expanding label.
     facts = [{"val": v, "end": f"2025-{m:02d}-01"} for m, v in [(1, 100), (3, 110), (6, 120), (9, 130)]]
     out = trend_summary(facts)
     assert out["label"] == "expanding"
@@ -903,6 +904,37 @@ def test_compute_trend_label_categorizes():
 
     flat_facts = [{"val": 100, "end": f"2025-{m:02d}-01"} for m in (1, 4, 7, 10)]
     assert trend_summary(flat_facts)["label"] == "stable"
+
+
+def test_compute_trend_detects_acceleration():
+    """Slow growth then fast growth -> 'accelerating' with change_point set."""
+    from edgar.compute import trend_summary
+
+    # 8 points: first 4 grow at +1/period, last 4 grow at +10/period.
+    facts = [
+        {"val": 100, "end": "2024-01-01"}, {"val": 101, "end": "2024-04-01"},
+        {"val": 102, "end": "2024-07-01"}, {"val": 103, "end": "2024-10-01"},
+        {"val": 113, "end": "2025-01-01"}, {"val": 123, "end": "2025-04-01"},
+        {"val": 133, "end": "2025-07-01"}, {"val": 143, "end": "2025-10-01"},
+    ]
+    out = trend_summary(facts)
+    assert out["label"] == "accelerating"
+    assert out["change_point"] is not None
+    assert out["segment_slopes"]["after"] > out["segment_slopes"]["before"]
+
+
+def test_compute_trend_detects_inflection():
+    """Up then down -> 'inflecting'."""
+    from edgar.compute import trend_summary
+
+    facts = [
+        {"val": 100, "end": "2024-01-01"}, {"val": 110, "end": "2024-04-01"},
+        {"val": 120, "end": "2024-07-01"}, {"val": 130, "end": "2024-10-01"},
+        {"val": 125, "end": "2025-01-01"}, {"val": 115, "end": "2025-04-01"},
+        {"val": 105, "end": "2025-07-01"}, {"val": 95, "end": "2025-10-01"},
+    ]
+    out = trend_summary(facts)
+    assert out["label"] == "inflecting"
 
 
 def test_compute_cagr_handles_two_years():
@@ -1054,6 +1086,114 @@ def test_compute_envelope_keeps_value_when_only_optional_input_missing():
     assert out["value"] == 2.0
     assert out.get("missing_inputs") is None
     assert out.get("optional_missing_inputs") == ["InventoryNet"]
+
+
+# --- Phase 1-2: mirror + search ---
+
+
+def test_mirror_open_db_creates_schema(tmp_path):
+    from edgar.mirror import open_db
+
+    db_path = tmp_path / "mirror.sqlite"
+    with open_db(db_path) as conn:
+        tables = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+        )}
+    assert {"filers", "filings", "facts", "documents", "filings_fts",
+            "schema_meta"}.issubset(tables)
+
+
+def test_mirror_ingest_submissions_inserts_filings(tmp_path):
+    from edgar.mirror import open_db, ingest_submissions
+
+    submissions = {
+        "name": "Apple Inc.", "tickers": ["AAPL"], "sic": "3571",
+        "sicDescription": "Electronic Computers", "fiscalYearEnd": "0926",
+        "filings": {"recent": {
+            "accessionNumber": ["0000320193-25-000079", "0000320193-26-000013"],
+            "filingDate": ["2025-10-31", "2026-05-01"],
+            "form": ["10-K", "10-Q"],
+            "primaryDocument": ["aapl-20250927.htm", "aapl-20260328.htm"],
+            "primaryDocDescription": ["10-K", "10-Q"],
+            "items": ["", ""],
+            "reportDate": ["2025-09-27", "2026-03-28"],
+        }},
+    }
+    with open_db(tmp_path / "m.sqlite") as conn:
+        out = ingest_submissions(conn, "0000320193", submissions)
+        assert out["filings_inserted"] == 2
+        # Idempotent — second pass inserts zero.
+        out2 = ingest_submissions(conn, "0000320193", submissions)
+        assert out2["filings_inserted"] == 0
+        rows = list(conn.execute(
+            "SELECT form, filed FROM filings WHERE cik = ? ORDER BY filed",
+            ("0000320193",),
+        ))
+        assert [r[0] for r in rows] == ["10-K", "10-Q"]
+
+
+def test_mirror_search_fts_finds_form_metadata(tmp_path):
+    from edgar.mirror import open_db, ingest_submissions, search_filings
+
+    submissions = {
+        "name": "Test Inc.", "filings": {"recent": {
+            "accessionNumber": ["x-1", "x-2"],
+            "filingDate": ["2025-01-01", "2025-02-01"],
+            "form": ["10-K", "8-K"],
+            "primaryDocument": ["10k.htm", "8k.htm"],
+            "primaryDocDescription": ["10-K", "8-K"],
+            "items": ["", "2.02,9.01"],
+            "reportDate": ["", ""],
+        }},
+    }
+    with open_db(tmp_path / "m.sqlite") as conn:
+        ingest_submissions(conn, "0000000001", submissions)
+        results = search_filings(conn, "10-K")
+        assert any(r["form"] == "10-K" for r in results)
+        # Item-code search.
+        results = search_filings(conn, "2.02")
+        assert any("2.02" in (r.get("items") or "") for r in results)
+
+
+# --- Phase 3: restatement back-fill ---
+
+
+def test_populate_restatement_state_marks_priors():
+    from edgar.api import EdgarClient
+
+    facts = [
+        {"start": "2024-01-01", "end": "2024-12-31", "unit": "USD",
+         "val": 100, "filed": "2025-02-01", "accn": "x-1"},
+        {"start": "2024-01-01", "end": "2024-12-31", "unit": "USD",
+         "val": 110, "filed": "2026-02-01", "accn": "x-2"},  # restated up
+        {"start": "2023-01-01", "end": "2023-12-31", "unit": "USD",
+         "val": 80, "filed": "2024-02-01", "accn": "y-1"},
+    ]
+    EdgarClient._populate_restatement_state(facts)
+    by_accn = {f["accn"]: f for f in facts}
+    assert by_accn["x-1"]["is_restated"] is True
+    assert by_accn["x-1"]["superseded_by"] == "x-2"
+    assert by_accn["x-1"]["latest_known_value"] == 110
+    assert by_accn["x-2"]["is_restated"] is False
+    assert by_accn["x-2"]["prior_values"] == [
+        {"val": 100, "filed": "2025-02-01", "accession": "x-1"}
+    ]
+    # Unrestated period stays clean.
+    assert by_accn["y-1"]["is_restated"] is False
+
+
+# --- Phase 7-9: quality / verify / dashboard ---
+
+
+def test_quality_flags_have_provenance(tmp_path):
+    from edgar.compute import _input_record
+
+    # Just verify the input-record shape we depend on for quality flags.
+    rec = _input_record("Test", {"val": 100, "tag": "X", "filing_url": "http://e",
+                                 "end": "2025-01-01"})
+    assert rec["val"] == 100
+    assert rec["tag"] == "X"
+    assert rec["source_url"] == "http://e"
 
 
 def test_extract_earnings_highlights_skips_table_dumps():

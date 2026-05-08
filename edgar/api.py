@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import sqlite3
 import time
 from datetime import date, datetime, timedelta
 from difflib import get_close_matches
@@ -35,6 +36,7 @@ from edgar import __version__ as CLI_VERSION
 from edgar import compute
 from edgar.cache import EdgarCache, ttl_for_url
 from edgar.state import StateStore
+from edgar import mirror as mirror_mod
 
 log = logging.getLogger(__name__)
 
@@ -129,6 +131,86 @@ COMMON_CONCEPT_CANDIDATES = {
         ("us-gaap", "SalesRevenueServicesNet", "USD"),
     ],
     "shares": [("dei", "EntityCommonStockSharesOutstanding", "shares")],
+    # Working-capital line items
+    "accounts_receivable": [
+        ("us-gaap", "AccountsReceivableNetCurrent", "USD"),
+        ("us-gaap", "ReceivablesNetCurrent", "USD"),
+    ],
+    "accounts_payable": [
+        ("us-gaap", "AccountsPayableCurrent", "USD"),
+    ],
+    "deferred_revenue": [
+        ("us-gaap", "ContractWithCustomerLiability", "USD"),
+        ("us-gaap", "DeferredRevenue", "USD"),
+        ("us-gaap", "DeferredRevenueCurrent", "USD"),
+    ],
+    "accrued_liabilities": [
+        ("us-gaap", "AccruedLiabilitiesCurrent", "USD"),
+    ],
+    # Tax
+    "income_tax_expense": [
+        ("us-gaap", "IncomeTaxExpenseBenefit", "USD"),
+    ],
+    "deferred_tax_assets": [
+        ("us-gaap", "DeferredTaxAssetsNet", "USD"),
+        ("us-gaap", "DeferredTaxAssetsLiabilitiesNet", "USD"),
+    ],
+    "deferred_tax_liabilities": [
+        ("us-gaap", "DeferredIncomeTaxLiabilitiesNet", "USD"),
+    ],
+    # Lease accounting (ASC 842)
+    "operating_lease_liabilities": [
+        ("us-gaap", "OperatingLeaseLiability", "USD"),
+        ("us-gaap", "OperatingLeaseLiabilityNoncurrent", "USD"),
+    ],
+    "operating_lease_rou_assets": [
+        ("us-gaap", "OperatingLeaseRightOfUseAsset", "USD"),
+    ],
+    # Cash flow components
+    "depreciation": [
+        ("us-gaap", "Depreciation", "USD"),
+        ("us-gaap", "DepreciationAndAmortization", "USD"),
+    ],
+    "amortization_intangibles": [
+        ("us-gaap", "AmortizationOfIntangibleAssets", "USD"),
+    ],
+    "stock_compensation": [
+        ("us-gaap", "ShareBasedCompensation", "USD"),
+        ("us-gaap", "StockBasedCompensation", "USD"),
+    ],
+    "investing_cash_flow": [
+        ("us-gaap", "NetCashProvidedByUsedInInvestingActivities", "USD"),
+    ],
+    "financing_cash_flow": [
+        ("us-gaap", "NetCashProvidedByUsedInFinancingActivities", "USD"),
+    ],
+    "dividends_paid": [
+        ("us-gaap", "PaymentsOfDividends", "USD"),
+        ("us-gaap", "PaymentsOfDividendsCommonStock", "USD"),
+    ],
+    "share_repurchases": [
+        ("us-gaap", "PaymentsForRepurchaseOfCommonStock", "USD"),
+    ],
+    "interest_expense": [
+        ("us-gaap", "InterestExpense", "USD"),
+    ],
+    # Intangibles
+    "goodwill": [
+        ("us-gaap", "Goodwill", "USD"),
+    ],
+    "intangibles": [
+        ("us-gaap", "IntangibleAssetsNetExcludingGoodwill", "USD"),
+        ("us-gaap", "FiniteLivedIntangibleAssetsNet", "USD"),
+    ],
+    # Retained earnings
+    "retained_earnings": [
+        ("us-gaap", "RetainedEarningsAccumulatedDeficit", "USD"),
+    ],
+    # Common shares outstanding (period-end count, not split-adjusted)
+    "shares_outstanding": [
+        ("dei", "EntityCommonStockSharesOutstanding", "shares"),
+        ("us-gaap", "CommonStockSharesOutstanding", "shares"),
+    ],
 }
 
 COMMON_CONCEPTS = {
@@ -658,6 +740,52 @@ class EdgarClient(BaseAPIClient):
             "total": len(concepts),
         }
 
+    @staticmethod
+    def _populate_restatement_state(facts: list[dict]) -> list[dict]:
+        """Walk facts and back-fill `is_restated`, `superseded_by`,
+        `latest_known_value`, and `prior_values` based on same-period siblings.
+
+        Two facts are considered to describe the same period when their
+        `(start, end)` (or `end` alone for instants) match. The fact with the
+        latest `filed` date is the latest known value; earlier facts whose
+        `val` differs are flagged `is_restated=True` with a `superseded_by`
+        pointer to the latest accession.
+        """
+        groups: dict[tuple, list[dict]] = {}
+        for fact in facts:
+            key = (fact.get("start", ""), fact.get("end", ""), fact.get("unit", ""))
+            groups.setdefault(key, []).append(fact)
+
+        for siblings in groups.values():
+            if len(siblings) <= 1:
+                # Single observation — explicitly mark it as not restated.
+                siblings[0].setdefault("is_restated", False)
+                siblings[0].setdefault("superseded_by", None)
+                siblings[0].setdefault("prior_values", [])
+                siblings[0].setdefault("latest_known_value", siblings[0].get("val"))
+                continue
+            ordered = sorted(siblings, key=lambda f: f.get("filed", ""))
+            latest = ordered[-1]
+            latest_val = latest.get("val")
+            latest_accn = latest.get("accn") or latest.get("accession", "")
+            distinct_vals = []
+            for prior in ordered[:-1]:
+                pv = prior.get("val")
+                prior["is_restated"] = pv != latest_val
+                prior["superseded_by"] = latest_accn if prior["is_restated"] else None
+                prior["latest_known_value"] = latest_val
+                if pv != latest_val and pv not in [d["val"] for d in distinct_vals]:
+                    distinct_vals.append({
+                        "val": pv,
+                        "filed": prior.get("filed", ""),
+                        "accession": prior.get("accn") or prior.get("accession", ""),
+                    })
+            latest["is_restated"] = False
+            latest["superseded_by"] = None
+            latest["latest_known_value"] = latest_val
+            latest["prior_values"] = distinct_vals
+        return facts
+
     def company_concept(self, identifier: str | int, taxonomy: str, tag: str,
                         unit: Optional[str] = None, limit: int = 20,
                         suggest_on_404: bool = True,
@@ -697,7 +825,12 @@ class EdgarClient(BaseAPIClient):
                     continue
                 facts.append(item)
 
+        # Back-fill restatement state across all same-period siblings before
+        # truncating to `limit`, so even truncated views carry accurate flags.
+        self._populate_restatement_state(facts)
+
         facts.sort(key=lambda x: (x.get("filed", ""), x.get("end", "")), reverse=True)
+        restated_count = sum(1 for f in facts if f.get("is_restated"))
         return {
             "cik": normalize_cik(result.get("cik", company["cik"])),
             "name": result.get("entityName", company.get("name", "")),
@@ -708,6 +841,7 @@ class EdgarClient(BaseAPIClient):
             "as_of": as_of,
             "facts": facts[:limit],
             "total": len(facts),
+            "restated_facts_in_window": restated_count,
         }
 
     def company_concept_alias(self, identifier: str | int, concept: str,
@@ -1225,6 +1359,515 @@ class EdgarClient(BaseAPIClient):
                     "snippets": snippets,
                 })
         return {"cik": result["cik"], "name": result["name"], "events": events, "total": len(events)}
+
+    def dashboard(self, identifier: str | int) -> dict:
+        """One-call composite: profile + key metrics + recent events + earnings + quality.
+
+        Composes the existing primitives so an agent can get the full state of
+        a filer in a single CLI invocation.
+        """
+        company = self.resolve_company(identifier)
+        if "error" in company:
+            return company
+        cik = company["cik"]
+        out = {
+            "cik": cik, "ticker": company.get("ticker", ""),
+            "name": company.get("name", ""),
+        }
+
+        profile = self.submissions(identifier, limit=10)
+        if "error" not in profile:
+            out["profile"] = {
+                "sic": profile.get("sic", ""),
+                "sicDescription": profile.get("sicDescription", ""),
+                "fiscalYearEnd": profile.get("fiscalYearEnd", ""),
+                "exchanges": profile.get("exchanges", []),
+                "tickers": profile.get("tickers", []),
+                "latest_filings": profile.get("filings", [])[:5],
+            }
+
+        bundle = ["revenue", "net_income", "operating_income",
+                  "operating_cash_flow", "cash", "debt", "equity"]
+        metrics_result = self.metrics(identifier, bundle)
+        if "error" not in metrics_result:
+            out["metrics"] = metrics_result.get("metrics", [])
+            out["reference_date"] = metrics_result.get("reference_date", "")
+
+        ratios_result = self.ratios(identifier, period_type="annual")
+        if "error" not in ratios_result:
+            out["ratios"] = [
+                {"metric": r["metric"], "value": r.get("value"),
+                 "formula": r.get("formula", "")}
+                for r in ratios_result.get("ratios", [])
+                if r.get("metric") in {"gross_margin", "operating_margin",
+                                        "net_margin", "fcf_margin", "roe", "roa",
+                                        "debt_to_equity", "current_ratio"}
+            ]
+
+        events_result = self.events(identifier, limit=8)
+        if "error" not in events_result:
+            out["events"] = events_result.get("events", [])[:5]
+
+        try:
+            earnings_result = self.latest_earnings(identifier, limit=8)
+            if "error" not in earnings_result:
+                out["latest_earnings"] = {
+                    "filing": earnings_result.get("filing"),
+                    "exhibit": earnings_result.get("exhibit"),
+                    "highlights": earnings_result.get("highlights", [])[:5],
+                }
+        except Exception:
+            pass
+
+        quality_result = self.quality(identifier)
+        if "error" not in quality_result:
+            out["quality"] = {
+                "flagged_count": quality_result.get("flagged_count", 0),
+                "flags": [{"flag": f["flag"], "value": f.get("value"),
+                           "flagged": f.get("flagged", False)}
+                          for f in quality_result.get("flags", [])],
+            }
+
+        return out
+
+    def quality(self, identifier: str | int, period_type: str = "annual",
+                as_of: Optional[str] = None) -> dict:
+        """Earnings-quality and balance-sheet-quality flags.
+
+        Returns a list of named flags, each with a value and a `flagged: bool`
+        indicator. Threshold values are documented in `docs/definitions.md`.
+        """
+        company = self.resolve_company(identifier)
+        if "error" in company:
+            return company
+        cik = company["cik"]
+
+        ni = self._latest_fact_for_alias(cik, "net_income", period_type=period_type, as_of=as_of)
+        ocf = self._latest_fact_for_alias(cik, "operating_cash_flow", period_type=period_type, as_of=as_of)
+        revenue = self._latest_fact_for_alias(cik, "revenue", period_type=period_type, as_of=as_of)
+        sbc = self._latest_fact_for_alias(cik, "stock_compensation", period_type=period_type, as_of=as_of)
+        anchor = (ni or revenue or {}).get("end", "")
+
+        assets = self._instant_fact_at_period_end(cik, "assets", target_end=anchor, as_of=as_of)
+        ar = self._instant_fact_at_period_end(cik, "accounts_receivable", target_end=anchor, as_of=as_of)
+        inv = self._instant_fact_at_period_end(cik, "inventory", target_end=anchor, as_of=as_of)
+
+        flags: list[dict] = []
+
+        # Accruals ratio = (NI - OpCF) / total Assets. >0.10 is an aggressive-accruals flag.
+        ni_v = compute._value_or_none(ni)
+        ocf_v = compute._value_or_none(ocf)
+        assets_v = compute._value_or_none(assets)
+        if ni_v is not None and ocf_v is not None and assets_v not in (None, 0):
+            value = (ni_v - ocf_v) / assets_v
+            flags.append({
+                "flag": "accruals_ratio",
+                "value": value,
+                "formula": "(NetIncome - OperatingCashFlow) / Assets",
+                "threshold": "abs > 0.10",
+                "flagged": abs(value) > 0.10,
+                "inputs": [
+                    compute._input_record("NetIncomeLoss", ni),
+                    compute._input_record("OperatingCashFlow", ocf),
+                    compute._input_record("Assets", assets),
+                ],
+            })
+        else:
+            flags.append({"flag": "accruals_ratio", "value": None,
+                          "formula": "(NetIncome - OperatingCashFlow) / Assets",
+                          "missing_inputs": [k for k, v in
+                                              [("NI", ni_v), ("OCF", ocf_v), ("Assets", assets_v)]
+                                              if v is None]})
+
+        # OpCF / NI divergence. <0.8 means OCF is materially below earnings.
+        if ni_v not in (None, 0) and ocf_v is not None:
+            ratio = ocf_v / ni_v
+            flags.append({
+                "flag": "ocf_to_ni",
+                "value": ratio,
+                "formula": "OperatingCashFlow / NetIncome",
+                "threshold": "ratio < 0.80",
+                "flagged": ratio < 0.80,
+                "inputs": [compute._input_record("OperatingCashFlow", ocf),
+                           compute._input_record("NetIncomeLoss", ni)],
+            })
+
+        # AR/Revenue creep — receivables growing faster than revenue suggests
+        # channel stuffing or worsening collections.
+        ar_v = compute._value_or_none(ar)
+        rev_v = compute._value_or_none(revenue)
+        if ar_v is not None and rev_v not in (None, 0):
+            ratio = ar_v / rev_v
+            flags.append({
+                "flag": "ar_to_revenue",
+                "value": ratio,
+                "formula": "AccountsReceivable / Revenue",
+                "threshold": "(no static threshold; track delta vs peers/history)",
+                "flagged": False,
+                "inputs": [compute._input_record("AccountsReceivable", ar),
+                           compute._input_record("Revenue", revenue)],
+            })
+
+        # Stock-based compensation as % of revenue. >15% is high.
+        sbc_v = compute._value_or_none(sbc)
+        if sbc_v is not None and rev_v not in (None, 0):
+            ratio = sbc_v / rev_v
+            flags.append({
+                "flag": "sbc_to_revenue",
+                "value": ratio,
+                "formula": "StockBasedCompensation / Revenue",
+                "threshold": "ratio > 0.15",
+                "flagged": ratio > 0.15,
+                "inputs": [compute._input_record("StockBasedCompensation", sbc),
+                           compute._input_record("Revenue", revenue)],
+            })
+
+        # Inventory days = Inventory / (COGS / 365). High vs peers signals build-up.
+        # We surface raw inventory + days only when COGS is available.
+        cogs = self._latest_fact_for_alias(cik, "cogs", period_type=period_type, as_of=as_of)
+        cogs_v = compute._value_or_none(cogs)
+        inv_v = compute._value_or_none(inv)
+        if inv_v is not None and cogs_v not in (None, 0):
+            days = inv_v / (cogs_v / 365)
+            flags.append({
+                "flag": "inventory_days",
+                "value": days,
+                "formula": "Inventory / (COGS / 365)",
+                "threshold": "(no static threshold; compare to sector)",
+                "flagged": False,
+                "inputs": [compute._input_record("InventoryNet", inv),
+                           compute._input_record("CostOfGoodsAndServicesSold", cogs)],
+            })
+
+        # Restatement frequency over last 5 years on key metrics.
+        recent_restatements = 0
+        for probe in ("revenue", "net_income", "assets"):
+            try:
+                trail = self.audit_trail(identifier, probe)
+            except Exception:
+                continue
+            if "error" in trail:
+                continue
+            recent_restatements += len(trail.get("restated_periods", []))
+        flags.append({
+            "flag": "restatement_count_recent",
+            "value": recent_restatements,
+            "formula": "count of restated (start, end) pairs in audit_trail across "
+                       "{revenue, net_income, assets}",
+            "threshold": "count > 0",
+            "flagged": recent_restatements > 0,
+        })
+
+        flagged_count = sum(1 for f in flags if f.get("flagged"))
+        return {
+            "cik": cik, "ticker": company.get("ticker", ""),
+            "name": company.get("name", ""),
+            "period_type": period_type, "period_end": anchor,
+            "as_of": as_of,
+            "flags": flags,
+            "flagged_count": flagged_count,
+        }
+
+    def verify(self, identifier: str | int, period_type: str = "annual",
+               as_of: Optional[str] = None) -> dict:
+        """Cross-statement consistency checks.
+
+        Each check returns `{check, expected, actual, delta, tolerance, passed}`.
+        Tolerance is 1% of the larger absolute value, accounting for rounding.
+        """
+        company = self.resolve_company(identifier)
+        if "error" in company:
+            return company
+        cik = company["cik"]
+
+        ni = self._latest_fact_for_alias(cik, "net_income", period_type=period_type, as_of=as_of)
+        eps = self._latest_fact_for_alias(cik, "diluted_eps", period_type=period_type, as_of=as_of)
+        shares = self._latest_fact_for_alias(cik, "shares_outstanding", period_type="instant", as_of=as_of)
+
+        checks: list[dict] = []
+
+        ni_v = compute._value_or_none(ni)
+        eps_v = compute._value_or_none(eps)
+        sh_v = compute._value_or_none(shares)
+        if ni_v is not None and eps_v not in (None, 0) and sh_v not in (None, 0):
+            implied_shares = ni_v / eps_v
+            delta = implied_shares - sh_v
+            tolerance = max(abs(implied_shares), abs(sh_v)) * 0.05
+            checks.append({
+                "check": "eps_ties_to_ni_over_shares",
+                "expected": sh_v,
+                "actual": implied_shares,
+                "delta": delta,
+                "tolerance": tolerance,
+                "passed": abs(delta) <= tolerance,
+                "formula": "NetIncome / DilutedEPS ~= SharesOutstanding (within 5%)",
+                "inputs": [compute._input_record("NetIncomeLoss", ni),
+                           compute._input_record("EarningsPerShareDiluted", eps),
+                           compute._input_record("SharesOutstanding", shares)],
+                "caveats": ["Diluted EPS uses weighted-average diluted shares; the shares "
+                            "outstanding fact is period-end. A 5% tolerance accommodates "
+                            "the gap. Larger deltas suggest dilution or buybacks within "
+                            "the period."],
+            })
+
+        # Gross profit ties to revenue - cogs.
+        rev = self._latest_fact_for_alias(cik, "revenue", period_type=period_type, as_of=as_of)
+        cogs = self._latest_fact_for_alias(cik, "cogs", period_type=period_type, as_of=as_of)
+        gp = self._latest_fact_for_alias(cik, "gross_profit", period_type=period_type, as_of=as_of)
+        rev_v = compute._value_or_none(rev)
+        cogs_v = compute._value_or_none(cogs)
+        gp_v = compute._value_or_none(gp)
+        if rev_v is not None and cogs_v is not None and gp_v is not None:
+            implied = rev_v - cogs_v
+            delta = implied - gp_v
+            tolerance = max(abs(implied), abs(gp_v)) * 0.01
+            checks.append({
+                "check": "gross_profit_ties_to_revenue_minus_cogs",
+                "expected": gp_v,
+                "actual": implied,
+                "delta": delta,
+                "tolerance": tolerance,
+                "passed": abs(delta) <= tolerance,
+                "formula": "Revenue - CostOfGoodsAndServicesSold ~= GrossProfit (within 1%)",
+                "inputs": [compute._input_record("Revenue", rev),
+                           compute._input_record("CostOfGoodsAndServicesSold", cogs),
+                           compute._input_record("GrossProfit", gp)],
+            })
+
+        passed_count = sum(1 for c in checks if c.get("passed"))
+        return {
+            "cik": cik, "ticker": company.get("ticker", ""),
+            "name": company.get("name", ""),
+            "period_type": period_type, "as_of": as_of,
+            "checks": checks,
+            "passed": passed_count,
+            "total": len(checks),
+        }
+
+    def statement(self, identifier: str | int, statement: str = "income",
+                  period_type: str = "annual", as_of: Optional[str] = None) -> dict:
+        """Compose a normalized financial statement (income/balance/cash flow).
+
+        Each line item is a metric envelope: `{tag, val, source_url, as_of, ...}`.
+        Coverage is bounded by the canonical alias map; unknown line items
+        appear with `value: null` and `missing_inputs` so agents can detect
+        gaps rather than silently get a zero.
+        """
+        statement = statement.lower()
+        # Income statement uses flow facts; balance sheet uses instants;
+        # cash flow uses flow facts.
+        layouts = {
+            "income": {
+                "kind": "flow",
+                "lines": [
+                    "revenue", "cogs", "gross_profit",
+                    "operating_income", "interest_expense", "income_tax_expense",
+                    "net_income", "eps", "diluted_eps",
+                ],
+            },
+            "balance": {
+                "kind": "instant",
+                "lines": [
+                    "assets_current", "inventory", "accounts_receivable", "cash",
+                    "goodwill", "intangibles", "assets",
+                    "accounts_payable", "deferred_revenue", "accrued_liabilities",
+                    "short_term_debt", "liabilities_current",
+                    "debt", "operating_lease_liabilities",
+                    "deferred_tax_liabilities", "liabilities",
+                    "retained_earnings", "equity",
+                    "shares_outstanding",
+                ],
+            },
+            "cash": {
+                "kind": "flow",
+                "lines": [
+                    "net_income", "depreciation", "amortization_intangibles",
+                    "stock_compensation", "operating_cash_flow",
+                    "capex", "investing_cash_flow",
+                    "dividends_paid", "share_repurchases", "financing_cash_flow",
+                ],
+            },
+        }
+        if statement not in layouts:
+            return {"error": f"Unknown statement: {statement}; "
+                             f"choose income, balance, or cash"}
+
+        company = self.resolve_company(identifier)
+        if "error" in company:
+            return company
+        cik = company["cik"]
+
+        layout = layouts[statement]
+        out_lines = []
+        period_anchor = None
+        for alias in layout["lines"]:
+            if alias not in COMMON_CONCEPT_CANDIDATES:
+                out_lines.append({"line": alias,
+                                  "error": f"Unknown alias '{alias}'"})
+                continue
+            if layout["kind"] == "instant":
+                fact = self._instant_fact_at_period_end(
+                    cik, alias, target_end=period_anchor or "", as_of=as_of,
+                )
+            else:
+                fact = self._latest_fact_for_alias(
+                    cik, alias, period_type=period_type, as_of=as_of,
+                )
+                if fact and not period_anchor:
+                    period_anchor = fact.get("end", "")
+            if fact is None:
+                out_lines.append({
+                    "line": alias, "value": None, "tag": None,
+                    "missing": True,
+                })
+                continue
+            out_lines.append({
+                "line": alias,
+                "value": fact.get("val"),
+                "tag": fact.get("tag", ""),
+                "unit": fact.get("unit", ""),
+                "fiscal_period": fact.get("fiscal_period", ""),
+                "calendar_period": fact.get("calendar_period", ""),
+                "start": fact.get("start", ""),
+                "end": fact.get("end", ""),
+                "source_url": fact.get("source_url", ""),
+                "accession": fact.get("accession") or fact.get("accn", ""),
+                "is_restated": fact.get("is_restated", False),
+            })
+        coverage = sum(1 for l in out_lines if l.get("value") is not None) / max(1, len(out_lines))
+        return {
+            "cik": cik, "ticker": company.get("ticker", ""),
+            "name": company.get("name", ""),
+            "statement": statement, "period_type": period_type,
+            "period_end": period_anchor,
+            "as_of": as_of,
+            "lines": out_lines,
+            "coverage": round(coverage, 2),
+        }
+
+    def mirror_filer(self, identifier: str | int, db_path: str,
+                     include_facts: bool = True,
+                     include_documents_for_form: Optional[str] = None) -> dict:
+        """Mirror one filer's submissions + companyfacts (and optionally
+        per-filing document indices) into a local SQLite database.
+
+        Subsequent runs are incremental: only new accessions are inserted.
+        Returns a counts dict for what was added on this pass.
+        """
+        company = self.resolve_company(identifier)
+        if "error" in company:
+            return company
+        cik = company["cik"]
+
+        submissions = self._get(f"/submissions/CIK{cik}.json")
+        if "error" in submissions:
+            return {"error": submissions["error"], "identifier": identifier}
+
+        with mirror_mod.open_db(db_path) as conn:
+            sub_counts = mirror_mod.ingest_submissions(conn, cik, submissions, client=self)
+
+            facts_counts = {"facts_inserted": 0, "facts_seen": 0}
+            if include_facts:
+                facts_doc = self._get(f"/api/xbrl/companyfacts/CIK{cik}.json")
+                if "error" not in facts_doc:
+                    facts_counts = mirror_mod.ingest_companyfacts(conn, cik, facts_doc)
+
+            doc_counts = {"docs_inserted": 0}
+            if include_documents_for_form:
+                target = include_documents_for_form.upper()
+                cur = conn.execute(
+                    "SELECT accession FROM filings WHERE cik = ? AND form = ? "
+                    "ORDER BY filed DESC LIMIT 5", (cik, target),
+                )
+                for (accn,) in cur.fetchall():
+                    docs = self.filing_documents(cik, accn)
+                    if "error" in docs:
+                        continue
+                    for doc in docs.get("documents", []):
+                        try:
+                            conn.execute("""
+                                INSERT INTO documents(cik, accession, sequence, doc_type,
+                                                      document, description, url)
+                                VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                                cik, accn, doc.get("sequence", ""),
+                                doc.get("type", ""), doc.get("document", ""),
+                                doc.get("description", ""), doc.get("url", ""),
+                            ))
+                            doc_counts["docs_inserted"] += 1
+                        except sqlite3.IntegrityError:
+                            pass
+                conn.commit()
+
+            return {
+                "cik": cik, "ticker": company.get("ticker", ""),
+                "name": company.get("name", ""),
+                "db_path": str(db_path),
+                **sub_counts, **facts_counts, **doc_counts,
+            }
+
+    def search_mirror(self, db_path: str, query: str, form: Optional[str] = None,
+                      since: Optional[str] = None,
+                      ciks: Optional[list[str]] = None,
+                      limit: int = 50) -> dict:
+        """Full-text search a mirror SQLite database via the filings_fts table."""
+        with mirror_mod.open_db(db_path) as conn:
+            try:
+                rows = mirror_mod.search_filings(conn, query, form=form, since=since,
+                                                 ciks=ciks, limit=limit)
+            except sqlite3.OperationalError as exc:
+                return {"error": f"FTS query failed: {exc}", "matches": []}
+            return {"query": query, "matches": rows, "total": len(rows),
+                    "db_path": str(db_path)}
+
+    def search_efts(self, query: str, form: Optional[str] = None,
+                    since: Optional[str] = None,
+                    until: Optional[str] = None,
+                    cik: Optional[str] = None,
+                    limit: int = 25) -> dict:
+        """Live SEC EDGAR full-text search (efts.sec.gov/LATEST/search-index).
+
+        Lighter than mirroring + FTS5 but capped at SEC's own response size and
+        rate. Use the local mirror path for serious corpus work.
+        """
+        params: dict[str, Any] = {"q": query, "hits": min(limit, 100)}
+        if form:
+            params["forms"] = form
+        if since:
+            params["dateRange"] = "custom"
+            params["startdt"] = since
+            params["enddt"] = until or time.strftime("%Y-%m-%d")
+        elif until:
+            params["dateRange"] = "custom"
+            params["startdt"] = "2001-01-01"
+            params["enddt"] = until
+        if cik:
+            params["ciks"] = cik
+        url = "https://efts.sec.gov/LATEST/search-index"
+        result = self._get(url, params=params)
+        if "error" in result:
+            return result
+        hits = result.get("hits", {}).get("hits", [])
+        matches = []
+        for hit in hits[:limit]:
+            src = hit.get("_source", {}) or {}
+            display_names = src.get("display_names") or []
+            adsh = src.get("adsh", "")
+            ciks = src.get("ciks") or []
+            primary_cik = ciks[0] if ciks else ""
+            matches.append({
+                "accession": adsh,
+                "filed": src.get("file_date", ""),
+                "form": src.get("form", ""),
+                "ciks": ciks,
+                "primary_cik": primary_cik,
+                "display_names": display_names,
+                "highlight": (hit.get("highlight") or {}).get("text") or [],
+                "score": hit.get("_score"),
+            })
+        return {"query": query, "matches": matches,
+                "total_available": result.get("hits", {}).get("total", {}).get("value"),
+                "returned": len(matches)}
 
     def resolve(self, identifiers: list[str]) -> dict:
         """Batch resolve identifiers to CIKs, with ambiguity metadata per row."""

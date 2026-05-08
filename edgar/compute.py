@@ -515,36 +515,96 @@ def linear_slope(values: list[float]) -> Optional[float]:
     return num / den if den else None
 
 
-def trend_label(slope: Optional[float], values: list[float]) -> str:
-    """Categorize a series: expanding / contracting / stable / inflecting."""
-    if slope is None or not values:
+def detect_change_point(values: list[float]) -> Optional[int]:
+    """Find the index that maximally splits a series into two segments with
+    different *slopes* (binary segmentation, slope-difference criterion).
+
+    Linear growth at a constant rate intentionally returns None — the segment
+    means differ but the slopes don't, so it isn't actually changing trend.
+    None for series shorter than 6 points.
+    """
+    n = len(values)
+    if n < 6:
+        return None
+    total_slope = linear_slope(values)
+    if total_slope is None:
+        return None
+    avg_abs = sum(abs(v) for v in values) / max(1, n)
+    best_idx = None
+    best_diff = 0.0
+    for i in range(3, n - 2):
+        s_left = linear_slope(values[:i])
+        s_right = linear_slope(values[i:])
+        if s_left is None or s_right is None:
+            continue
+        # Relative slope-difference, normalized by series scale, must exceed 5%.
+        diff = abs(s_right - s_left)
+        rel = diff / max(avg_abs, 1e-12)
+        if rel < 0.05:
+            continue
+        if diff > best_diff:
+            best_diff = diff
+            best_idx = i
+    return best_idx
+
+
+def trend_label(values: list[float], slope: Optional[float],
+                change_point: Optional[int]) -> str:
+    """Categorize a series with awareness of mid-series direction changes.
+
+    Labels: expanding, contracting, stable, accelerating, decelerating,
+    re-accelerating, re-decelerating, inflecting.
+    """
+    if not values:
         return "unknown"
     avg_abs = sum(abs(v) for v in values) / max(1, len(values))
+    if slope is None:
+        return "unknown"
     rel = abs(slope) / max(avg_abs, 1e-12)
-    if rel < 0.005:
+    if rel < 0.005 and change_point is None:
         return "stable"
-    if len(values) >= 4:
-        # Check sign change: compare slope of first half vs second half
-        mid = len(values) // 2
-        s_first = linear_slope(values[:mid])
-        s_second = linear_slope(values[mid:])
-        if s_first is not None and s_second is not None and (s_first > 0) != (s_second > 0):
-            return "inflecting"
+    if change_point is None:
+        return "expanding" if slope > 0 else "contracting"
+    s_left = linear_slope(values[:change_point])
+    s_right = linear_slope(values[change_point:])
+    if s_left is None or s_right is None:
+        return "expanding" if slope > 0 else "contracting"
+    sign_change = (s_left > 0) != (s_right > 0)
+    if sign_change:
+        return "inflecting"
+    if s_right > 0 and s_left > 0:
+        return "accelerating" if abs(s_right) > abs(s_left) else "decelerating"
+    if s_right < 0 and s_left < 0:
+        return "re-decelerating" if abs(s_right) > abs(s_left) else "decelerating"
     return "expanding" if slope > 0 else "contracting"
 
 
 def trend_summary(facts: list[dict]) -> dict:
-    """Summarize a list of facts (chronologically newest first) with slope and label."""
+    """Summarize a list of facts (chronologically newest first) with slope,
+    change-point, and a richer categorical label."""
     sorted_facts = sorted(facts, key=lambda f: f.get("end", ""))
     values = [_value_or_none(f) for f in sorted_facts]
     values = [v for v in values if v is not None]
     if not values:
-        return {"slope": None, "label": "unknown", "n": 0}
+        return {"slope": None, "label": "unknown", "n": 0,
+                "change_point": None, "change_point_end": None}
     slope = linear_slope(values)
-    label = trend_label(slope, values)
+    change_point = detect_change_point(values)
+    label = trend_label(values, slope, change_point)
     direction = None
     if len(values) >= 2:
         direction = "up" if values[-1] > values[0] else ("flat" if values[-1] == values[0] else "down")
+    change_point_end = None
+    if change_point is not None:
+        change_point_end = sorted_facts[change_point].get("end", "")
+    segment_slopes = None
+    if change_point is not None:
+        s_left = linear_slope(values[:change_point])
+        s_right = linear_slope(values[change_point:])
+        segment_slopes = {
+            "before": s_left, "before_n": change_point,
+            "after": s_right, "after_n": len(values) - change_point,
+        }
     return {
         "slope": slope,
         "label": label,
@@ -552,6 +612,9 @@ def trend_summary(facts: list[dict]) -> dict:
         "first_value": values[0] if values else None,
         "last_value": values[-1] if values else None,
         "direction": direction,
+        "change_point": change_point,
+        "change_point_end": change_point_end,
+        "segment_slopes": segment_slopes,
     }
 
 
