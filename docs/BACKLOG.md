@@ -11,7 +11,7 @@ for the genuinely multi-day projects.
 **Cache & state**
 - `EdgarCache` wrapper with endpoint-aware TTLs (ticker map 7d, companyfacts/concept 1d, frames 90d, submissions 1h, historical chunks 7d) + negative caching + atomic writes + `fcntl` cross-process locks + `--cache-max-mb` LRU eviction.
 - Conditional `GET` via `If-None-Match` / `If-Modified-Since`. `304` refreshes timestamp without re-download.
-- `cache stats`, `cache invalidate --pattern '*CIK0000320193*'`, `cache warm --tickers ...` commands.
+- `cache stats`, `cache invalidate '*CIK0000320193*'`, `cache warm --tickers ...` commands.
 - `cache` summary in every JSON envelope.
 - `StateStore` at `~/.edgar/state.json`: high-water marks per `(cik, form)`, plus `subscribe`/`unsubscribe`/`mark_seen` primitives.
 

@@ -1089,12 +1089,18 @@ def diff(ctx, identifier_a, identifier_b, concept, periods, period_type, as_of,
     if _wants_json(json_output, markdown, ndjson):
         _json(result)
         return
-    rows = [[r.get("end", ""), r.get("frame", ""),
+    def _period_str(p):
+        if not p or p == ["", ""]:
+            return ""
+        return f"{p[0]}..{p[1]}" if p[0] else p[1]
+    rows = [[r.get("frame", ""),
+             _period_str(r.get("a_period")), _period_str(r.get("b_period")),
              _format_value(r.get("a_value")), _format_value(r.get("b_value")),
              _format_value(r.get("delta")),
              f"{r['ratio']:.2f}x" if r.get("ratio") is not None else ""]
             for r in result.get("rows", [])]
-    headers = ["Period End", "Frame",
+    headers = ["Frame",
+               f"{result['a']['identifier']} period", f"{result['b']['identifier']} period",
                f"{result['a']['identifier']}", f"{result['b']['identifier']}",
                "Delta (A-B)", "Ratio (A/B)"]
     title = f"Diff: {concept} ({period_type})"
@@ -1469,12 +1475,20 @@ def bulk_urls(markdown, json_output, ndjson):
     console.print(table)
 
 
-@main.command("clear-cache")
-def clear_cache():
-    """Clear the local EDGAR cache."""
+def _cache_for_management(ctx) -> "EdgarCache":  # noqa: F821
+    """Build an EdgarCache that honors the global --cache-max-mb flag."""
     from edgar.cache import EdgarCache
 
-    count = EdgarCache(cache_dir="~/.edgar_cache").clear()
+    max_mb = ctx.obj.get("cache_max_mb") if ctx.obj else None
+    max_bytes = int(max_mb) * 1024 * 1024 if max_mb else None
+    return EdgarCache(cache_dir="~/.edgar_cache", max_bytes=max_bytes)
+
+
+@main.command("clear-cache")
+@click.pass_context
+def clear_cache(ctx):
+    """Clear the local EDGAR cache."""
+    count = _cache_for_management(ctx).clear()
     click.echo(f"Cleared {count} cached entries.")
 
 
@@ -1485,11 +1499,10 @@ def cache():
 
 @cache.command("stats")
 @output_options
-def cache_stats(markdown, json_output, ndjson):
+@click.pass_context
+def cache_stats(ctx, markdown, json_output, ndjson):
     """Show cache size, fresh/expired counts, and configuration."""
-    from edgar.cache import EdgarCache
-
-    stats = EdgarCache(cache_dir="~/.edgar_cache").stats()
+    stats = _cache_for_management(ctx).stats()
     if ndjson:
         _ndjson([stats])
         return
@@ -1505,11 +1518,10 @@ def cache_stats(markdown, json_output, ndjson):
 
 @cache.command("invalidate")
 @click.argument("pattern")
-def cache_invalidate(pattern):
+@click.pass_context
+def cache_invalidate(ctx, pattern):
     """Delete cached entries whose URL matches a glob (e.g. '*CIK0000320193*')."""
-    from edgar.cache import EdgarCache
-
-    removed = EdgarCache(cache_dir="~/.edgar_cache").invalidate(pattern)
+    removed = _cache_for_management(ctx).invalidate(pattern)
     click.echo(f"Invalidated {removed} cached entries matching {pattern!r}.")
 
 
@@ -1517,14 +1529,16 @@ def cache_invalidate(pattern):
 @click.option("--tickers", default=None, help="Comma-separated identifiers to warm submissions+facts for")
 @click.option("--input", "input_file", type=click.Path(exists=True, dir_okay=False, path_type=Path),
               default=None, help="Read identifiers from a file")
-def cache_warm(tickers, input_file):
+@click.pass_context
+def cache_warm(ctx, tickers, input_file):
     """Pre-fetch submissions and companyfacts for a list of identifiers."""
-    from edgar.api import COMPANY_TICKERS_URL, get_client, normalize_cik
+    from edgar.api import COMPANY_TICKERS_URL
 
     identifiers = _collect_identifiers(None, tickers, input_file, batch=False) if (tickers or input_file) else []
     if not identifiers:
         raise click.UsageError("Provide --tickers or --input")
-    client = get_client()
+    client = get_client(use_cache=not ctx.obj["no_cache"],
+                       cache_max_mb=ctx.obj.get("cache_max_mb"))
     cache_obj = client.edgar_cache
     urls = [COMPANY_TICKERS_URL]
     for ident in identifiers:

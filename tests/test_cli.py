@@ -324,6 +324,13 @@ def test_filings_json_keeps_envelope(monkeypatch):
     assert payload.get("filings")
 
 
+def test_cache_stats_honors_global_cache_max_mb():
+    result = CliRunner().invoke(main, ["--cache-max-mb", "5", "cache", "stats", "--json-output"])
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["max_bytes"] == 5 * 1024 * 1024
+
+
 def test_schema_accepts_output_options():
     result = CliRunner().invoke(main, ["schema", "concept", "--json-output"])
     assert result.exit_code == 0

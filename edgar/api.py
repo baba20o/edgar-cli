@@ -1305,26 +1305,44 @@ class EdgarClient(BaseAPIClient):
                                  periods=periods, period_type=period_type, as_of=as_of)
         if "error" in a:
             return a
-        # Build a period-aligned grid: outer key = (start, end), value = {a: fact, b: fact}
-        grid: dict[tuple, dict] = {}
+        # Align on `frame` / `calendar_period` first so different fiscal calendars
+        # still pair up (AAPL FY ends Sep, MSFT FY ends Jun, both map to CY2025).
+        # Fall back to `(start, end)` only when neither side has a frame.
+        grid: dict[str, dict] = {}
         for i, side in enumerate(("a", "b")):
             company = (a.get("companies") or [None, None])[i] or {}
             for fact in company.get("facts", []):
-                key = (fact.get("start", ""), fact.get("end", ""))
-                grid.setdefault(key, {"a": None, "b": None,
-                                      "frame": fact.get("frame", ""),
-                                      "calendar_period": fact.get("calendar_period", "")})[side] = fact
+                frame = fact.get("frame") or fact.get("calendar_period") or ""
+                key = frame or f"se:{fact.get('start','')}|{fact.get('end','')}"
+                entry = grid.setdefault(key, {"a": None, "b": None, "frame": frame,
+                                               "a_period": None, "b_period": None})
+                entry[side] = fact
+                entry[f"{side}_period"] = (fact.get("start", ""), fact.get("end", ""))
+                if not entry["frame"] and frame:
+                    entry["frame"] = frame
         rows = []
-        for (start, end), entry in sorted(grid.items(), key=lambda x: x[0][1] or "", reverse=True):
+        for key, entry in sorted(
+            grid.items(),
+            key=lambda kv: (kv[1].get("a_period") or kv[1].get("b_period") or ("", ""))[1] or "",
+            reverse=True,
+        ):
             va = compute._value_or_none(entry.get("a")) if entry.get("a") else None
             vb = compute._value_or_none(entry.get("b")) if entry.get("b") else None
-            rows.append({
-                "start": start, "end": end,
+            row = {
                 "frame": entry.get("frame", ""),
-                "a_value": va, "b_value": vb,
+                "a_period": entry.get("a_period"),
+                "b_period": entry.get("b_period"),
+                "a_value": va,
+                "b_value": vb,
                 "delta": (va - vb) if (va is not None and vb is not None) else None,
                 "ratio": (va / vb) if (va is not None and vb not in (None, 0)) else None,
-            })
+            }
+            # Keep legacy `start`/`end` keys for callers that rely on them — pick
+            # whichever side actually had a fact.
+            period = entry.get("a_period") or entry.get("b_period") or ("", "")
+            row["start"] = period[0]
+            row["end"] = period[1]
+            rows.append(row)
         return {
             "concept": concept,
             "period_type": period_type,

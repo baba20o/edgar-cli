@@ -1009,6 +1009,44 @@ def test_ttm_from_stub_period_reconstructs_apple_style():
     assert "AnnualFY + CurrentYTD - PriorYTD" in out["formula"]
 
 
+def test_diff_aligns_on_frame_when_fiscal_calendars_differ():
+    """Filers with different FY ends must still pair up by calendar frame."""
+    from edgar.api import EdgarClient
+
+    client = EdgarClient.__new__(EdgarClient)
+
+    def fake_compare(identifiers, concept, **kwargs):
+        return {
+            "concept": concept,
+            "companies": [
+                {
+                    "identifier": "AAPL", "name": "Apple Inc.",
+                    "facts": [
+                        {"frame": "CY2025", "start": "2024-09-29", "end": "2025-09-27", "val": 416161},
+                        {"frame": "CY2024", "start": "2023-09-30", "end": "2024-09-28", "val": 391035},
+                    ],
+                },
+                {
+                    "identifier": "MSFT", "name": "Microsoft Corp",
+                    "facts": [
+                        {"frame": "CY2025", "start": "2024-07-01", "end": "2025-06-30", "val": 281724},
+                        {"frame": "CY2024", "start": "2023-07-01", "end": "2024-06-30", "val": 245122},
+                    ],
+                },
+            ],
+        }
+
+    client.compare_concept = fake_compare
+    out = client.diff_concept("AAPL", "MSFT", "revenue", periods=2)
+    by_frame = {r["frame"]: r for r in out["rows"]}
+    assert by_frame["CY2025"]["a_value"] == 416161
+    assert by_frame["CY2025"]["b_value"] == 281724
+    assert by_frame["CY2025"]["delta"] == 416161 - 281724
+    # Periods are preserved per-side so callers can still see the calendar mismatch.
+    assert by_frame["CY2025"]["a_period"] == ("2024-09-29", "2025-09-27")
+    assert by_frame["CY2025"]["b_period"] == ("2024-07-01", "2025-06-30")
+
+
 def test_compute_envelope_keeps_value_when_only_optional_input_missing():
     from edgar.compute import quick_ratio
 
