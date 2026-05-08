@@ -58,3 +58,20 @@ def test_summarize_concepts_filters():
     assert len(rows) == 1
     assert rows[0]["tag"] == "Assets"
     assert rows[0]["fact_count"] == 2
+
+
+def test_summarize_concepts_handles_null_metadata():
+    facts = {
+        "us-gaap": {
+            "RevenueFromContractWithCustomerExcludingAssessedTax": {
+                "label": None,
+                "description": None,
+                "units": {"USD": [{"filed": "2022-01-01"}]},
+            },
+        }
+    }
+
+    rows = EdgarClient._summarize_concepts(facts, "us-gaap", "revenue")
+
+    assert len(rows) == 1
+    assert rows[0]["tag"] == "RevenueFromContractWithCustomerExcludingAssessedTax"

@@ -325,8 +325,8 @@ class EdgarClient(BaseAPIClient):
                 if tag_needle:
                     haystack = " ".join([
                         tag,
-                        concept.get("label", ""),
-                        concept.get("description", ""),
+                        str(concept.get("label") or ""),
+                        str(concept.get("description") or ""),
                     ]).lower()
                     if tag_needle not in haystack:
                         continue
