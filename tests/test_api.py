@@ -1307,6 +1307,19 @@ def test_form4_aggregate_groups_by_owner_and_code():
 # --- Phase 3: per-share metrics ---
 
 
+def test_expand_group_13f_top_returns_curated_filers():
+    from edgar.api import EdgarClient
+
+    client = EdgarClient.__new__(EdgarClient)
+    out = client.expand_group("@13f-top")
+    assert out["group"] == "13f-top"
+    # Berkshire and BlackRock are anchor entries; must be present.
+    assert "0001067983" in out["identifiers"]
+    assert "0001364742" in out["identifiers"]
+    # Dedup is preserved.
+    assert len(out["identifiers"]) == len(set(out["identifiers"]))
+
+
 def test_holders_parse_infotable_xml_post_2023():
     """Recent 13F filings report value in absolute USD."""
     from edgar.holders import parse_infotable_xml
@@ -1367,6 +1380,56 @@ def test_holders_parse_infotable_xml_pre_2023_thousands():
     # Total raw value $50K < $10B threshold -> treated as thousands.
     assert rows[0]["value_unit_convention"] == "thousands"
     assert rows[0]["value_usd"] == 50_000_000  # 50,000 thousands
+
+
+def test_holdings_quarter_matches_report_date_not_filing_date():
+    """13F-HR is filed ~45 days after quarter-end; matching must use reportDate."""
+    from edgar.api import EdgarClient
+
+    client = EdgarClient.__new__(EdgarClient)
+
+    # Stub: the Q4-2024 filing is filed in Feb 2025 (reportDate 2024-12-31),
+    # the Q3-2024 filing is filed in Nov 2024 (reportDate 2024-09-30).
+    # The buggy implementation matched filingDate.startswith('2024') which
+    # picked the November (Q3) filing for `--quarter 2024Q4`.
+    captured = {}
+
+    def fake_resolve(identifier):
+        return {"cik": "0001067983", "ticker": "BRK", "name": "BERKSHIRE"}
+
+    def fake_submissions(identifier, form=None, limit=None):
+        return {
+            "filings": [
+                {"accessionNumber": "x-2026Q4", "form": "13F-HR",
+                 "filingDate": "2026-02-17", "reportDate": "2025-12-31",
+                 "primaryDocument": "primary_doc.html", "primary_doc_url": "u1"},
+                {"accessionNumber": "x-2025Q3", "form": "13F-HR",
+                 "filingDate": "2025-11-14", "reportDate": "2025-09-30",
+                 "primaryDocument": "primary_doc.html", "primary_doc_url": "u2"},
+                {"accessionNumber": "x-2024Q4", "form": "13F-HR",
+                 "filingDate": "2025-02-14", "reportDate": "2024-12-31",
+                 "primaryDocument": "primary_doc.html", "primary_doc_url": "u3"},
+                {"accessionNumber": "x-2024Q3", "form": "13F-HR",
+                 "filingDate": "2024-11-14", "reportDate": "2024-09-30",
+                 "primaryDocument": "primary_doc.html", "primary_doc_url": "u4"},
+            ]
+        }
+
+    def fake_fetch_holdings(cik, accession):
+        captured["accession"] = accession
+        return [{"name_of_issuer": "AMERICAN EXPRESS CO", "value_usd": 1000,
+                 "shares": 1, "value_unit_convention": "absolute"}]
+
+    client.resolve_company = fake_resolve
+    client.submissions = fake_submissions
+    client._fetch_13f_holdings = fake_fetch_holdings
+
+    out = client.holdings("BRK", quarter="2024Q4")
+    assert captured["accession"] == "x-2024Q4"
+    assert out["filing"]["filed"] == "2025-02-14"
+
+    out_q3 = client.holdings("BRK", quarter="2024Q3")
+    assert captured["accession"] == "x-2024Q3"
 
 
 def test_holders_aggregate_filer_holdings_concentration():

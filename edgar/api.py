@@ -54,6 +54,30 @@ DEFAULT_CACHE_TTL = 900
 DEFAULT_RATE_LIMIT_INTERVAL = 0.2
 DEFAULT_USER_AGENT = "edgar-cli/0.1.0 baba200@greenmountaincomputing.com"
 
+# Curated set of large institutional 13F filers, keyed by CIK so name/ticker
+# changes don't break the list. Snapshot date is recorded in expand_group's
+# return value so agents can detect staleness. NOT exhaustive — for broader
+# coverage agents should pass an explicit candidate list.
+TOP_13F_FILERS = [
+    "0001067983",  # Berkshire Hathaway Inc
+    "0001364742",  # BlackRock Inc
+    "0000102909",  # Vanguard Group Inc
+    "0000093751",  # State Street Corp
+    "0000315066",  # FMR LLC (Fidelity)
+    "0000080255",  # T. Rowe Price Group
+    "0000019617",  # JPMorgan Chase & Co
+    "0000895421",  # Morgan Stanley
+    "0000070858",  # Bank of America
+    "0000895421",  # (dup safe — dedupe in caller)
+    "0001037389",  # Renaissance Technologies LLC
+    "0001350694",  # Bridgewater Associates LP
+    "0001423053",  # Citadel Advisors LLC
+    "0001009207",  # D. E. Shaw & Co Inc
+    "0000902219",  # Wellington Management Group LLP
+    "0001029160",  # Capital Research Global Investors
+]
+
+
 DOW30_TICKERS = [
     "AAPL", "AMGN", "AMZN", "AXP", "BA", "CAT", "CRM", "CSCO", "CVX", "DIS",
     "GS", "HD", "HON", "IBM", "JNJ", "JPM", "KO", "MCD", "MMM", "MRK",
@@ -989,6 +1013,19 @@ class EdgarClient(BaseAPIClient):
         if body.lower() == "dow30":
             return {"group": "dow30", "identifiers": list(DOW30_TICKERS),
                     "source": "static", "as_of": "2026-05-08"}
+        if body.lower() in ("13f-top", "13f_top", "top13f"):
+            # Dedupe while preserving order.
+            seen = set()
+            uniq = []
+            for cik in TOP_13F_FILERS:
+                if cik not in seen:
+                    uniq.append(cik)
+                    seen.add(cik)
+            return {"group": "13f-top", "identifiers": uniq,
+                    "source": "static", "as_of": "2026-05-08",
+                    "note": ("Curated list of large institutional 13F filers by "
+                             "CIK. Not exhaustive; pass explicit candidates for "
+                             "broader coverage.")}
         if body.lower().startswith("sic:"):
             try:
                 sic = int(body.split(":", 1)[1])
@@ -1630,14 +1667,16 @@ class EdgarClient(BaseAPIClient):
                  top_n: int = 50) -> dict:
         """Single 13F filer's holdings (most recent quarter unless `quarter` given).
 
-        `quarter` accepts forms like `2025Q4`, `CY2025Q4`, or a date string —
-        the CLI matches against `periodOfReport` / filing date heuristically.
+        `quarter` accepts forms like `2025Q4` or `CY2025Q4`. Selection matches
+        on the filing's `reportDate` (period end), NOT `filingDate` — 13F-HR
+        is filed ~45 days after quarter end, so a Q4 filing is filed in
+        February of the following year.
         """
         company = self.resolve_company(identifier)
         if "error" in company:
             return company
         cik = company["cik"]
-        result = self.submissions(identifier, form="13F-HR", limit=20)
+        result = self.submissions(identifier, form="13F-HR", limit=24)
         if "error" in result:
             return result
         filings = result.get("filings", [])
@@ -1649,15 +1688,23 @@ class EdgarClient(BaseAPIClient):
             qmatch = re.match(r"(?:CY)?(\d{4})Q([1-4])", str(quarter).upper())
             if qmatch:
                 year, q = int(qmatch.group(1)), int(qmatch.group(2))
-                # Quarter end month (Mar/Jun/Sep/Dec)
-                end_month = {1: "03", 2: "06", 3: "09", 4: "12"}[q]
-                wanted = f"{year}-{end_month}"
-                for f in filings:
-                    if (f.get("primaryDocument", "")
-                            and (f.get("filingDate", "").startswith(f"{year}")
-                                 or wanted in f.get("primaryDocument", ""))):
-                        chosen = f
-                        break
+                end_month, end_day = {1: ("03", "31"), 2: ("06", "30"),
+                                       3: ("09", "30"), 4: ("12", "31")}[q]
+                wanted_period = f"{year}-{end_month}-{end_day}"
+                # Match `reportDate` exactly first, then fall back to a year+month prefix.
+                exact = next((f for f in filings if f.get("reportDate") == wanted_period), None)
+                if exact:
+                    chosen = exact
+                else:
+                    prefix = f"{year}-{end_month}"
+                    near = next((f for f in filings if (f.get("reportDate") or "").startswith(prefix)), None)
+                    if near:
+                        chosen = near
+                    else:
+                        return {"error": (f"No 13F-HR with reportDate matching {quarter} "
+                                          f"({wanted_period}); available reportDates: "
+                                          f"{[f.get('reportDate') for f in filings[:8]]}"),
+                                "rows": []}
 
         rows = self._fetch_13f_holdings(cik, chosen.get("accessionNumber", ""))
         agg = holders_mod.aggregate_filer_holdings(rows, top_n=top_n)
@@ -1714,7 +1761,9 @@ class EdgarClient(BaseAPIClient):
                 if "error" not in dei:
                     cand_company["name"] = dei.get("name", "")
                     cand_company["ticker"] = cand_company.get("ticker") or dei.get("ticker", "")
-            holdings_result = self.submissions(cand, form="13F-HR", limit=4)
+            # Pull a deeper window so historical-quarter searches can find
+            # older 13Fs (default of 4 was unreachable for prior years).
+            holdings_result = self.submissions(cand, form="13F-HR", limit=24)
             if "error" in holdings_result:
                 skipped += 1
                 continue
@@ -1726,11 +1775,22 @@ class EdgarClient(BaseAPIClient):
             if quarter:
                 qmatch = re.match(r"(?:CY)?(\d{4})Q([1-4])", str(quarter).upper())
                 if qmatch:
-                    year = int(qmatch.group(1))
-                    for f in f13s:
-                        if f.get("filingDate", "").startswith(str(year)):
-                            chosen = f
-                            break
+                    year, q = int(qmatch.group(1)), int(qmatch.group(2))
+                    end_month, end_day = {1: ("03", "31"), 2: ("06", "30"),
+                                           3: ("09", "30"), 4: ("12", "31")}[q]
+                    wanted_period = f"{year}-{end_month}-{end_day}"
+                    exact = next((f for f in f13s if f.get("reportDate") == wanted_period), None)
+                    if exact:
+                        chosen = exact
+                    else:
+                        prefix = f"{year}-{end_month}"
+                        near = next((f for f in f13s if (f.get("reportDate") or "").startswith(prefix)), None)
+                        if near:
+                            chosen = near
+                        else:
+                            # No 13F for this candidate at the requested quarter.
+                            skipped += 1
+                            continue
             scanned += 1
             rows = self._fetch_13f_holdings(cand_cik, chosen.get("accessionNumber", ""))
             for r in rows:
@@ -1979,7 +2039,12 @@ class EdgarClient(BaseAPIClient):
 
         ni = self._latest_fact_for_alias(cik, "net_income", period_type=period_type, as_of=as_of)
         eps = self._latest_fact_for_alias(cik, "diluted_eps", period_type=period_type, as_of=as_of)
-        shares = self._latest_fact_for_alias(cik, "shares_outstanding", period_type="instant", as_of=as_of)
+        # Anchor shares to the NI period end so we don't compare FY revenue/EPS
+        # against a future-quarter share count.
+        ni_period_end = (ni or {}).get("end", "")
+        shares = self._instant_fact_at_period_end(
+            cik, "shares_outstanding", target_end=ni_period_end, as_of=as_of,
+        )
 
         checks: list[dict] = []
 
@@ -2095,8 +2160,50 @@ class EdgarClient(BaseAPIClient):
         cik = company["cik"]
 
         layout = layouts[statement]
+
+        # Two-pass strategy:
+        # Pass 1: anchor the period from a flow line whose canonical-period
+        # ordering is most reliable (revenue for income/cash, equity for
+        # balance). The anchor's `end` becomes the required period for every
+        # other line.
+        # Pass 2: pick each line's fact and ACCEPT only when its `end` matches
+        # the anchor exactly (instants) or aligns within ±7 days (flow
+        # tolerance for fiscal-year drift). Lines that don't align are marked
+        # `missing` with `period_misaligned` set, so coverage drops to reflect
+        # the real same-period state instead of stitching across years.
+        from datetime import datetime, timedelta
+
+        def _align_ok(fact_end: str, anchor: str, kind: str) -> bool:
+            if not fact_end or not anchor:
+                return False
+            if fact_end == anchor:
+                return True
+            if kind == "instant":
+                return False  # instants must match exactly
+            try:
+                d_fact = datetime.strptime(fact_end, "%Y-%m-%d").date()
+                d_anchor = datetime.strptime(anchor, "%Y-%m-%d").date()
+            except (ValueError, TypeError):
+                return False
+            return abs((d_fact - d_anchor).days) <= 7
+
+        anchor_alias = (
+            "revenue" if statement in {"income", "cash"} else "equity"
+        )
+        anchor_fact = None
+        if anchor_alias in COMMON_CONCEPT_CANDIDATES:
+            if layout["kind"] == "instant":
+                anchor_fact = self._latest_fact_for_alias(
+                    cik, anchor_alias, period_type="instant", as_of=as_of,
+                )
+            else:
+                anchor_fact = self._latest_fact_for_alias(
+                    cik, anchor_alias, period_type=period_type, as_of=as_of,
+                )
+        period_anchor = (anchor_fact or {}).get("end", "") if anchor_fact else ""
+
         out_lines = []
-        period_anchor = None
+        rejected_misaligned = 0
         for alias in layout["lines"]:
             if alias not in COMMON_CONCEPT_CANDIDATES:
                 out_lines.append({"line": alias,
@@ -2112,12 +2219,29 @@ class EdgarClient(BaseAPIClient):
                 )
                 if fact and not period_anchor:
                     period_anchor = fact.get("end", "")
+
             if fact is None:
                 out_lines.append({
                     "line": alias, "value": None, "tag": None,
                     "missing": True,
                 })
                 continue
+
+            # Reject facts that fall outside the anchor period — prevents
+            # silent mixing of e.g. FY2023 interest_expense into a FY2025
+            # income statement.
+            fact_end = fact.get("end", "")
+            if period_anchor and not _align_ok(fact_end, period_anchor, layout["kind"]):
+                rejected_misaligned += 1
+                out_lines.append({
+                    "line": alias, "value": None, "tag": fact.get("tag", ""),
+                    "missing": True,
+                    "period_misaligned": True,
+                    "rejected_end": fact_end,
+                    "anchor_end": period_anchor,
+                })
+                continue
+
             out_lines.append({
                 "line": alias,
                 "value": fact.get("val"),
@@ -2140,6 +2264,8 @@ class EdgarClient(BaseAPIClient):
             "as_of": as_of,
             "lines": out_lines,
             "coverage": round(coverage, 2),
+            "lines_period_misaligned": rejected_misaligned,
+            "anchor_alias": anchor_alias,
         }
 
     def mirror_filer(self, identifier: str | int, db_path: str,

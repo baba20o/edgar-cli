@@ -1616,8 +1616,8 @@ def holdings(ctx, identifier, quarter, top_n, markdown, json_output, ndjson):
 
 @main.command()
 @click.argument("identifier")
-@click.option("--candidates", default="@dow30",
-              help="Tickers/@group of 13F filers to scan (default @dow30 — usually too narrow; pass an institutional list)")
+@click.option("--candidates", default="@13f-top",
+              help="Tickers/@group of 13F filers to scan (default @13f-top — a curated set of major institutional filers; pass explicit CIKs for broader coverage)")
 @click.option("--cusip", default=None,
               help="Match holdings by CUSIP (more precise than name-substring)")
 @click.option("--quarter", default=None,
