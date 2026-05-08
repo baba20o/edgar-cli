@@ -7,6 +7,7 @@ import logging
 import sys
 import webbrowser
 from pathlib import Path
+from typing import Optional
 
 import click
 from rich.console import Console
@@ -14,6 +15,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from edgar.api import BULK_ARCHIVES, get_client
+from edgar.state import StateStore
 
 console = Console()
 click.UsageError.exit_code = 5
@@ -21,15 +23,138 @@ click.UsageError.exit_code = 5
 
 def _json(data) -> None:
     click.echo(json.dumps(data, indent=2, default=str))
+    _maybe_webhook(data)
 
 
 def _ndjson(rows) -> None:
     for row in rows:
         click.echo(json.dumps(row, default=str, separators=(",", ":")))
+    _maybe_webhook(rows)
+
+
+def _maybe_webhook(payload) -> None:
+    """POST payload to the global --webhook URL if configured. Best-effort."""
+    try:
+        ctx = click.get_current_context(silent=True)
+    except RuntimeError:
+        return
+    url = ctx.obj.get("webhook") if ctx and ctx.obj else None
+    if not url:
+        return
+    try:
+        import requests
+        requests.post(url, json=payload, timeout=5)
+    except Exception:
+        pass
 
 
 def _wants_json(json_output: bool, markdown: bool, ndjson: bool) -> bool:
     return json_output or (not markdown and not ndjson and not sys.stdout.isatty())
+
+
+def _validate_date_option(ctx, param, value):
+    """Click callback: reject anything that is not a YYYY-MM-DD calendar date."""
+    if value in (None, ""):
+        return value
+    from datetime import datetime
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except (ValueError, TypeError):
+        raise click.BadParameter(f"{value!r} is not a valid YYYY-MM-DD date", param=param)
+    return value
+
+
+PositiveInt = click.IntRange(min=1)
+PositiveOrZeroInt = click.IntRange(min=0)
+
+
+def _format_citation(row: dict, ticker: str = "", name: str = "") -> str:
+    """Build an agent-quotable citation string for a fact-like or filing-like row."""
+    accession = row.get("accessionNumber") or row.get("accn") or ""
+    filed = row.get("filed") or row.get("filingDate") or ""
+    form = row.get("form") or ""
+    period = row.get("fiscal_period") or row.get("calendar_period") or row.get("frame") or ""
+    head_parts = [p for p in [ticker or name, period, form] if p]
+    out = " ".join(head_parts)
+    if accession:
+        out = f"{out} · {accession}" if out else accession
+    if filed:
+        out = f"{out} · filed {filed}" if out else f"filed {filed}"
+    return out
+
+
+def _add_citations(result: dict) -> dict:
+    """Walk a result dict and add a `citation` to each row-like child."""
+    if not isinstance(result, dict):
+        return result
+    tickers = result.get("tickers") or []
+    ticker = result.get("ticker") or (tickers[0] if tickers else "")
+    name = result.get("name") or ""
+
+    for key in ("facts", "filings", "events", "concepts", "documents"):
+        rows = result.get(key)
+        if isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, dict):
+                    row["citation"] = _format_citation(row, ticker=ticker, name=name)
+
+    if isinstance(result.get("companies"), list):
+        for company in result["companies"]:
+            if not isinstance(company, dict):
+                continue
+            cticker = company.get("ticker") or company.get("identifier") or ""
+            cname = company.get("name", "")
+            for fact in company.get("facts", []) or []:
+                if isinstance(fact, dict):
+                    fact["citation"] = _format_citation(fact, ticker=cticker, name=cname)
+
+    if isinstance(result.get("metrics"), list):
+        for metric in result["metrics"]:
+            if isinstance(metric, dict) and isinstance(metric.get("fact"), dict):
+                metric["fact"]["citation"] = _format_citation(metric["fact"], ticker=ticker, name=name)
+
+    profile = result.get("profile")
+    if isinstance(profile, dict):
+        _add_citations(profile)
+    earnings = result.get("earnings")
+    if isinstance(earnings, dict) and isinstance(earnings.get("filing"), dict):
+        earnings["filing"]["citation"] = _format_citation(
+            earnings["filing"], ticker=ticker, name=name,
+        )
+    return result
+
+
+def _finalize(client, result: dict, cite: bool = False) -> dict:
+    """Add citations (optional) and the schema/cli/cache envelope to a result."""
+    if not isinstance(result, dict):
+        return result
+    if cite:
+        result = _add_citations(result)
+    envelope = getattr(client, "_envelope", None)
+    return envelope(result) if envelope else result
+
+
+def _finalize_batch(client, results: list, key: str = "results", cite: bool = False) -> dict:
+    """Wrap a list of per-identifier results in a single enveloped dict."""
+    if cite:
+        results = [_add_citations(r) if isinstance(r, dict) else r for r in results]
+    payload = {key: results}
+    envelope = getattr(client, "_envelope", None)
+    return envelope(payload) if envelope else payload
+
+
+def cite_option(fn):
+    return click.option(
+        "--cite", is_flag=True,
+        help="Attach an agent-quotable citation string to each row",
+    )(fn)
+
+
+def since_last_fetch_option(fn):
+    return click.option(
+        "--since-last-fetch", "since_last_fetch", is_flag=True,
+        help="Only return entries newer than the last fetch (state at ~/.edgar/state.json)",
+    )(fn)
 
 
 def _error_exit(result: dict) -> None:
@@ -135,6 +260,24 @@ def _split_input_values(text: str) -> list[str]:
     return values
 
 
+def _expand_groups(values: list[str], client=None) -> list[str]:
+    """Expand any `@group` expressions in a list of identifiers."""
+    expanded = []
+    for value in values:
+        if value.startswith("@"):
+            if client is None:
+                client = get_client()
+            result = client.expand_group(value)
+            if "error" in result:
+                error = click.ClickException(f"Group expansion failed: {result['error']}")
+                error.exit_code = 5
+                raise error
+            expanded.extend(result.get("identifiers", []))
+        else:
+            expanded.append(value)
+    return expanded
+
+
 def _collect_identifiers(identifier: str | None, tickers: str | None, input_file: Path | None,
                          batch: bool) -> list[str]:
     identifiers = [identifier] if identifier else []
@@ -149,6 +292,9 @@ def _collect_identifiers(identifier: str | None, tickers: str | None, input_file
             raise error from exc
     if batch:
         identifiers.extend(_split_input_values(sys.stdin.read()))
+
+    if any(value.startswith("@") for value in identifiers):
+        identifiers = _expand_groups(identifiers)
 
     deduped = []
     seen = set()
@@ -168,97 +314,141 @@ def _batch_failed(results: list[dict]) -> bool:
 @click.group()
 @click.option("--debug", is_flag=True, help="Enable debug logging")
 @click.option("--no-cache", is_flag=True, help="Skip local response cache")
+@click.option("--cache-max-mb", default=None, type=PositiveInt,
+              help="Bound the local cache to this size in MB (LRU eviction).")
+@click.option("--webhook", default=None,
+              help="POST result JSON to this URL after the command completes (fire-and-forget)")
 @click.pass_context
-def main(ctx, debug: bool, no_cache: bool):
+def main(ctx, debug: bool, no_cache: bool, cache_max_mb, webhook: str | None):
     """SEC EDGAR public data CLI."""
     if debug:
         logging.basicConfig(level=logging.DEBUG)
     ctx.ensure_object(dict)
     ctx.obj["no_cache"] = no_cache
+    ctx.obj["cache_max_mb"] = cache_max_mb
+    ctx.obj["webhook"] = webhook
 
 
 @main.command("search-companies")
 @click.argument("query")
-@click.option("--limit", "-n", default=20, show_default=True, help="Maximum matches")
+@click.option("--limit", "-n", default=20, show_default=True, type=PositiveInt, help="Maximum matches")
 @output_options
 @click.pass_context
 def search_companies(ctx, query, limit, markdown, json_output, ndjson):
     """Search SEC ticker, CIK, company, and exchange mappings."""
-    result = get_client(use_cache=not ctx.obj["no_cache"]).search_companies(query, limit=limit)
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.search_companies(query, limit=limit)
+    result = _finalize(client, result)
     _output_companies(result, json_output, markdown, ndjson)
 
 
 @main.command()
 @click.argument("identifier")
-@click.option("--limit", "-n", default=10, show_default=True, help="Recent filings to show")
+@click.option("--limit", "-n", default=10, show_default=True, type=PositiveInt, help="Recent filings to show")
 @click.option("--form", "form_type", default=None, help="Only show a form type, e.g. 10-K")
-@click.option("--start-date", default=None, help="Only filings on/after YYYY-MM-DD")
-@click.option("--end-date", default=None, help="Only filings on/before YYYY-MM-DD")
+@click.option("--start-date", default=None, callback=_validate_date_option, help="Only filings on/after YYYY-MM-DD")
+@click.option("--end-date", default=None, callback=_validate_date_option, help="Only filings on/before YYYY-MM-DD")
 @click.option("--all", "all_history", is_flag=True, help="Search historical filing chunks too")
 @click.option("--show-urls", is_flag=True, help="Show filing URLs in table output")
+@click.option("--major", "form_class_flag", flag_value="major",
+              help="Only major forms (10-K/10-Q/8-K/S-1/proxy/20-F)")
+@click.option("--insider", "form_class_flag", flag_value="insider",
+              help="Only insider forms (3, 4, 5, 144)")
+@click.option("--institutional", "form_class_flag", flag_value="institutional",
+              help="Only institutional forms (SC 13D/G, 13F)")
+@cite_option
+@since_last_fetch_option
 @output_options
 @click.pass_context
 def company(ctx, identifier, limit, form_type, start_date, end_date, all_history, show_urls,
-            markdown, json_output, ndjson):
+            form_class_flag, cite, since_last_fetch, markdown, json_output, ndjson):
     """Show company profile and recent filings for a ticker or CIK."""
-    result = get_client(use_cache=not ctx.obj["no_cache"]).submissions(
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    state_store = StateStore() if since_last_fetch else None
+    result = client.submissions(
         identifier, limit=limit, form=form_type, start_date=start_date,
         end_date=end_date, all_history=all_history,
+        since_last_fetch=since_last_fetch, state_store=state_store,
+        form_class=form_class_flag,
     )
+    result = _finalize(client, result, cite=cite)
     _output_company(result, json_output, markdown, ndjson, show_urls=show_urls)
 
 
 @main.command()
 @click.argument("identifier")
-@click.option("--limit", "-n", default=20, show_default=True, help="Recent filings to show")
+@click.option("--limit", "-n", default=20, show_default=True, type=PositiveInt, help="Recent filings to show")
 @click.option("--form", "form_type", default=None, help="Only show a form type, e.g. 8-K")
-@click.option("--start-date", default=None, help="Only filings on/after YYYY-MM-DD")
-@click.option("--end-date", default=None, help="Only filings on/before YYYY-MM-DD")
+@click.option("--start-date", default=None, callback=_validate_date_option, help="Only filings on/after YYYY-MM-DD")
+@click.option("--end-date", default=None, callback=_validate_date_option, help="Only filings on/before YYYY-MM-DD")
 @click.option("--all", "all_history", is_flag=True, help="Search historical filing chunks too")
 @click.option("--show-urls", is_flag=True, help="Show filing URLs in table output")
+@click.option("--major", "form_class_flag", flag_value="major",
+              help="Only major forms (10-K/10-Q/8-K/S-1/proxy/20-F)")
+@click.option("--insider", "form_class_flag", flag_value="insider",
+              help="Only insider forms (3, 4, 5, 144)")
+@click.option("--institutional", "form_class_flag", flag_value="institutional",
+              help="Only institutional forms (SC 13D/G, 13F)")
+@cite_option
+@since_last_fetch_option
 @output_options
 @click.pass_context
 def filings(ctx, identifier, limit, form_type, start_date, end_date, all_history, show_urls,
-            markdown, json_output, ndjson):
+            form_class_flag, cite, since_last_fetch, markdown, json_output, ndjson):
     """Show recent filings for a ticker or CIK."""
-    result = get_client(use_cache=not ctx.obj["no_cache"]).submissions(
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    state_store = StateStore() if since_last_fetch else None
+    result = client.submissions(
         identifier, limit=limit, form=form_type, start_date=start_date,
         end_date=end_date, all_history=all_history,
+        since_last_fetch=since_last_fetch, state_store=state_store,
+        form_class=form_class_flag,
     )
+    result = _finalize(client, result, cite=cite)
     _output_filings(result, f"Recent Filings: {identifier}", json_output, markdown, ndjson, show_urls=show_urls)
 
 
 @main.command()
 @click.argument("identifier")
-@click.option("--limit", "-n", default=50, show_default=True, help="Concepts to show")
+@click.option("--limit", "-n", default=50, show_default=True, type=PositiveInt, help="Concepts to show")
 @click.option("--taxonomy", "-t", default=None, help="Filter taxonomy, e.g. us-gaap")
 @click.option("--tag-filter", "-q", default=None, help="Filter tag, label, or description")
 @output_options
 @click.pass_context
 def facts(ctx, identifier, limit, taxonomy, tag_filter, markdown, json_output, ndjson):
     """List XBRL concepts available for one company."""
-    result = get_client(use_cache=not ctx.obj["no_cache"]).company_facts(
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.company_facts(
         identifier, taxonomy=taxonomy, tag_filter=tag_filter, limit=limit,
     )
+    result = _finalize(client, result)
     _output_concepts(result, json_output, markdown, ndjson)
 
 
 @main.command()
 @click.argument("args", nargs=-1, required=True)
 @click.option("--unit", "-u", default=None, help="Restrict to one unit, e.g. USD")
-@click.option("--limit", "-n", default=20, show_default=True, help="Facts to show")
+@click.option("--limit", "-n", default=20, show_default=True, type=PositiveInt, help="Facts to show")
 @click.option("--deltas", is_flag=True, help="Show change vs previous comparable displayed period")
 @click.option("--annual", is_flag=True, help="Only annual-duration facts")
 @click.option("--quarterly", is_flag=True, help="Only quarterly-duration facts")
 @click.option("--ytd", is_flag=True, help="Only year-to-date facts")
 @click.option("--instant", is_flag=True, help="Only instant facts")
+@click.option("--as-of", "as_of", default=None, callback=_validate_date_option,
+              help="Only return facts filed on/before YYYY-MM-DD (eliminates look-ahead bias)")
+@click.option("--canonical", is_flag=True,
+              help="Union facts across all candidate tags for the alias (deduped on start/end/accn)")
+@click.option("--explain", "explain", is_flag=True,
+              help="Add a resolution trace: candidates tried, fact counts, winner")
 @batch_options
+@cite_option
 @output_options
 @click.pass_context
 def concept(ctx, args, unit, limit, deltas, annual, quarterly, ytd, instant,
-            tickers, input_file, batch, markdown, json_output, ndjson):
+            as_of, canonical, explain,
+            tickers, input_file, batch, cite, markdown, json_output, ndjson):
     """Show facts for one company XBRL concept or alias."""
-    client = get_client(use_cache=not ctx.obj["no_cache"])
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
     period_type = _period_type_from_flags(annual, quarterly, ytd, instant)
     batch_mode = bool(tickers or input_file or batch)
     if batch_mode:
@@ -273,11 +463,13 @@ def concept(ctx, args, unit, limit, deltas, annual, quarterly, ytd, instant,
     if len(terms) == 1:
         fetch = lambda identifier: client.company_concept_alias(
             identifier, terms[0], unit=unit, limit=limit, period_type=period_type,
+            as_of=as_of, canonical_union=canonical,
         )
     elif len(terms) == 2:
         taxonomy, tag = terms
         fetch = lambda identifier: client.company_concept(
             identifier, taxonomy, tag, unit=unit, limit=limit, period_type=period_type,
+            as_of=as_of,
         )
     else:
         raise click.UsageError("Use either: concept IDENTIFIER ALIAS or concept IDENTIFIER TAXONOMY TAG")
@@ -286,11 +478,17 @@ def concept(ctx, args, unit, limit, deltas, annual, quarterly, ytd, instant,
     for identifier in identifiers:
         result = fetch(identifier)
         result.setdefault("identifier", identifier)
+        if explain and len(terms) == 1:
+            result["_explain"] = client.explain_concept(
+                identifier, terms[0], unit=unit, period_type=period_type,
+            )
         results.append(result)
     if len(results) == 1 and not batch_mode:
-        _output_concept_facts(results[0], json_output, markdown, ndjson, deltas=deltas)
+        single = _finalize(client, results[0], cite=cite)
+        _output_concept_facts(single, json_output, markdown, ndjson, deltas=deltas)
     else:
-        _output_concept_batch(results, json_output, markdown, ndjson, deltas=deltas)
+        wrapped = _finalize_batch(client, results, key="results", cite=cite)
+        _output_concept_batch(wrapped["results"], json_output, markdown, ndjson, deltas=deltas, envelope=wrapped)
 
 
 @main.command()
@@ -298,16 +496,17 @@ def concept(ctx, args, unit, limit, deltas, annual, quarterly, ytd, instant,
 @click.argument("tag")
 @click.argument("unit")
 @click.argument("frame")
-@click.option("--limit", "-n", default=25, show_default=True, help="Facts to show")
+@click.option("--limit", "-n", default=25, show_default=True, type=PositiveInt, help="Facts to show")
 @click.option("--sort", "sort_by", type=click.Choice(["value", "name", "none"]),
               default="value", show_default=True)
+@cite_option
 @output_options
 @click.pass_context
-def frame(ctx, taxonomy, tag, unit, frame, limit, sort_by, markdown, json_output, ndjson):
+def frame(ctx, taxonomy, tag, unit, frame, limit, sort_by, cite, markdown, json_output, ndjson):
     """Show a cross-company XBRL frame."""
-    result = get_client(use_cache=not ctx.obj["no_cache"]).frame(
-        taxonomy, tag, unit, frame, limit=limit, sort_by=sort_by,
-    )
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.frame(taxonomy, tag, unit, frame, limit=limit, sort_by=sort_by)
+    result = _finalize(client, result, cite=cite)
     _output_frame(result, json_output, markdown, ndjson)
 
 
@@ -319,7 +518,7 @@ def frame(ctx, taxonomy, tag, unit, frame, limit, sort_by, markdown, json_output
 @click.pass_context
 def open(ctx, identifier, form_type, all_history, print_only):
     """Open the latest filing index for a ticker or CIK."""
-    result = get_client(use_cache=not ctx.obj["no_cache"]).latest_filing(
+    result = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb")).latest_filing(
         identifier, form=form_type, all_history=all_history,
     )
     _error_exit(result)
@@ -339,7 +538,7 @@ def open(ctx, identifier, form_type, all_history, print_only):
 @click.pass_context
 def exhibits(ctx, accession_or_url, cik, download, type_filter, markdown, json_output, ndjson):
     """List or download documents/exhibits from a filing."""
-    client = get_client(use_cache=not ctx.obj["no_cache"])
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
     result = client.filing_documents_for_accession(accession_or_url, cik=cik)
     _error_exit(result)
     if type_filter:
@@ -356,22 +555,33 @@ def exhibits(ctx, accession_or_url, cik, download, type_filter, markdown, json_o
 
 @main.command()
 @click.argument("identifier")
+@cite_option
 @output_options
 @click.pass_context
-def earnings(ctx, identifier, markdown, json_output, ndjson):
+def earnings(ctx, identifier, cite, markdown, json_output, ndjson):
     """Summarize the latest Item 2.02 earnings 8-K and exhibit."""
-    result = get_client(use_cache=not ctx.obj["no_cache"]).latest_earnings(identifier)
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.latest_earnings(identifier)
+    result = _finalize(client, result, cite=cite)
     _output_earnings(result, json_output, markdown, ndjson)
 
 
 @main.command()
 @click.argument("identifier")
-@click.option("--limit", "-n", default=20, show_default=True, help="Recent 8-Ks to inspect")
+@click.option("--limit", "-n", default=20, show_default=True, type=PositiveInt, help="Recent 8-Ks to inspect")
+@cite_option
+@since_last_fetch_option
 @output_options
 @click.pass_context
-def events(ctx, identifier, limit, markdown, json_output, ndjson):
+def events(ctx, identifier, limit, cite, since_last_fetch, markdown, json_output, ndjson):
     """Detect notable recent 8-K events."""
-    result = get_client(use_cache=not ctx.obj["no_cache"]).events(identifier, limit=limit)
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    state_store = StateStore() if since_last_fetch else None
+    result = client.events(
+        identifier, limit=limit,
+        since_last_fetch=since_last_fetch, state_store=state_store,
+    )
+    result = _finalize(client, result, cite=cite)
     _output_events(result, json_output, markdown, ndjson)
 
 
@@ -380,21 +590,26 @@ def events(ctx, identifier, limit, markdown, json_output, ndjson):
 @click.option("--concept", "-c", required=True, help="Concept alias or tag, e.g. revenue or Assets")
 @click.option("--taxonomy", "-t", default=None, help="Taxonomy override, e.g. us-gaap")
 @click.option("--unit", "-u", default=None, help="Unit override, e.g. USD")
-@click.option("--periods", "-n", default=4, show_default=True, help="Periods per company")
+@click.option("--periods", "-n", default=4, show_default=True, type=PositiveInt, help="Periods per company")
 @click.option("--annual", is_flag=True, help="Only annual-duration facts")
 @click.option("--quarterly", is_flag=True, help="Only quarterly-duration facts")
 @click.option("--ytd", is_flag=True, help="Only year-to-date facts")
 @click.option("--instant", is_flag=True, help="Only instant facts")
+@click.option("--as-of", "as_of", default=None, callback=_validate_date_option,
+              help="Only return facts filed on/before YYYY-MM-DD")
+@cite_option
 @output_options
 @click.pass_context
 def compare(ctx, identifiers, concept, taxonomy, unit, periods, annual, quarterly, ytd, instant,
-            markdown, json_output, ndjson):
+            as_of, cite, markdown, json_output, ndjson):
     """Compare one concept across companies."""
     period_type = _period_type_from_flags(annual, quarterly, ytd, instant)
-    result = get_client(use_cache=not ctx.obj["no_cache"]).compare_concept(
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.compare_concept(
         list(identifiers), concept, taxonomy=taxonomy, unit=unit, periods=periods,
-        period_type=period_type,
+        period_type=period_type, as_of=as_of,
     )
+    result = _finalize(client, result, cite=cite)
     _output_compare(result, json_output, markdown, ndjson)
 
 
@@ -403,42 +618,831 @@ def compare(ctx, identifiers, concept, taxonomy, unit, periods, annual, quarterl
 @click.option("--bundle", default="revenue,net_income,operating_income,operating_cash_flow,cash,debt,shares",
               show_default=True, help="Comma-separated metric aliases")
 @batch_options
+@cite_option
 @output_options
 @click.pass_context
-def metrics(ctx, identifier, bundle, tickers, input_file, batch, markdown, json_output, ndjson):
-    """Return a bundled canonical metric set for one company."""
-    labels = [item.strip() for item in bundle.split(",") if item.strip()]
+def metrics(ctx, identifier, bundle, tickers, input_file, batch, cite, markdown, json_output, ndjson):
+    """Return a bundled canonical metric set for one company.
+
+    `--bundle` accepts comma-separated alias names AND named bundle groups:
+    `income-statement`, `balance-sheet`, `cash-flow`, `liquidity`,
+    `capital-structure`, `quality`. Group names expand into their members.
+    """
+    from edgar.api import METRIC_BUNDLE_GROUPS
+    labels = []
+    for item in bundle.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if item in METRIC_BUNDLE_GROUPS:
+            labels.extend(METRIC_BUNDLE_GROUPS[item])
+        else:
+            labels.append(item)
     identifiers = _collect_identifiers(identifier, tickers, input_file, batch)
-    client = get_client(use_cache=not ctx.obj["no_cache"])
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
     results = []
     for value in identifiers:
         result = client.metrics(value, labels)
         result.setdefault("identifier", value)
         results.append(result)
     if len(results) == 1 and not (tickers or input_file or batch):
-        _output_metrics(results[0], json_output, markdown, ndjson)
+        single = _finalize(client, results[0], cite=cite)
+        _output_metrics(single, json_output, markdown, ndjson)
     else:
-        _output_metrics_batch(results, json_output, markdown, ndjson)
+        wrapped = _finalize_batch(client, results, key="results", cite=cite)
+        _output_metrics_batch(wrapped["results"], json_output, markdown, ndjson, envelope=wrapped)
 
 
 @main.command()
 @click.argument("identifier", required=False)
 @batch_options
+@cite_option
 @output_options
 @click.pass_context
-def brief(ctx, identifier, tickers, input_file, batch, markdown, json_output, ndjson):
+def brief(ctx, identifier, tickers, input_file, batch, cite, markdown, json_output, ndjson):
     """Build a compact company brief."""
     identifiers = _collect_identifiers(identifier, tickers, input_file, batch)
-    client = get_client(use_cache=not ctx.obj["no_cache"])
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
     results = []
     for value in identifiers:
         result = client.brief(value)
         result.setdefault("identifier", value)
         results.append(result)
     if len(results) == 1 and not (tickers or input_file or batch):
-        _output_brief(results[0], json_output, markdown, ndjson)
+        single = _finalize(client, results[0], cite=cite)
+        _output_brief(single, json_output, markdown, ndjson)
     else:
-        _output_brief_batch(results, json_output, markdown, ndjson)
+        wrapped = _finalize_batch(client, results, key="results", cite=cite)
+        _output_brief_batch(wrapped["results"], json_output, markdown, ndjson, envelope=wrapped)
+
+
+@main.command()
+@click.argument("identifier")
+@output_options
+@click.pass_context
+def dei(ctx, identifier, markdown, json_output, ndjson):
+    """Show entity-level (DEI) metadata for a filer."""
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.dei(identifier)
+    result = _finalize(client, result)
+    _error_exit(result)
+    if ndjson:
+        _ndjson([result])
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+    body = "\n".join([
+        f"CIK: {result.get('cik', '')}",
+        f"Tickers: {', '.join(result.get('tickers', []))}",
+        f"Exchanges: {', '.join(result.get('exchanges', []))}",
+        f"SIC: {result.get('sic', '')} {result.get('sicDescription', '')}".strip(),
+        f"Entity type: {result.get('entityType', '')}",
+        f"Category: {result.get('category', '')}",
+        f"Fiscal year end: {result.get('fiscalYearEnd', '')}",
+        f"State of incorporation: {result.get('stateOfIncorporationDescription') or result.get('stateOfIncorporation', '')}",
+        f"EIN: {result.get('ein', '')}",
+        f"Phone: {result.get('phone', '')}",
+        f"Former names: {len(result.get('formerNames', []))}",
+    ])
+    console.print(Panel(body, title=f"DEI: {result.get('name', '')}", expand=False))
+
+
+@main.command()
+@click.argument("identifier")
+@click.option("--by", default="sic", show_default=True, type=click.Choice(["sic"]),
+              help="Peer ranking method")
+@click.option("--candidates", default=None,
+              help="Comma-separated tickers or @group expression to search (default @dow30)")
+@click.option("--limit", "-n", default=10, show_default=True, type=PositiveInt)
+@output_options
+@click.pass_context
+def peers(ctx, identifier, by, candidates, limit, markdown, json_output, ndjson):
+    """Find peer filers from a candidate set, matched on SIC code."""
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    candidate_list = None
+    if candidates:
+        candidate_list = _expand_groups(_split_input_values(candidates), client=client)
+    result = client.peers(identifier, candidates=candidate_list, by=by, limit=limit)
+    result = _finalize(client, result)
+    _error_exit(result)
+    peers_list = result.get("peers", [])
+    if ndjson:
+        _ndjson(peers_list)
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+    target = result.get("target", {})
+    rows = [[p["cik"], p["ticker"], p["name"], p["exchange"]] for p in peers_list]
+    headers = ["CIK", "Ticker", "Name", "Exchange"]
+    title = f"Peers of {target.get('ticker') or target.get('name', '')} (SIC {target.get('sic')})"
+    if markdown:
+        click.echo(_markdown_table(headers, rows))
+        return
+    console.print(_simple_table(title, headers, rows))
+
+
+@main.command("concept-info")
+@click.argument("alias_or_tag")
+@click.option("--taxonomy", default="us-gaap", show_default=True)
+@click.option("--filer", default="AAPL", show_default=True,
+              help="Reference filer used to surface label/description/freshness")
+@output_options
+@click.pass_context
+def concept_info_cmd(ctx, alias_or_tag, taxonomy, filer, markdown, json_output, ndjson):
+    """Show metadata about a concept alias or XBRL tag (candidates, units, label)."""
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.concept_info(alias_or_tag, taxonomy=taxonomy, filer=filer)
+    result = _finalize(client, result)
+    _error_exit(result)
+    if ndjson:
+        _ndjson([result])
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+    if result.get("is_alias"):
+        rows = [[c["taxonomy"], c["tag"], c.get("label", ""), c.get("default_unit", ""),
+                 c.get("fact_count_in_filer", 0), c.get("latest_filed_in_filer", "")]
+                for c in result.get("candidates", [])]
+        headers = ["Taxonomy", "Tag", "Label", "Default Unit", "Facts", "Latest"]
+        title = f"Alias: {result['alias']} (reference filer: {result['reference_filer']})"
+    else:
+        rows = [[result.get("taxonomy", ""), result.get("tag", ""),
+                 result.get("label", ""), result.get("units", ""),
+                 result.get("fact_count_in_filer", 0), result.get("latest_filed_in_filer", "")]]
+        headers = ["Taxonomy", "Tag", "Label", "Units", "Facts", "Latest"]
+        title = f"Tag: {result.get('tag')} (reference filer: {result['reference_filer']})"
+    if markdown:
+        click.echo(_markdown_table(headers, rows))
+        return
+    console.print(_simple_table(title, headers, rows))
+
+
+@main.command()
+@click.argument("query")
+@click.option("--filer", default="AAPL", show_default=True,
+              help="Reference filer whose reported tags are searched")
+@click.option("--taxonomy", default="us-gaap", show_default=True)
+@click.option("--limit", "-n", default=25, show_default=True, type=PositiveInt)
+@output_options
+@click.pass_context
+def tags(ctx, query, filer, taxonomy, limit, markdown, json_output, ndjson):
+    """Search XBRL tag labels/descriptions for a phrase."""
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.tag_search(query, filer=filer, taxonomy=taxonomy, limit=limit)
+    result = _finalize(client, result)
+    _output_tag_search(result, json_output, markdown, ndjson)
+
+
+@main.command()
+@click.option("--taxonomy", default="us-gaap", show_default=True)
+@click.option("--since", "since_year", type=int, default=None,
+              help="Earliest calendar year (default 2009)")
+@click.option("--until", "until_year", type=int, default=None,
+              help="Latest calendar year (default current year)")
+@click.option("--annual/--no-annual", default=True)
+@click.option("--quarterly/--no-quarterly", default=True)
+@click.option("--instant/--no-instant", default=True)
+@output_options
+@click.pass_context
+def frames(ctx, taxonomy, since_year, until_year, annual, quarterly, instant,
+           markdown, json_output, ndjson):
+    """Enumerate plausible XBRL frame strings deterministically."""
+    from edgar.api import EdgarClient
+
+    kinds = set()
+    if annual:
+        kinds.add("annual")
+    if quarterly:
+        kinds.add("quarterly")
+    if instant:
+        kinds.add("instant")
+    result = EdgarClient.list_frames(taxonomy=taxonomy, since_year=since_year,
+                                     until_year=until_year, kinds=kinds)
+    if ndjson:
+        _ndjson(result.get("frames", []))
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+    rows = [[f["frame"], f["kind"], f["year"], f["quarter"] or ""] for f in result["frames"]]
+    headers = ["Frame", "Kind", "Year", "Quarter"]
+    if markdown:
+        click.echo(_markdown_table(headers, rows))
+        return
+    console.print(_simple_table(f"Frames {result['since_year']}-{result['until_year']}", headers, rows))
+
+
+def _output_tag_search(result: dict, json_output: bool, markdown: bool, ndjson: bool = False) -> None:
+    _error_exit(result)
+    matches = result.get("matches", [])
+    if ndjson:
+        _ndjson(matches)
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+    rows = [[m["tag"], _truncate(m.get("label", ""), 48), m.get("units", ""),
+             m.get("fact_count", ""), m.get("latest_filed", "")] for m in matches]
+    headers = ["Tag", "Label", "Units", "Facts", "Latest Filed"]
+    if markdown:
+        click.echo(_markdown_table(headers, rows))
+        return
+    console.print(_simple_table(f"Tags matching {result.get('query')!r}", headers, rows))
+
+
+@main.command()
+@click.argument("identifier")
+@click.option("--bundle", default="revenue,net_income,operating_income,operating_cash_flow",
+              show_default=True)
+@click.option("--as-of", "as_of", default=None, callback=_validate_date_option,
+              help="Trailing twelve months as of YYYY-MM-DD (look-ahead-safe)")
+@output_options
+@click.pass_context
+def ttm(ctx, identifier, bundle, as_of, markdown, json_output, ndjson):
+    """Trailing-twelve-months reconstruction for a metric bundle."""
+    labels = [item.strip() for item in bundle.split(",") if item.strip()]
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.ttm(identifier, bundle=labels, as_of=as_of)
+    result = _finalize(client, result)
+    _error_exit(result)
+    if ndjson:
+        _ndjson(result.get("metrics", []))
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+    rows = [[m.get("metric"), _format_value(m.get("value", "")),
+             m.get("formula", "")[:80], ", ".join(m.get("missing_inputs", []))]
+            for m in result.get("metrics", [])]
+    headers = ["Metric", "TTM", "Formula", "Missing"]
+    title = f"TTM: {result.get('name', identifier)}"
+    if markdown:
+        click.echo(_markdown_table(headers, rows))
+        return
+    console.print(_simple_table(title, headers, rows))
+
+
+@main.command()
+@click.argument("identifier")
+@click.option("--period-type", default="annual",
+              type=click.Choice(["annual", "quarterly", "ytd"]), show_default=True)
+@click.option("--as-of", "as_of", default=None, callback=_validate_date_option)
+@output_options
+@click.pass_context
+def ratios(ctx, identifier, period_type, as_of, markdown, json_output, ndjson):
+    """Canonical ratio set with formula + provenance per ratio."""
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.ratios(identifier, period_type=period_type, as_of=as_of)
+    result = _finalize(client, result)
+    _error_exit(result)
+    if ndjson:
+        _ndjson(result.get("ratios", []))
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+    rows = []
+    for r in result.get("ratios", []):
+        v = r.get("value")
+        rows.append([
+            r.get("metric", ""),
+            f"{v*100:.2f}%" if isinstance(v, (int, float)) and abs(v) < 10 and "margin" in r.get("metric", "") else (
+                f"{v:.2f}" if isinstance(v, (int, float)) else ""),
+            r.get("formula", "")[:64],
+            ", ".join(r.get("missing_inputs", [])),
+        ])
+    headers = ["Ratio", "Value", "Formula", "Missing"]
+    title = f"Ratios: {result.get('name', identifier)} ({period_type})"
+    if markdown:
+        click.echo(_markdown_table(headers, rows))
+        return
+    console.print(_simple_table(title, headers, rows))
+
+
+@main.command()
+@click.argument("identifier")
+@click.option("--metric", "-c", required=True, help="Metric alias (e.g. revenue, net_income)")
+@click.option("--periods", "-n", default=8, show_default=True, type=PositiveInt)
+@click.option("--period-type", default="quarterly",
+              type=click.Choice(["annual", "quarterly", "ytd", "instant"]), show_default=True)
+@click.option("--as-of", "as_of", default=None, callback=_validate_date_option)
+@output_options
+@click.pass_context
+def trend(ctx, identifier, metric, periods, period_type, as_of, markdown, json_output, ndjson):
+    """Multi-period trend with slope, direction, and categorical label."""
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.trend(identifier, metric, periods=periods,
+                          period_type=period_type, as_of=as_of)
+    result = _finalize(client, result)
+    _error_exit(result)
+    if ndjson:
+        _ndjson(result.get("facts", []))
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+    facts = result.get("facts", [])
+    summary = result.get("summary", {})
+    rows = [[f.get("end", ""), f.get("calendar_period", ""),
+             _format_value(f.get("val", ""), f.get("unit", ""))]
+            for f in sorted(facts, key=lambda x: x.get("end", ""))]
+    headers = ["Period End", "Frame", "Value"]
+    title = (f"Trend: {result.get('name', identifier)} {metric} "
+             f"({period_type}) — {summary.get('label', '')}, slope={summary.get('slope')}")
+    if markdown:
+        click.echo(_markdown_table(headers, rows))
+        return
+    console.print(_simple_table(title, headers, rows))
+
+
+@main.command()
+@click.argument("identifier")
+@click.option("--metric", "-c", required=True)
+@click.option("--basis", default="yoy", show_default=True,
+              help="Comma-separated: yoy,qoq,cagr3,cagr5")
+@click.option("--periods", "-n", default=8, show_default=True, type=PositiveInt)
+@click.option("--period-type", default="annual",
+              type=click.Choice(["annual", "quarterly", "ytd"]), show_default=True)
+@click.option("--as-of", "as_of", default=None, callback=_validate_date_option)
+@output_options
+@click.pass_context
+def growth(ctx, identifier, metric, basis, periods, period_type, as_of,
+           markdown, json_output, ndjson):
+    """Multi-basis growth: yoy, qoq, cagr3, cagr5."""
+    bases = [b.strip() for b in basis.split(",") if b.strip()]
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.growth(identifier, metric, basis=bases, periods=periods,
+                           period_type=period_type, as_of=as_of)
+    result = _finalize(client, result)
+    _error_exit(result)
+    if ndjson:
+        _ndjson(result.get("growth", []))
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+    rows = []
+    for g in result.get("growth", []):
+        if g.get("basis") in {"yoy", "qoq"}:
+            latest = g.get("latest")
+            rows.append([g["basis"],
+                         f"{latest*100:+.1f}%" if isinstance(latest, (int, float)) else "",
+                         f"{len(g.get('rates', []))} rates computed"])
+        else:
+            v = g.get("value")
+            rows.append([g["basis"],
+                         f"{v*100:+.1f}%" if isinstance(v, (int, float)) else "",
+                         f"window={g.get('window_size', 0)}"])
+    headers = ["Basis", "Value", "Detail"]
+    title = f"Growth: {result.get('name', identifier)} {metric} ({period_type})"
+    if markdown:
+        click.echo(_markdown_table(headers, rows))
+        return
+    console.print(_simple_table(title, headers, rows))
+
+
+@main.command()
+@click.argument("identifier")
+@click.option("--metric", "-c", required=True,
+              type=click.Choice(["ebitda", "fcf", "net_debt", "nwc", "working_capital",
+                                  "tangible_book", "tangible_book_value"]))
+@click.option("--period-type", default="annual",
+              type=click.Choice(["annual", "quarterly", "ytd"]), show_default=True)
+@click.option("--as-of", "as_of", default=None, callback=_validate_date_option)
+@output_options
+@click.pass_context
+def reconstruct(ctx, identifier, metric, period_type, as_of, markdown, json_output, ndjson):
+    """Reconstruct derived line items SEC does not tag directly (EBITDA, FCF, ...)."""
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.reconstruct(identifier, metric, period_type=period_type, as_of=as_of)
+    result = _finalize(client, result)
+    _error_exit(result)
+    if ndjson:
+        _ndjson([result])
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+    body = "\n".join([
+        f"Metric: {result.get('metric')}",
+        f"Value: {_format_value(result.get('value'))}",
+        f"Formula: {result.get('formula', '')}",
+        f"Inputs: {len(result.get('inputs', []))} sources",
+        f"Caveats: {'; '.join(result.get('caveats', [])) or 'none'}",
+        f"Missing inputs: {', '.join(result.get('missing_inputs', [])) or 'none'}",
+    ])
+    console.print(Panel(body, title=f"Reconstruct: {result.get('name', identifier)} {metric}", expand=False))
+
+
+@main.command()
+@click.argument("identifiers", nargs=-1, required=True)
+@output_options
+@click.pass_context
+def resolve(ctx, identifiers, markdown, json_output, ndjson):
+    """Batch resolve tickers/CIKs/names with ambiguity metadata.
+
+    Accepts plain identifiers and `@group` expressions (e.g. `@dow30`).
+    """
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.resolve(list(identifiers))
+    result = _finalize(client, result)
+    if ndjson:
+        _ndjson(result.get("results", []))
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+    rows = [[r.get("identifier", ""), r.get("ticker", ""), r.get("cik", ""),
+             r.get("name", ""), r.get("error", "")]
+            for r in result.get("results", [])]
+    headers = ["Input", "Ticker", "CIK", "Name", "Error"]
+    if markdown:
+        click.echo(_markdown_table(headers, rows))
+        return
+    console.print(_simple_table("Resolve", headers, rows))
+
+
+@main.command()
+@click.argument("identifier_a")
+@click.argument("identifier_b")
+@click.option("--concept", "-c", required=True)
+@click.option("--periods", "-n", default=4, show_default=True, type=PositiveInt)
+@click.option("--period-type", default="annual",
+              type=click.Choice(["annual", "quarterly", "ytd", "instant"]), show_default=True)
+@click.option("--as-of", "as_of", default=None, callback=_validate_date_option)
+@output_options
+@click.pass_context
+def diff(ctx, identifier_a, identifier_b, concept, periods, period_type, as_of,
+         markdown, json_output, ndjson):
+    """Side-by-side diff of one concept across two filers, period-aligned."""
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.diff_concept(identifier_a, identifier_b, concept,
+                                 period_type=period_type, periods=periods, as_of=as_of)
+    result = _finalize(client, result)
+    _error_exit(result)
+    if ndjson:
+        _ndjson(result.get("rows", []))
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+    rows = [[r.get("end", ""), r.get("frame", ""),
+             _format_value(r.get("a_value")), _format_value(r.get("b_value")),
+             _format_value(r.get("delta")),
+             f"{r['ratio']:.2f}x" if r.get("ratio") is not None else ""]
+            for r in result.get("rows", [])]
+    headers = ["Period End", "Frame",
+               f"{result['a']['identifier']}", f"{result['b']['identifier']}",
+               "Delta (A-B)", "Ratio (A/B)"]
+    title = f"Diff: {concept} ({period_type})"
+    if markdown:
+        click.echo(_markdown_table(headers, rows))
+        return
+    console.print(_simple_table(title, headers, rows))
+
+
+@main.command()
+@click.argument("command_name", required=False)
+@output_options
+def schema(command_name, markdown, json_output, ndjson):
+    """Print a JSON schema describing the output of a command (or list known schemas)."""
+    schemas = _output_schemas()
+    if not command_name:
+        payload = {"available": sorted(schemas)}
+        if ndjson:
+            _ndjson([payload])
+            return
+        _json(payload)
+        return
+    if command_name not in schemas:
+        click.echo(f"Unknown command schema: {command_name}", err=True)
+        click.echo(f"Available: {', '.join(sorted(schemas))}", err=True)
+        raise click.exceptions.Exit(2)
+    if ndjson:
+        _ndjson([schemas[command_name]])
+        return
+    _json(schemas[command_name])
+
+
+def _output_schemas() -> dict:
+    """Return JSON schemas for the most-used command outputs.
+
+    Schemas are intentionally pragmatic: they describe top-level shape and the
+    key fields agents will read. They are not exhaustive — agents should treat
+    them as a contract over named fields, not a closed-world spec.
+    """
+    fact_schema = {
+        "type": "object",
+        "properties": {
+            "val": {"type": ["number", "string"]},
+            "start": {"type": "string"}, "end": {"type": "string"},
+            "filed": {"type": "string"}, "form": {"type": "string"},
+            "accn": {"type": "string"}, "accession": {"type": "string"},
+            "unit": {"type": "string"},
+            "period_type": {"type": "string", "enum": ["annual", "quarterly", "ytd", "instant"]},
+            "period_length_days": {"type": "integer"},
+            "fiscal_period": {"type": "string"}, "calendar_period": {"type": "string"},
+            "source_url": {"type": "string"}, "as_of": {"type": "string"},
+            "is_restated": {"type": "boolean"}, "is_cumulative": {"type": "boolean"},
+            "superseded_by": {"type": ["string", "null"]},
+        },
+    }
+    envelope_meta = {
+        "schema_version": {"type": "string"},
+        "cli_version": {"type": "string"},
+        "cache": {
+            "type": "object",
+            "properties": {
+                "calls": {"type": "integer"}, "hits": {"type": "integer"},
+                "misses": {"type": "integer"}, "age_max_seconds": {"type": "integer"},
+                "ttl_min_remaining": {"type": "integer"},
+                "last_key": {"type": "string"}, "last_hit": {"type": "boolean"},
+                "last_etag": {"type": ["string", "null"]},
+            },
+        },
+    }
+    return {
+        "concept": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                **envelope_meta,
+                "cik": {"type": "string"}, "name": {"type": "string"},
+                "taxonomy": {"type": "string"}, "tag": {"type": "string"},
+                "label": {"type": "string"}, "description": {"type": "string"},
+                "as_of": {"type": ["string", "null"]},
+                "facts": {"type": "array", "items": fact_schema},
+                "total": {"type": "integer"},
+                "alias": {"type": ["string", "null"]},
+                "candidate_tags": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["cik", "facts"],
+        },
+        "metrics": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                **envelope_meta,
+                "cik": {"type": "string"}, "ticker": {"type": "string"},
+                "name": {"type": "string"}, "reference_date": {"type": "string"},
+                "metrics": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "metric": {"type": "string"}, "tag": {"type": "string"},
+                            "fact": fact_schema, "age_days": {"type": ["integer", "null"]},
+                            "stale": {"type": "boolean"}, "error": {"type": "string"},
+                        },
+                    },
+                },
+            },
+        },
+        "ratios": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                **envelope_meta,
+                "cik": {"type": "string"}, "name": {"type": "string"},
+                "period_type": {"type": "string"},
+                "ratios": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "metric": {"type": "string"},
+                            "value": {"type": ["number", "null"]},
+                            "formula": {"type": "string"},
+                            "inputs": {"type": "array"},
+                            "caveats": {"type": "array", "items": {"type": "string"}},
+                            "missing_inputs": {"type": "array", "items": {"type": "string"}},
+                        },
+                    },
+                },
+                "not_applicable": {"type": "array"},
+            },
+        },
+        "filings": {
+            "type": "object",
+            "properties": {
+                **envelope_meta,
+                "filings": {"type": "array", "items": {"type": "object"}},
+                "warning": {"type": "string"},
+            },
+        },
+        "events": {
+            "type": "object",
+            "properties": {**envelope_meta, "events": {"type": "array"}},
+        },
+        "delta": {
+            "type": "object",
+            "properties": {
+                **envelope_meta,
+                "since": {"type": ["string", "null"]},
+                "new_filings": {"type": "array"},
+                "restated_facts": {"type": "array"},
+                "summary": {"type": "object"},
+            },
+        },
+    }
+
+
+@main.command("audit-trail")
+@click.argument("identifier")
+@click.option("--concept", "-c", required=True, help="Concept alias (e.g. revenue, net_income)")
+@click.option("--period", default=None, help="Calendar period frame (e.g. CY2024)")
+@click.option("--start", "period_start", default=None, help="Period start YYYY-MM-DD")
+@click.option("--end", "period_end", default=None, help="Period end YYYY-MM-DD")
+@output_options
+@click.pass_context
+def audit_trail_cmd(ctx, identifier, concept, period, period_start, period_end,
+                    markdown, json_output, ndjson):
+    """Show every filing that reported a fact, with restatement detection."""
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.audit_trail(identifier, concept, period=period,
+                                period_start=period_start, period_end=period_end)
+    result = _finalize(client, result)
+    _error_exit(result)
+    if ndjson:
+        _ndjson(result.get("facts", []))
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+    rows = [[f.get("filed", ""), f.get("end", ""), f.get("calendar_period", ""),
+             _format_value(f.get("val", ""), f.get("unit", "")),
+             f.get("source_tag") or f.get("tag", ""), f.get("accn", "")]
+            for f in result.get("facts", [])]
+    headers = ["Filed", "Period End", "Frame", "Value", "Tag", "Accession"]
+    title = f"Audit trail: {result.get('name', '')} {concept}"
+    if markdown:
+        click.echo(_markdown_table(headers, rows))
+        return
+    console.print(_simple_table(title, headers, rows))
+    restated = result.get("restated_periods", [])
+    if restated:
+        console.print(f"\n[bold yellow]Restated periods: {len(restated)}[/bold yellow]")
+        for r in restated[:5]:
+            console.print(f"  {r['start']}..{r['end']}: values seen = {r['values_seen']}")
+
+
+@main.command()
+@click.argument("identifier")
+@click.option("--since", default=None, callback=_validate_date_option,
+              help="Only filings on/after YYYY-MM-DD")
+@click.option("--limit", "-n", default=50, show_default=True, type=PositiveInt)
+@output_options
+@click.pass_context
+def amendments(ctx, identifier, since, limit, markdown, json_output, ndjson):
+    """Pair primary filings with their /A amendments."""
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.amendments(identifier, since=since, limit=limit)
+    result = _finalize(client, result)
+    _error_exit(result)
+    if ndjson:
+        _ndjson(result.get("chains", []))
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+    rows = []
+    for chain in result.get("chains", []):
+        amd = chain["amendment"]
+        prim = chain.get("primary") or {}
+        rows.append([amd.get("filingDate", ""), amd.get("form", ""), amd.get("accessionNumber", ""),
+                     prim.get("filingDate", "—"), prim.get("form", "—"), prim.get("accessionNumber", "—")])
+    headers = ["Amend Filed", "Amend Form", "Amend Accession", "Primary Filed", "Primary Form", "Primary Accession"]
+    title = f"Amendments: {result.get('name', '')}"
+    if markdown:
+        click.echo(_markdown_table(headers, rows))
+        return
+    console.print(_simple_table(title, headers, rows))
+
+
+@main.command()
+@click.argument("identifier")
+@click.option("--since", default=None, callback=_validate_date_option,
+              help="Diff scope start (YYYY-MM-DD)")
+@click.option("--use-state/--no-state", default=False,
+              help="Use ~/.edgar/state.json high-water mark (auto-advance on success)")
+@output_options
+@click.pass_context
+def delta(ctx, identifier, since, use_state, markdown, json_output, ndjson):
+    """Show new filings and detected restatements since a date."""
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    state_store = StateStore() if use_state else None
+    result = client.delta(identifier, since=since, state_store=state_store)
+    result = _finalize(client, result)
+    _error_exit(result)
+    if ndjson:
+        for nf in result.get("new_filings", []):
+            click.echo(json.dumps({"kind": "new_filing", **nf}, default=str))
+        for rf in result.get("restated_facts", []):
+            click.echo(json.dumps({"kind": "restated", **rf}, default=str))
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+    summary = result.get("summary", {})
+    console.print(Panel(
+        f"New filings: {summary.get('new_filings', 0)}\n"
+        f"Restated periods detected: {summary.get('restated_periods', 0)}\n"
+        f"Since: {result.get('since') or 'state high-water'}",
+        title=f"Delta: {result.get('name', '')}", expand=False,
+    ))
+    rows = [[f.get("filingDate"), f.get("form"), f.get("accessionNumber")]
+            for f in result.get("new_filings", [])[:20]]
+    if rows:
+        console.print(_simple_table("New filings (top 20)", ["Filed", "Form", "Accession"], rows))
+
+
+@main.group()
+def subscribe():
+    """Manage filing subscriptions in ~/.edgar/state.json."""
+
+
+@subscribe.command("add")
+@click.argument("identifier")
+@click.option("--form", default=None, help="Restrict to a specific form")
+@click.pass_context
+def subscribe_add(ctx, identifier, form):
+    """Subscribe to a (filer, form) pair."""
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    company = client.resolve_company(identifier)
+    _error_exit(company)
+    store = StateStore()
+    entry = store.subscribe(company["cik"], form)
+    click.echo(json.dumps(entry, default=str))
+
+
+@subscribe.command("remove")
+@click.argument("identifier")
+@click.option("--form", default=None)
+@click.pass_context
+def subscribe_remove(ctx, identifier, form):
+    """Unsubscribe from a (filer, form) pair."""
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    company = client.resolve_company(identifier)
+    _error_exit(company)
+    removed = StateStore().unsubscribe(company["cik"], form)
+    click.echo(f"removed: {removed}")
+
+
+@subscribe.command("list")
+def subscribe_list():
+    """List all current subscriptions."""
+    subs = StateStore().subscriptions()
+    _json({"subscriptions": subs, "total": len(subs)})
+
+
+@main.command()
+@click.option("--ndjson", "ndjson_out", is_flag=True, help="Stream new filings as NDJSON")
+@click.pass_context
+def pending(ctx, ndjson_out):
+    """Drain new filings for every active subscription (advances high-water marks)."""
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    store = StateStore()
+    subs = store.subscriptions()
+    out_subs = []
+    for sub in subs:
+        cik = sub.get("cik", "")
+        form = None if sub.get("form") in (None, "*") else sub.get("form")
+        result = client.submissions(cik, limit=50, form=form,
+                                     since_last_fetch=True, state_store=store)
+        new = result.get("filings", []) if "error" not in result else []
+        if ndjson_out:
+            for f in new:
+                click.echo(json.dumps({
+                    "subscription": sub.get("key"), "cik": cik, "form": form or "*",
+                    **f,
+                }, default=str))
+        else:
+            out_subs.append({"subscription": sub.get("key"), "new_filings": new,
+                             "count": len(new)})
+    if not ndjson_out:
+        _json({"subscriptions": out_subs, "total": len(subs)})
+
+
+@main.command("mark-seen")
+@click.argument("identifier")
+@click.argument("accession")
+@click.option("--form", default=None)
+@click.option("--filed", default=None, callback=_validate_date_option,
+              help="Filing date YYYY-MM-DD (defaults to today)")
+@click.pass_context
+def mark_seen(ctx, identifier, accession, form, filed):
+    """Manually advance the high-water mark for a (filer, form) subscription."""
+    from datetime import date as _date
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    company = client.resolve_company(identifier)
+    _error_exit(company)
+    StateStore().mark_seen(
+        company["cik"], form, accession, filed or _date.today().isoformat(),
+    )
+    click.echo("ok")
 
 
 @main.command("bulk-urls")
@@ -468,10 +1472,75 @@ def bulk_urls(markdown, json_output, ndjson):
 @main.command("clear-cache")
 def clear_cache():
     """Clear the local EDGAR cache."""
-    from research_cli_base import FileCache
+    from edgar.cache import EdgarCache
 
-    count = FileCache(cache_dir="~/.edgar_cache").clear()
+    count = EdgarCache(cache_dir="~/.edgar_cache").clear()
     click.echo(f"Cleared {count} cached entries.")
+
+
+@main.group()
+def cache():
+    """Inspect and manage the local EDGAR cache."""
+
+
+@cache.command("stats")
+@output_options
+def cache_stats(markdown, json_output, ndjson):
+    """Show cache size, fresh/expired counts, and configuration."""
+    from edgar.cache import EdgarCache
+
+    stats = EdgarCache(cache_dir="~/.edgar_cache").stats()
+    if ndjson:
+        _ndjson([stats])
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(stats)
+        return
+    rows = [[k, str(v)] for k, v in stats.items()]
+    if markdown:
+        click.echo(_markdown_table(["Field", "Value"], rows))
+        return
+    console.print(_simple_table("Cache Stats", ["Field", "Value"], rows))
+
+
+@cache.command("invalidate")
+@click.argument("pattern")
+def cache_invalidate(pattern):
+    """Delete cached entries whose URL matches a glob (e.g. '*CIK0000320193*')."""
+    from edgar.cache import EdgarCache
+
+    removed = EdgarCache(cache_dir="~/.edgar_cache").invalidate(pattern)
+    click.echo(f"Invalidated {removed} cached entries matching {pattern!r}.")
+
+
+@cache.command("warm")
+@click.option("--tickers", default=None, help="Comma-separated identifiers to warm submissions+facts for")
+@click.option("--input", "input_file", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              default=None, help="Read identifiers from a file")
+def cache_warm(tickers, input_file):
+    """Pre-fetch submissions and companyfacts for a list of identifiers."""
+    from edgar.api import COMPANY_TICKERS_URL, get_client, normalize_cik
+
+    identifiers = _collect_identifiers(None, tickers, input_file, batch=False) if (tickers or input_file) else []
+    if not identifiers:
+        raise click.UsageError("Provide --tickers or --input")
+    client = get_client()
+    cache_obj = client.edgar_cache
+    urls = [COMPANY_TICKERS_URL]
+    for ident in identifiers:
+        company = client.resolve_company(ident)
+        if "error" in company:
+            click.echo(f"skip {ident}: {company['error']}", err=True)
+            continue
+        cik = company["cik"]
+        urls.append(f"https://data.sec.gov/submissions/CIK{cik}.json")
+        urls.append(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json")
+
+    def fetch(url):
+        return client._get(url)
+
+    summary = cache_obj.warm(urls, fetch)
+    _json(summary)
 
 
 def _output_companies(result: dict, json_output: bool, markdown: bool, ndjson: bool = False) -> None:
@@ -545,7 +1614,11 @@ def _output_filings(result: dict, title: str, json_output: bool, markdown: bool,
         _ndjson(result.get("filings", []))
         return
     if _wants_json(json_output, markdown, ndjson):
-        _json({"cik": result.get("cik"), "name": result.get("name"), "filings": result.get("filings", [])})
+        # Preserve envelope metadata (schema_version, cli_version, cache, warning, ...)
+        # rather than emitting only a stripped-down dict, so agents always get
+        # the documented envelope on JSON output.
+        payload = {k: v for k, v in result.items() if k not in {"files", "history_files_checked"}}
+        _json(payload)
         return
 
     rows = []
@@ -707,14 +1780,16 @@ def _flatten_concept_batch(results: list[dict], deltas: bool = False) -> list[di
 
 
 def _output_concept_batch(results: list[dict], json_output: bool, markdown: bool,
-                          ndjson: bool = False, deltas: bool = False) -> None:
+                          ndjson: bool = False, deltas: bool = False,
+                          envelope: Optional[dict] = None) -> None:
     if _batch_failed(results):
         _error_exit(results[0])
     rows = _flatten_concept_batch(results, deltas=deltas)
     if ndjson:
         _ndjson(rows)
         return
-    payload = {"results": results}
+    payload = dict(envelope) if envelope else {"results": results}
+    payload.setdefault("results", results)
     if deltas:
         payload["facts"] = rows
     if _wants_json(json_output, markdown, ndjson):
@@ -949,7 +2024,8 @@ def _flatten_metrics_batch(results: list[dict]) -> list[dict]:
     return rows
 
 
-def _output_metrics_batch(results: list[dict], json_output: bool, markdown: bool, ndjson: bool = False) -> None:
+def _output_metrics_batch(results: list[dict], json_output: bool, markdown: bool,
+                          ndjson: bool = False, envelope: Optional[dict] = None) -> None:
     if _batch_failed(results):
         _error_exit(results[0])
     rows = _flatten_metrics_batch(results)
@@ -957,7 +2033,9 @@ def _output_metrics_batch(results: list[dict], json_output: bool, markdown: bool
         _ndjson(rows)
         return
     if _wants_json(json_output, markdown, ndjson):
-        _json({"results": results})
+        payload = dict(envelope) if envelope else {"results": results}
+        payload.setdefault("results", results)
+        _json(payload)
         return
 
     table_rows = [
@@ -1060,14 +2138,17 @@ def _brief_summary_rows(results: list[dict]) -> list[list]:
     return rows
 
 
-def _output_brief_batch(results: list[dict], json_output: bool, markdown: bool, ndjson: bool = False) -> None:
+def _output_brief_batch(results: list[dict], json_output: bool, markdown: bool,
+                        ndjson: bool = False, envelope: Optional[dict] = None) -> None:
     if _batch_failed(results):
         _error_exit(results[0])
     if ndjson:
         _ndjson(results)
         return
     if _wants_json(json_output, markdown, ndjson):
-        _json({"results": results})
+        payload = dict(envelope) if envelope else {"results": results}
+        payload.setdefault("results", results)
+        _json(payload)
         return
 
     rows = _brief_summary_rows(results)

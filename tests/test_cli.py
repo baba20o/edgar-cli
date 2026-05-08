@@ -55,7 +55,7 @@ def test_unknown_company_uses_no_data_exit_code(monkeypatch):
         def submissions(self, *args, **kwargs):
             return {"error": "No company found for FAKETICKER"}
 
-    monkeypatch.setattr("edgar.cli.get_client", lambda use_cache=True: FakeClient())
+    monkeypatch.setattr("edgar.cli.get_client", lambda use_cache=True, cache_max_mb=None: FakeClient())
 
     result = CliRunner().invoke(main, ["company", "FAKETICKER"])
 
@@ -81,7 +81,7 @@ def test_metrics_accepts_ticker_batch(monkeypatch):
                 "metrics": [{"metric": labels[0], "tag": "Revenues", "fact": {"val": 123}, "unit": "USD"}],
             }
 
-    monkeypatch.setattr("edgar.cli.get_client", lambda use_cache=True: FakeClient())
+    monkeypatch.setattr("edgar.cli.get_client", lambda use_cache=True, cache_max_mb=None: FakeClient())
 
     result = CliRunner().invoke(
         main,
@@ -98,7 +98,8 @@ def test_concept_accepts_input_file_batch(monkeypatch, tmp_path):
     input_file.write_text("AAPL\nMSFT\n")
 
     class FakeClient:
-        def company_concept_alias(self, identifier, concept, unit=None, limit=20, period_type=None):
+        def company_concept_alias(self, identifier, concept, unit=None, limit=20,
+                                  period_type=None, as_of=None, canonical_union=False):
             return {
                 "identifier": identifier,
                 "cik": identifier,
@@ -108,7 +109,7 @@ def test_concept_accepts_input_file_batch(monkeypatch, tmp_path):
                 "facts": [{"val": 123, "unit": "USD", "filed": "2026-01-01"}],
             }
 
-    monkeypatch.setattr("edgar.cli.get_client", lambda use_cache=True: FakeClient())
+    monkeypatch.setattr("edgar.cli.get_client", lambda use_cache=True, cache_max_mb=None: FakeClient())
 
     result = CliRunner().invoke(main, ["concept", "--input", str(input_file), "revenue", "--ndjson"])
 
@@ -157,3 +158,194 @@ def test_download_documents_returns_error_on_directory_failure(monkeypatch, tmp_
     result = _download_documents(object(), {"documents": []}, target)
 
     assert result["error"].startswith("Could not create download directory")
+
+
+# --- foundation tranche: citations and envelope wiring at the CLI seam ---
+
+
+def test_format_citation_builds_agent_quotable_string():
+    from edgar.cli import _format_citation
+
+    cite = _format_citation(
+        {"accessionNumber": "0000320193-25-000079", "filingDate": "2025-10-31",
+         "form": "10-K", "fiscal_period": "FY2025"},
+        ticker="AAPL",
+    )
+    assert "AAPL" in cite
+    assert "FY2025" in cite
+    assert "10-K" in cite
+    assert "0000320193-25-000079" in cite
+    assert "filed 2025-10-31" in cite
+
+
+def test_add_citations_walks_facts_and_filings():
+    from edgar.cli import _add_citations
+
+    result = _add_citations({
+        "ticker": "AAPL",
+        "name": "Apple Inc.",
+        "facts": [
+            {"accn": "0000320193-25-000079", "filed": "2025-10-31", "form": "10-K",
+             "fiscal_period": "FY2025"},
+            {"accn": "0000320193-26-000013", "filed": "2026-05-01", "form": "10-Q",
+             "fiscal_period": "Q2-FY2026"},
+        ],
+        "filings": [
+            {"accessionNumber": "0000320193-26-000011", "filingDate": "2026-04-30",
+             "form": "8-K"},
+        ],
+    })
+
+    assert "AAPL" in result["facts"][0]["citation"]
+    assert "FY2025" in result["facts"][0]["citation"]
+    assert "Q2-FY2026" in result["facts"][1]["citation"]
+    assert "8-K" in result["filings"][0]["citation"]
+
+
+def test_add_citations_handles_compare_and_metrics_shapes():
+    from edgar.cli import _add_citations
+
+    result = _add_citations({
+        "companies": [{"ticker": "AAPL", "name": "Apple", "facts": [
+            {"accn": "x-1", "filed": "2026-05-01", "form": "10-Q", "fiscal_period": "Q1"},
+        ]}],
+        "metrics": [
+            {"metric": "revenue", "fact": {"accn": "x-2", "filed": "2026-02-25",
+                                           "form": "10-K", "fiscal_period": "FY2026"}},
+        ],
+        "ticker": "NVDA",
+        "name": "NVIDIA",
+    })
+
+    assert "AAPL" in result["companies"][0]["facts"][0]["citation"]
+    assert "NVDA" in result["metrics"][0]["fact"]["citation"]
+    assert "FY2026" in result["metrics"][0]["fact"]["citation"]
+
+
+def test_finalize_passes_through_when_client_lacks_envelope():
+    from edgar.cli import _finalize
+
+    class Stub:
+        pass
+
+    out = _finalize(Stub(), {"x": 1}, cite=False)
+    assert out == {"x": 1}
+
+
+def test_finalize_calls_envelope_when_available():
+    from edgar.cli import _finalize
+
+    captured = {}
+
+    class Client:
+        def _envelope(self, data):
+            captured["called"] = True
+            return {**data, "schema_version": "1.0.0"}
+
+    out = _finalize(Client(), {"x": 1})
+    assert captured["called"] is True
+    assert out["schema_version"] == "1.0.0"
+
+
+# --- new commands wired into CLI surface ---
+
+
+def test_help_includes_new_commands():
+    result = CliRunner().invoke(main, ["--help"])
+    for cmd in ("ttm", "ratios", "trend", "growth", "reconstruct", "audit-trail",
+                "amendments", "delta", "subscribe", "pending", "mark-seen",
+                "tags", "frames", "dei", "peers", "concept-info", "resolve",
+                "diff", "schema", "cache"):
+        assert cmd in result.output, f"missing {cmd}"
+
+
+def test_schema_command_lists_known_commands():
+    result = CliRunner().invoke(main, ["schema"])
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert "concept" in payload["available"]
+    assert "ratios" in payload["available"]
+
+
+def test_schema_command_returns_concept_schema():
+    result = CliRunner().invoke(main, ["schema", "concept"])
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["type"] == "object"
+    assert "facts" in payload["properties"]
+
+
+def test_schema_command_unknown_returns_exit_2():
+    result = CliRunner().invoke(main, ["schema", "no-such-command"])
+    assert result.exit_code == 2
+
+
+def test_invalid_as_of_date_rejected_with_validation_exit_code():
+    result = CliRunner().invoke(main, ["concept", "AAPL", "revenue",
+                                        "--as-of", "not-a-date", "--limit", "1"])
+    assert result.exit_code == 5
+    assert "not a valid YYYY-MM-DD" in result.output
+
+
+def test_invalid_start_date_rejected():
+    result = CliRunner().invoke(main, ["filings", "AAPL", "--start-date", "garbage"])
+    assert result.exit_code == 5
+
+
+def test_negative_limit_rejected():
+    result = CliRunner().invoke(main, ["search-companies", "AAPL", "--limit", "-1"])
+    assert result.exit_code == 5
+
+
+def test_negative_periods_rejected():
+    result = CliRunner().invoke(main, ["trend", "AAPL", "-c", "revenue", "--periods", "-3"])
+    assert result.exit_code == 5
+
+
+def test_filings_json_keeps_envelope(monkeypatch):
+    class FakeClient:
+        edgar_cache = None
+        _cache_calls: list = []
+        def submissions(self, *args, **kwargs):
+            return {"cik": "0000320193", "name": "Apple Inc.",
+                    "filings": [{"filingDate": "2025-10-31", "form": "10-K"}],
+                    "warning": ""}
+        def _envelope(self, data):
+            return {**data, "schema_version": "1.0.0", "cli_version": "0.1.0",
+                    "cache": {"calls": 1, "hits": 0, "misses": 1}}
+
+    monkeypatch.setattr("edgar.cli.get_client",
+                        lambda use_cache=True, cache_max_mb=None: FakeClient())
+    result = CliRunner().invoke(main, ["filings", "AAPL", "--limit", "1", "--json-output"])
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload.get("schema_version") == "1.0.0"
+    assert "cache" in payload
+    assert payload.get("filings")
+
+
+def test_schema_accepts_output_options():
+    result = CliRunner().invoke(main, ["schema", "concept", "--json-output"])
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert "properties" in payload
+
+
+def test_metrics_bundle_groups_expand(monkeypatch):
+    captured = {}
+
+    class FakeClient:
+        edgar_cache = None
+        _cache_calls: list = []
+        def metrics(self, ident, labels):
+            captured["labels"] = labels
+            return {"identifier": ident, "cik": "1", "name": "x", "metrics": []}
+        def _envelope(self, d):
+            return d
+
+    monkeypatch.setattr("edgar.cli.get_client", lambda use_cache=True, cache_max_mb=None: FakeClient())
+    runner = CliRunner()
+    result = runner.invoke(main, ["metrics", "AAPL", "--bundle", "income-statement"])
+    assert result.exit_code == 0
+    assert "revenue" in captured["labels"]
+    assert "operating_income" in captured["labels"]

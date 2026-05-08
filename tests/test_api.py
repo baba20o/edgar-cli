@@ -637,3 +637,398 @@ def test_suggest_concepts_avoids_weak_false_positive():
 
 def test_event_types_from_8k_items():
     assert event_types_from_items("2.02, 5.02, 3.01") == {"earnings", "leadership", "delisting"}
+
+
+# --- foundation tranche: cache, state, envelope, citation, _next_day ---
+
+
+def test_ttl_for_url_picks_endpoint_specific_value():
+    from edgar.cache import ttl_for_url
+
+    assert ttl_for_url("https://www.sec.gov/files/company_tickers_exchange.json") == 7 * 86400
+    assert ttl_for_url("https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json") == 86400
+    assert ttl_for_url("https://data.sec.gov/api/xbrl/companyconcept/CIK0000320193/us-gaap/Assets.json") == 86400
+    assert ttl_for_url("https://data.sec.gov/api/xbrl/frames/us-gaap/Assets/USD/CY2024Q4I.json") == 90 * 86400
+    assert ttl_for_url("https://data.sec.gov/submissions/CIK0000320193.json") == 3600
+    assert ttl_for_url("https://example.com/unknown") == 900
+
+
+def test_edgar_cache_miss_then_hit_with_meta(tmp_path):
+    from edgar.cache import EdgarCache
+
+    cache = EdgarCache(cache_dir=str(tmp_path))
+    payload, meta = cache.get_with_meta("https://data.sec.gov/x.json")
+    assert payload is None
+    assert meta["hit"] is False
+
+    cache.set("https://data.sec.gov/x.json", None, {"ok": 1}, etag='W/"abc"', last_modified="Tue")
+    payload, meta = cache.get_with_meta("https://data.sec.gov/x.json")
+    assert payload == {"ok": 1}
+    assert meta["hit"] is True
+    assert meta["etag"] == 'W/"abc"'
+    assert meta["last_modified"] == "Tue"
+    assert meta["age_seconds"] is not None
+    assert meta["ttl_remaining"] is not None
+
+
+def test_edgar_cache_negative_entry_round_trips(tmp_path):
+    from edgar.cache import EdgarCache
+
+    cache = EdgarCache(cache_dir=str(tmp_path))
+    cache.set("https://data.sec.gov/missing.json", None, {"error": "404"}, negative=True)
+    payload, meta = cache.get_with_meta("https://data.sec.gov/missing.json")
+    assert payload == {"error": "404"}
+    assert meta["hit"] is True
+    assert meta["negative"] is True
+
+
+def test_edgar_cache_refresh_timestamp_after_304(tmp_path):
+    from edgar.cache import EdgarCache
+
+    cache = EdgarCache(cache_dir=str(tmp_path), default_ttl=1)
+    cache.set("https://data.sec.gov/x.json", None, {"ok": 1}, etag='"v1"')
+    # Force the entry to be stale by rewriting its timestamp to long ago.
+    path = cache._path(cache._key("https://data.sec.gov/x.json"))
+    import json as _json
+    data = _json.loads(path.read_text())
+    data["_ts"] = 0
+    path.write_text(_json.dumps(data))
+
+    payload, meta = cache.get_with_meta("https://data.sec.gov/x.json")
+    assert payload is None
+    assert meta["stale_payload"] == {"ok": 1}
+    assert meta["stale_etag"] == '"v1"'
+
+    refreshed = cache.refresh_timestamp("https://data.sec.gov/x.json")
+    assert refreshed is True
+    payload, meta = cache.get_with_meta("https://data.sec.gov/x.json")
+    assert payload == {"ok": 1}
+    assert meta["hit"] is True
+
+
+def test_state_store_high_water_round_trip(tmp_path):
+    from edgar.state import StateStore
+
+    store = StateStore(path=str(tmp_path / "state.json"))
+    assert store.get_high_water("0000320193", "10-K") is None
+
+    store.update_high_water("0000320193", "10-K", "0000320193-25-000079", "2025-10-31")
+    hw = store.get_high_water("0000320193", "10-K")
+    assert hw["accession"] == "0000320193-25-000079"
+    assert hw["filed"] == "2025-10-31"
+
+    # Older entries do not regress the high-water mark.
+    store.update_high_water("0000320193", "10-K", "0000320193-23-000106", "2023-11-03")
+    hw = store.get_high_water("0000320193", "10-K")
+    assert hw["filed"] == "2025-10-31"
+
+    # Fresh StateStore re-reads the file from disk.
+    store2 = StateStore(path=str(tmp_path / "state.json"))
+    assert store2.get_high_water("0000320193", "10-K")["accession"] == "0000320193-25-000079"
+
+
+def test_state_store_reset_scopes(tmp_path):
+    from edgar.state import StateStore
+
+    store = StateStore(path=str(tmp_path / "state.json"))
+    store.update_high_water("0000320193", "10-K", "a", "2025-10-31")
+    store.update_high_water("0000320193", "10-Q", "b", "2025-08-01")
+    store.update_high_water("0001045810", "10-K", "c", "2026-02-25")
+
+    assert store.reset("0000320193", "10-K") == 1
+    assert store.get_high_water("0000320193", "10-K") is None
+    assert store.get_high_water("0000320193", "10-Q") is not None
+
+    assert store.reset("0000320193") == 1  # remaining 10-Q for AAPL
+    assert store.get_high_water("0000320193", "10-Q") is None
+
+    assert store.reset() == 1  # NVDA 10-K only one left
+    assert store.get_high_water("0001045810", "10-K") is None
+
+
+def test_envelope_adds_schema_cli_and_cache_summary():
+    from edgar.api import EdgarClient, SCHEMA_VERSION, CLI_VERSION
+
+    client = EdgarClient.__new__(EdgarClient)
+    client._cache_calls = [
+        {"hit": True, "age_seconds": 60, "ttl_remaining": 540, "key": "k1", "etag": '"a"'},
+        {"hit": False, "age_seconds": None, "ttl_remaining": None, "key": "k2", "etag": None},
+    ]
+    wrapped = client._envelope({"facts": [], "name": "Test"})
+    assert wrapped["schema_version"] == SCHEMA_VERSION
+    assert wrapped["cli_version"] == CLI_VERSION
+    cache = wrapped["cache"]
+    assert cache["calls"] == 2
+    assert cache["hits"] == 1
+    assert cache["misses"] == 1
+    assert cache["age_max_seconds"] == 60
+    assert cache["ttl_min_remaining"] == 540
+    assert cache["last_key"] == "k2"
+    assert cache["last_hit"] is False
+
+
+def test_envelope_pass_through_for_non_dict():
+    from edgar.api import EdgarClient
+
+    client = EdgarClient.__new__(EdgarClient)
+    client._cache_calls = []
+    assert client._envelope("not a dict") == "not a dict"
+
+
+def test_next_day_handles_year_rollover():
+    from edgar.api import _next_day
+
+    assert _next_day("2025-12-31") == "2026-01-01"
+    assert _next_day("2025-02-28") == "2025-03-01"
+    assert _next_day("not-a-date") == ""
+
+
+# --- Phase 1: cache management ---
+
+
+def test_edgar_cache_invalidate_pattern(tmp_path):
+    from edgar.cache import EdgarCache
+
+    cache = EdgarCache(cache_dir=str(tmp_path))
+    cache.set("https://data.sec.gov/submissions/CIK0000320193.json", None, {"a": 1})
+    cache.set("https://data.sec.gov/submissions/CIK0000789019.json", None, {"b": 2})
+    cache.set("https://data.sec.gov/api/xbrl/frames/x.json", None, {"c": 3})
+    removed = cache.invalidate("*CIK0000320193*")
+    assert removed == 1
+    payload, meta = cache.get_with_meta("https://data.sec.gov/submissions/CIK0000789019.json")
+    assert payload == {"b": 2}
+
+
+def test_edgar_cache_max_bytes_evicts_oldest(tmp_path):
+    from edgar.cache import EdgarCache
+    import time as _time
+
+    cache = EdgarCache(cache_dir=str(tmp_path), max_bytes=200)
+    cache.set("u1", None, {"x": "a" * 80})
+    _time.sleep(0.01)
+    cache.set("u2", None, {"x": "b" * 80})
+    _time.sleep(0.01)
+    cache.set("u3", None, {"x": "c" * 80})
+    stats = cache.stats()
+    assert stats["total"] <= 3
+    assert stats["size_bytes"] <= 800  # eviction kept things bounded
+
+
+# --- Phase 2 / 3: discovery + groups ---
+
+
+def test_list_frames_enumerates_period_kinds():
+    from edgar.api import EdgarClient
+
+    out = EdgarClient.list_frames(since_year=2024, until_year=2024)
+    frames = [f["frame"] for f in out["frames"]]
+    assert "CY2024" in frames
+    assert "CY2024Q1" in frames
+    assert "CY2024Q1I" in frames
+    assert out["total"] == 9  # 1 annual + 4 quarterly + 4 instant
+
+
+def test_form_classes_filter():
+    from edgar.api import EdgarClient
+
+    data = {
+        "cik": "0000320193",
+        "filings": {"recent": {
+            "accessionNumber": ["a", "b", "c", "d"],
+            "filingDate": ["2025-01-01"] * 4,
+            "form": ["10-K", "4", "SC 13G", "8-K"],
+            "primaryDocument": [""] * 4,
+        }},
+    }
+    insiders = EdgarClient._recent_filings(data, limit=10, form_class="insider")
+    assert len(insiders) == 1 and insiders[0]["form"] == "4"
+    inst = EdgarClient._recent_filings(data, limit=10, form_class="institutional")
+    assert len(inst) == 1 and inst[0]["form"] == "SC 13G"
+    major = EdgarClient._recent_filings(data, limit=10, form_class="major")
+    assert {row["form"] for row in major} == {"10-K", "8-K"}
+
+
+# --- Phase 5: computed metrics primitives ---
+
+
+def test_compute_gross_margin_uses_gross_profit_when_available():
+    from edgar.compute import gross_margin
+
+    rev = {"val": 100, "tag": "Revenues"}
+    gp = {"val": 40, "tag": "GrossProfit"}
+    out = gross_margin(rev, None, gp)
+    assert abs(out["value"] - 0.4) < 1e-9
+    assert "GrossProfit / Revenue" in out["formula"]
+
+
+def test_compute_gross_margin_falls_back_to_revenue_minus_cogs():
+    from edgar.compute import gross_margin
+
+    rev = {"val": 100, "tag": "Revenues"}
+    cogs = {"val": 60, "tag": "CostOfGoodsAndServicesSold"}
+    out = gross_margin(rev, cogs)
+    assert abs(out["value"] - 0.4) < 1e-9
+
+
+def test_compute_returns_missing_inputs_when_facts_absent():
+    from edgar.compute import operating_margin
+
+    out = operating_margin(None, None)
+    assert out["value"] is None
+    assert "Revenue" in out["missing_inputs"]
+
+
+def test_compute_ttm_sums_four_quarters():
+    from edgar.compute import ttm_from_quarters
+
+    quarters = [
+        {"val": 100, "end": "2026-03-31", "period_type": "quarterly"},
+        {"val": 90, "end": "2025-12-31", "period_type": "quarterly"},
+        {"val": 80, "end": "2025-09-30", "period_type": "quarterly"},
+        {"val": 70, "end": "2025-06-30", "period_type": "quarterly"},
+        {"val": 60, "end": "2025-03-31", "period_type": "quarterly"},
+    ]
+    out = ttm_from_quarters(quarters)
+    assert out["value"] == 340
+    assert len(out["inputs"]) == 4
+
+
+def test_compute_trend_label_categorizes():
+    from edgar.compute import trend_summary
+
+    facts = [{"val": v, "end": f"2025-{m:02d}-01"} for m, v in [(1, 100), (3, 110), (6, 120), (9, 130)]]
+    out = trend_summary(facts)
+    assert out["label"] == "expanding"
+    assert out["direction"] == "up"
+
+    flat_facts = [{"val": 100, "end": f"2025-{m:02d}-01"} for m in (1, 4, 7, 10)]
+    assert trend_summary(flat_facts)["label"] == "stable"
+
+
+def test_compute_cagr_handles_two_years():
+    from edgar.compute import cagr
+
+    # 100 -> 144 over 2 years = 20% CAGR
+    assert abs(cagr([100, 120, 144], periods_per_year=1) - 0.2) < 1e-6
+    assert cagr([100], periods_per_year=1) is None
+    assert cagr([0, 100], periods_per_year=1) is None
+
+
+# --- Phase 6: audit / delta ---
+
+
+def test_audit_trail_detects_restatement_in_synthesized_facts():
+    """Verify the restatement detection logic operates on synthesized inputs."""
+    from edgar.api import EdgarClient
+
+    client = EdgarClient.__new__(EdgarClient)
+
+    # Stub company_concept_alias to inject two facts for the same period with
+    # different values — that's exactly what a restatement looks like.
+    def fake_alias(identifier, concept, **kwargs):
+        return {
+            "cik": "0000320193", "name": "Test Inc.",
+            "facts": [
+                {"start": "2024-01-01", "end": "2024-12-31", "val": 100,
+                 "filed": "2025-02-01", "form": "10-K", "accn": "x-1", "source_tag": "Revenues"},
+                {"start": "2024-01-01", "end": "2024-12-31", "val": 110,
+                 "filed": "2026-02-01", "form": "10-K", "accn": "x-2", "source_tag": "Revenues"},
+            ],
+        }
+
+    client.company_concept_alias = fake_alias
+    out = client.audit_trail("X", "revenue")
+    assert len(out["restated_periods"]) == 1
+    assert sorted(out["restated_periods"][0]["values_seen"]) == [100, 110]
+
+
+# --- Phase 7: composability ---
+
+
+def test_resolve_company_returns_ambiguity_metadata():
+    from edgar.api import EdgarClient
+
+    client = EdgarClient.__new__(EdgarClient)
+    captured = {}
+
+    def fake_resolve(identifier):
+        return {"error": f"Ambiguous company identifier {identifier}; matches: A, B"}
+
+    def fake_search(query, limit=10):
+        captured["query"] = query
+        return {"companies": [
+            {"ticker": "AAA", "cik": "1", "name": "Alpha", "exchange": "X"},
+            {"ticker": "BBB", "cik": "2", "name": "Beta", "exchange": "X"},
+        ]}
+
+    client.resolve_company = fake_resolve
+    client.search_companies = fake_search
+    out = client._resolve_one("FOO")
+    assert "candidates" in out
+    assert {c["ticker"] for c in out["candidates"]} == {"AAA", "BBB"}
+    assert captured["query"] == "FOO"
+
+
+# --- Phase 8: bundles + earnings narrative ---
+
+
+def test_metric_bundle_groups_define_canonical_groups():
+    from edgar.api import METRIC_BUNDLE_GROUPS
+
+    assert "income-statement" in METRIC_BUNDLE_GROUPS
+    assert "revenue" in METRIC_BUNDLE_GROUPS["income-statement"]
+    assert "assets" in METRIC_BUNDLE_GROUPS["balance-sheet"]
+
+
+# --- regressions for reviewer's 8 findings ---
+
+
+def test_ttm_suppresses_value_when_quarters_have_gap():
+    from edgar.compute import ttm_from_quarters
+
+    quarters = [
+        {"val": 100, "end": "2026-03-28", "period_type": "quarterly"},
+        {"val": 90, "end": "2025-12-27", "period_type": "quarterly"},
+        # Q4 missing — gap from Sep to Dec
+        {"val": 70, "end": "2025-06-28", "period_type": "quarterly"},
+        {"val": 60, "end": "2025-03-29", "period_type": "quarterly"},
+    ]
+    out = ttm_from_quarters(quarters)
+    assert out["value"] is None
+    assert any("not contiguous" in c for c in out["caveats"])
+
+
+def test_ttm_from_stub_period_reconstructs_apple_style():
+    from edgar.compute import ttm_from_stub_period
+
+    annual = {"val": 416161, "end": "2025-09-27", "start": "2024-09-29"}
+    current_ytd = {"val": 254940, "end": "2026-03-28", "start": "2025-09-28"}
+    prior_ytd = {"val": 219659, "end": "2025-03-29", "start": "2024-09-30"}
+    out = ttm_from_stub_period(annual, current_ytd, prior_ytd)
+    assert out["value"] == 416161 + 254940 - 219659
+    assert "AnnualFY + CurrentYTD - PriorYTD" in out["formula"]
+
+
+def test_compute_envelope_keeps_value_when_only_optional_input_missing():
+    from edgar.compute import quick_ratio
+
+    out = quick_ratio({"val": 100}, None, {"val": 50})
+    assert out["value"] == 2.0
+    assert out.get("missing_inputs") is None
+    assert out.get("optional_missing_inputs") == ["InventoryNet"]
+
+
+def test_extract_earnings_highlights_skips_table_dumps():
+    from edgar.api import extract_earnings_highlights
+
+    table_dump = ("Three Months Ended Six Months Ended March 28, 2026 March 29, 2025 "
+                  "March 28, 2026 March 29, 2025 Net sales: Products $ 80,208 $ 68,714 "
+                  "$ 193,951 $ 166,674 Services 30,976 26,645 60,989 52,985 Total net "
+                  "sales 111,184 95,359 254,940 219,659.")
+    narrative = ("The Company posted quarterly revenue of $111.2 billion, up "
+                 "17 percent year over year.")
+    text = table_dump + " " + narrative
+    out = extract_earnings_highlights(text)
+    texts = [h["text"] for h in out]
+    assert any("posted quarterly revenue" in t for t in texts)
+    assert not any("Three Months Ended Six Months" in t for t in texts)

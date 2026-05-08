@@ -16,7 +16,8 @@ from __future__ import annotations
 import logging
 import os
 import re
-from datetime import date, datetime
+import time
+from datetime import date, datetime, timedelta
 from difflib import get_close_matches
 from html import unescape
 from html.parser import HTMLParser
@@ -25,7 +26,15 @@ from urllib.parse import quote
 
 from dotenv import load_dotenv
 
+import requests
+
 from research_cli_base import BaseAPIClient, FileCache, SharedRateLimiter
+from research_cli_base.http_client import retry_wait_seconds
+
+from edgar import __version__ as CLI_VERSION
+from edgar import compute
+from edgar.cache import EdgarCache, ttl_for_url
+from edgar.state import StateStore
 
 log = logging.getLogger(__name__)
 
@@ -33,9 +42,28 @@ DATA_BASE_URL = "https://data.sec.gov"
 SEC_BASE_URL = "https://www.sec.gov"
 COMPANY_TICKERS_URL = f"{SEC_BASE_URL}/files/company_tickers_exchange.json"
 
+SCHEMA_VERSION = "1.0.0"
+
 DEFAULT_CACHE_TTL = 900
 DEFAULT_RATE_LIMIT_INTERVAL = 0.2
 DEFAULT_USER_AGENT = "edgar-cli/0.1.0 baba200@greenmountaincomputing.com"
+
+DOW30_TICKERS = [
+    "AAPL", "AMGN", "AMZN", "AXP", "BA", "CAT", "CRM", "CSCO", "CVX", "DIS",
+    "GS", "HD", "HON", "IBM", "JNJ", "JPM", "KO", "MCD", "MMM", "MRK",
+    "MSFT", "NKE", "NVDA", "PG", "SHW", "TRV", "UNH", "V", "VZ", "WMT",
+]
+
+
+FORM_CLASSES: dict[str, set[str]] = {
+    "major": {"10-K", "10-K/A", "10-Q", "10-Q/A", "8-K", "8-K/A", "S-1", "S-1/A",
+              "DEF 14A", "20-F", "20-F/A", "6-K", "40-F"},
+    "insider": {"3", "3/A", "4", "4/A", "5", "5/A", "144"},
+    "institutional": {"SC 13D", "SC 13D/A", "SC 13G", "SC 13G/A", "SCHEDULE 13D",
+                      "SCHEDULE 13D/A", "SCHEDULE 13G", "SCHEDULE 13G/A",
+                      "13F-HR", "13F-HR/A", "13F-NT"},
+}
+
 
 BULK_ARCHIVES = [
     {
@@ -52,6 +80,33 @@ BULK_ARCHIVES = [
 
 COMMON_CONCEPT_CANDIDATES = {
     "assets": [("us-gaap", "Assets", "USD")],
+    "assets_current": [("us-gaap", "AssetsCurrent", "USD")],
+    "capex": [
+        ("us-gaap", "PaymentsToAcquirePropertyPlantAndEquipment", "USD"),
+        ("us-gaap", "PaymentsToAcquireProductiveAssets", "USD"),
+    ],
+    "cogs": [
+        ("us-gaap", "CostOfGoodsAndServicesSold", "USD"),
+        ("us-gaap", "CostOfRevenue", "USD"),
+        ("us-gaap", "CostOfGoodsSold", "USD"),
+    ],
+    "dna": [
+        ("us-gaap", "DepreciationDepletionAndAmortization", "USD"),
+        ("us-gaap", "DepreciationAndAmortization", "USD"),
+        ("us-gaap", "Depreciation", "USD"),
+    ],
+    "equity": [
+        ("us-gaap", "StockholdersEquity", "USD"),
+        ("us-gaap", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest", "USD"),
+    ],
+    "gross_profit": [("us-gaap", "GrossProfit", "USD")],
+    "inventory": [("us-gaap", "InventoryNet", "USD")],
+    "liabilities_current": [("us-gaap", "LiabilitiesCurrent", "USD")],
+    "short_term_debt": [
+        ("us-gaap", "LongTermDebtCurrent", "USD"),
+        ("us-gaap", "DebtCurrent", "USD"),
+        ("us-gaap", "ShortTermBorrowings", "USD"),
+    ],
     "cash": [
         ("us-gaap", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents", "USD"),
         ("us-gaap", "CashAndCashEquivalentsAtCarryingValue", "USD"),
@@ -81,6 +136,17 @@ COMMON_CONCEPTS = {
 }
 
 BRIEF_METRICS = ["assets", "cash", "debt", "net_income", "operating_income", "revenue"]
+METRIC_BUNDLE_GROUPS: dict[str, list[str]] = {
+    "income-statement": ["revenue", "cogs", "gross_profit", "operating_income",
+                         "net_income", "eps", "diluted_eps"],
+    "balance-sheet": ["assets", "liabilities", "equity", "cash", "debt",
+                      "short_term_debt", "assets_current", "liabilities_current"],
+    "cash-flow": ["operating_cash_flow", "capex"],
+    "liquidity": ["assets_current", "liabilities_current", "cash"],
+    "capital-structure": ["debt", "short_term_debt", "equity", "cash", "shares"],
+    "quality": ["net_income", "operating_cash_flow", "assets_current", "liabilities_current"],
+}
+
 DEFAULT_METRIC_BUNDLE = [
     "revenue",
     "net_income",
@@ -123,6 +189,15 @@ EVENT_KEYWORDS = {
     "guidance": ["guidance", "outlook", "forecast"],
     "earnings": ["results of operations", "financial results"],
 }
+
+
+def _next_day(yyyy_mm_dd: str) -> str:
+    """Return the day after a YYYY-MM-DD string, or empty string on parse failure."""
+    try:
+        d = datetime.strptime(yyyy_mm_dd, "%Y-%m-%d").date()
+        return (d + timedelta(days=1)).isoformat()
+    except (ValueError, TypeError):
+        return ""
 
 
 def normalize_cik(value: str | int) -> str:
@@ -183,14 +258,16 @@ def concept_alias_candidates(concept: str, taxonomy: Optional[str] = None,
     ]
 
 
-def get_client(use_cache: bool = True) -> "EdgarClient":
-    """Create an EDGAR client with shared cache and rate limiter."""
-    cache = FileCache(cache_dir="~/.edgar_cache", ttl=DEFAULT_CACHE_TTL)
+def get_client(use_cache: bool = True, cache_max_mb: Optional[int] = None) -> "EdgarClient":
+    """Create an EDGAR client with endpoint-aware cache and rate limiter."""
+    max_bytes = int(cache_max_mb) * 1024 * 1024 if cache_max_mb else None
+    cache = EdgarCache(cache_dir="~/.edgar_cache", default_ttl=DEFAULT_CACHE_TTL,
+                       max_bytes=max_bytes)
     rate_limiter = SharedRateLimiter(
         db_path="~/.edgar/rate_limit.db",
         min_interval=DEFAULT_RATE_LIMIT_INTERVAL,
     )
-    return EdgarClient(cache=cache, rate_limiter=rate_limiter, use_cache=use_cache)
+    return EdgarClient(edgar_cache=cache, rate_limiter=rate_limiter, use_cache=use_cache)
 
 
 class EdgarClient(BaseAPIClient):
@@ -198,10 +275,17 @@ class EdgarClient(BaseAPIClient):
 
     BASE_URL = DATA_BASE_URL
 
-    def __init__(self, *args, user_agent: Optional[str] = None, **kwargs):
+    def __init__(self, *args, user_agent: Optional[str] = None,
+                 edgar_cache: Optional[EdgarCache] = None, **kwargs):
         load_dotenv()
         self.user_agent = user_agent or os.getenv("SEC_USER_AGENT") or DEFAULT_USER_AGENT
+        use_cache_flag = kwargs.pop("use_cache", True)
+        kwargs.setdefault("cache", None)
+        kwargs["use_cache"] = False
         super().__init__(*args, **kwargs)
+        self.edgar_cache = edgar_cache
+        self.use_cache = bool(use_cache_flag and edgar_cache is not None)
+        self._cache_calls: list[dict] = []
 
     def _build_headers(self) -> dict[str, str]:
         return {
@@ -215,6 +299,142 @@ class EdgarClient(BaseAPIClient):
 
     def _default_error(self) -> dict:
         return {"error": "Request failed"}
+
+    def _reset_cache_meta(self) -> None:
+        self._cache_calls = []
+
+    def _record_cache(self, meta: dict) -> None:
+        self._cache_calls.append(meta)
+
+    def _summarize_cache(self) -> dict:
+        calls = list(self._cache_calls)
+        hits = [c for c in calls if c.get("hit")]
+        ages = [c["age_seconds"] for c in hits if c.get("age_seconds") is not None]
+        ttls = [c["ttl_remaining"] for c in hits if c.get("ttl_remaining") is not None]
+        last = calls[-1] if calls else None
+        summary = {
+            "calls": len(calls),
+            "hits": len(hits),
+            "misses": len(calls) - len(hits),
+        }
+        if ages:
+            summary["age_max_seconds"] = max(ages)
+            summary["age_min_seconds"] = min(ages)
+        if ttls:
+            summary["ttl_min_remaining"] = min(ttls)
+        if last:
+            summary["last_key"] = last.get("key")
+            summary["last_hit"] = bool(last.get("hit"))
+            summary["last_etag"] = last.get("etag")
+        return summary
+
+    def _envelope(self, data: dict, **extras) -> dict:
+        """Add schema_version, cli_version, and cache summary to a result dict."""
+        if not isinstance(data, dict):
+            return data
+        wrapped = dict(data)
+        wrapped.setdefault("schema_version", SCHEMA_VERSION)
+        wrapped.setdefault("cli_version", CLI_VERSION)
+        wrapped["cache"] = self._summarize_cache()
+        for key, value in extras.items():
+            wrapped[key] = value
+        return wrapped
+
+    def _get(self, path: str, params: Optional[dict] = None,
+             skip_cache: bool = False) -> dict:
+        """GET with EdgarCache, conditional headers, negative caching, and meta tracking."""
+        url = path if path.startswith("http") else f"{self.BASE_URL}{path}"
+        cache = self.edgar_cache if (self.use_cache and not skip_cache) else None
+
+        if cache is not None:
+            payload, meta = cache.get_with_meta(url, params)
+            if meta.get("hit"):
+                self._record_cache(meta)
+                if meta.get("negative") and isinstance(payload, dict) and "error" in payload:
+                    return payload
+                return payload
+
+        headers: dict[str, str] = {}
+        if cache is not None:
+            stale_etag = (meta or {}).get("stale_etag")
+            stale_lm = (meta or {}).get("stale_last_modified")
+            if stale_etag:
+                headers["If-None-Match"] = stale_etag
+            if stale_lm:
+                headers["If-Modified-Since"] = stale_lm
+
+        last_error = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                if self.rate_limiter:
+                    self.rate_limiter.acquire()
+                resp = self.session.get(
+                    url, params=params, headers=headers or None,
+                    timeout=self.request_timeout,
+                )
+
+                if resp.status_code == 304 and cache is not None and meta.get("stale_payload") is not None:
+                    cache.refresh_timestamp(url, params)
+                    refreshed_meta = dict(meta)
+                    refreshed_meta.update({
+                        "hit": True,
+                        "age_seconds": 0,
+                        "ttl_remaining": ttl_for_url(url),
+                        "etag": meta.get("stale_etag"),
+                        "last_modified": meta.get("stale_last_modified"),
+                        "stale_payload": None,
+                        "stale_etag": None,
+                        "stale_last_modified": None,
+                        "conditional_304": True,
+                    })
+                    self._record_cache(refreshed_meta)
+                    return meta["stale_payload"]
+
+                if resp.status_code == 429:
+                    wait = retry_wait_seconds(attempt, resp)
+                    log.warning("429 rate limited, waiting %.1fs (attempt %d)", wait, attempt)
+                    time.sleep(wait)
+                    continue
+
+                if resp.status_code in (403, 404):
+                    label = "Forbidden" if resp.status_code == 403 else "Not Found"
+                    err = self._format_error(f"{resp.status_code} {label}: {url}")
+                    if cache is not None:
+                        cache.set(url, params, err, negative=True)
+                        miss_meta = dict(meta) if meta else {"key": cache._key(url, params)}
+                        miss_meta.update({"hit": False, "negative": True})
+                        self._record_cache(miss_meta)
+                    return err
+
+                resp.raise_for_status()
+                data = resp.json()
+                etag = resp.headers.get("ETag")
+                last_modified = resp.headers.get("Last-Modified")
+                if cache is not None:
+                    cache.set(url, params, data, etag=etag, last_modified=last_modified)
+                    fresh_meta = {
+                        "key": cache._key(url, params),
+                        "hit": False,
+                        "etag": etag,
+                        "last_modified": last_modified,
+                    }
+                    self._record_cache(fresh_meta)
+                return data
+
+            except requests.exceptions.HTTPError as exc:
+                last_error = str(exc)
+                if attempt < self.max_retries:
+                    time.sleep(retry_wait_seconds(attempt))
+                    continue
+            except requests.exceptions.RequestException as exc:
+                last_error = str(exc)
+                if attempt < self.max_retries:
+                    time.sleep(retry_wait_seconds(attempt))
+                    continue
+
+        error = self._default_error()
+        error["error"] = f"Failed after {self.max_retries + 1} attempts: {last_error}"
+        return error
 
     def _get_text(self, url: str) -> str:
         """GET text/HTML with the same session, headers, limiter, and timeout."""
@@ -309,7 +529,9 @@ class EdgarClient(BaseAPIClient):
 
     def submissions(self, identifier: str | int, limit: int = 20, form: Optional[str] = None,
                     start_date: Optional[str] = None, end_date: Optional[str] = None,
-                    all_history: bool = False) -> dict:
+                    all_history: bool = False, since_last_fetch: bool = False,
+                    state_store: Optional["StateStore"] = None,
+                    form_class: Optional[str] = None) -> dict:
         """Return company submission metadata and recent filings."""
         company = self.resolve_company(identifier)
         if "error" in company:
@@ -320,6 +542,13 @@ class EdgarClient(BaseAPIClient):
         if "error" in result:
             return result
 
+        if since_last_fetch and state_store is not None:
+            high_water = state_store.get_high_water(cik, form)
+            if high_water and high_water.get("filed"):
+                hw_date = high_water["filed"]
+                if not start_date or start_date <= hw_date:
+                    start_date = _next_day(hw_date)
+
         files = result.get("filings", {}).get("files", [])
         recent_matches = self._recent_filings(
             result,
@@ -327,6 +556,7 @@ class EdgarClient(BaseAPIClient):
             form=form,
             start_date=start_date,
             end_date=end_date,
+            form_class=form_class,
         )
         recent_truncated = len(recent_matches) > limit
         filings = recent_matches[:limit]
@@ -347,6 +577,7 @@ class EdgarClient(BaseAPIClient):
                     form=form,
                     start_date=start_date,
                     end_date=end_date,
+                    form_class=form_class,
                 ):
                     accession = filing.get("accessionNumber")
                     if accession in seen:
@@ -382,6 +613,12 @@ class EdgarClient(BaseAPIClient):
         elif files_checked:
             warning = f"Searched recent filings plus {files_checked} historical chunk(s)."
 
+        if since_last_fetch and state_store is not None and filings:
+            top = max(filings, key=lambda f: f.get("filingDate", ""))
+            state_store.update_high_water(
+                cik, form, top.get("accessionNumber", ""), top.get("filingDate", ""),
+            )
+
         return {
             "cik": cik,
             "ticker": company.get("ticker", ""),
@@ -398,6 +635,7 @@ class EdgarClient(BaseAPIClient):
             "history_limited": bool(files),
             "all_history": all_history,
             "history_files_checked": files_checked,
+            "since_last_fetch": since_last_fetch,
             "warning": warning,
         }
 
@@ -423,8 +661,13 @@ class EdgarClient(BaseAPIClient):
     def company_concept(self, identifier: str | int, taxonomy: str, tag: str,
                         unit: Optional[str] = None, limit: int = 20,
                         suggest_on_404: bool = True,
-                        period_type: Optional[str] = None) -> dict:
-        """Return all facts for a single company concept."""
+                        period_type: Optional[str] = None,
+                        as_of: Optional[str] = None) -> dict:
+        """Return all facts for a single company concept.
+
+        `as_of` filters to facts whose `filed` date is on or before that date,
+        eliminating look-ahead bias for backtest-style queries.
+        """
         company = self.resolve_company(identifier)
         if "error" in company:
             return company
@@ -450,6 +693,8 @@ class EdgarClient(BaseAPIClient):
                 enrich_fact_metadata(item, company["cik"])
                 if period_type and item.get("period_type") != period_type:
                     continue
+                if as_of and item.get("filed", "") > as_of:
+                    continue
                 facts.append(item)
 
         facts.sort(key=lambda x: (x.get("filed", ""), x.get("end", "")), reverse=True)
@@ -460,20 +705,28 @@ class EdgarClient(BaseAPIClient):
             "tag": result.get("tag", tag),
             "label": result.get("label", ""),
             "description": result.get("description", ""),
+            "as_of": as_of,
             "facts": facts[:limit],
             "total": len(facts),
         }
 
     def company_concept_alias(self, identifier: str | int, concept: str,
                               unit: Optional[str] = None, limit: int = 20,
-                              period_type: Optional[str] = None) -> dict:
-        """Return facts for a friendly concept alias, choosing the freshest candidate tag."""
+                              period_type: Optional[str] = None,
+                              as_of: Optional[str] = None,
+                              canonical_union: bool = False) -> dict:
+        """Return facts for a friendly concept alias, choosing the freshest candidate tag.
+
+        If `canonical_union` is True, merge facts across all candidate tags
+        (deduped by `(start, end, accn)`) instead of picking just the freshest.
+        """
         key = concept_alias_key(concept)
         candidates = concept_alias_candidates(concept, unit=unit)
         if key not in COMMON_CONCEPT_CANDIDATES:
             taxonomy, tag, resolved_unit = candidates[0]
             return self.company_concept(
-                identifier, taxonomy, tag, unit=resolved_unit, limit=limit, period_type=period_type,
+                identifier, taxonomy, tag, unit=resolved_unit, limit=limit,
+                period_type=period_type, as_of=as_of,
             )
 
         errors = []
@@ -481,7 +734,7 @@ class EdgarClient(BaseAPIClient):
         for taxonomy, tag, resolved_unit in candidates:
             result = self.company_concept(
                 identifier, taxonomy, tag, unit=resolved_unit, limit=limit,
-                suggest_on_404=False, period_type=period_type,
+                suggest_on_404=False, period_type=period_type, as_of=as_of,
             )
             if "error" in result:
                 errors.append(result["error"])
@@ -492,10 +745,290 @@ class EdgarClient(BaseAPIClient):
         if not results:
             return {"error": errors[0] if errors else f"No facts found for {concept}", "facts": []}
 
+        if canonical_union:
+            seen = set()
+            merged = []
+            sources = []
+            for r in results:
+                sources.append({"taxonomy": r.get("taxonomy"), "tag": r.get("tag"),
+                                "label": r.get("label", ""), "fact_count": len(r.get("facts", []))})
+                for fact in r.get("facts", []):
+                    key3 = (fact.get("start", ""), fact.get("end", ""), fact.get("accn", ""))
+                    if key3 in seen:
+                        continue
+                    item = dict(fact)
+                    item["source_tag"] = r.get("tag")
+                    merged.append(item)
+                    seen.add(key3)
+            merged.sort(key=lambda x: (x.get("filed", ""), x.get("end", "")), reverse=True)
+            return {
+                "cik": results[0].get("cik", ""),
+                "name": results[0].get("name", ""),
+                "alias": concept,
+                "canonical_union": True,
+                "as_of": as_of,
+                "candidate_tags": [tag for _, tag, _ in candidates],
+                "tag_sources": sources,
+                "facts": merged[:limit],
+                "total": len(merged),
+            }
+
         best = max(results, key=lambda result: fact_sort_key(latest_distinct_fact(result.get("facts", [])) or {}))
         best["alias"] = concept
         best["candidate_tags"] = [tag for _, tag, _ in candidates]
         return best
+
+    def concept_info(self, alias_or_tag: str, taxonomy: str = "us-gaap",
+                     filer: str = "AAPL") -> dict:
+        """Return metadata about an alias or tag: candidates, label, units, sample fact count.
+
+        For aliases, lists every candidate tag the CLI tries plus their freshness
+        as reported by the reference filer's companyfacts. For raw tags, fetches
+        the reference filer's facts to surface label/description/units.
+        """
+        key = concept_alias_key(alias_or_tag)
+        if key in COMMON_CONCEPT_CANDIDATES:
+            candidates = concept_alias_candidates(alias_or_tag)
+            facts = self.company_facts(filer, taxonomy=taxonomy, limit=10000)
+            tag_index = {c.get("tag"): c for c in facts.get("concepts", [])} if "error" not in facts else {}
+            candidate_info = []
+            for tax, tag, unit in candidates:
+                info = tag_index.get(tag, {})
+                candidate_info.append({
+                    "taxonomy": tax,
+                    "tag": tag,
+                    "default_unit": unit,
+                    "label": info.get("label", ""),
+                    "fact_count_in_filer": info.get("fact_count", 0),
+                    "latest_filed_in_filer": info.get("latest_filed", ""),
+                    "units_in_filer": info.get("units", ""),
+                })
+            return {
+                "alias": alias_or_tag,
+                "is_alias": True,
+                "reference_filer": filer,
+                "candidates": candidate_info,
+            }
+        # Treat as a literal tag — look it up in the reference filer's facts.
+        facts = self.company_facts(filer, taxonomy=taxonomy, limit=10000)
+        if "error" in facts:
+            return facts
+        for concept in facts.get("concepts", []):
+            if concept.get("tag", "").lower() == alias_or_tag.lower():
+                return {
+                    "alias": None,
+                    "is_alias": False,
+                    "reference_filer": filer,
+                    "tag": concept.get("tag"),
+                    "taxonomy": concept.get("taxonomy", taxonomy),
+                    "label": concept.get("label", ""),
+                    "description": concept.get("description", ""),
+                    "units": concept.get("units", ""),
+                    "fact_count_in_filer": concept.get("fact_count", 0),
+                    "latest_filed_in_filer": concept.get("latest_filed", ""),
+                }
+        return {"error": f"Tag {alias_or_tag} not found in reference filer {filer} facts",
+                "alias": None, "is_alias": False}
+
+    def expand_group(self, expression: str) -> dict:
+        """Expand a `@group` expression into a list of identifiers.
+
+        Supported groups:
+        - `@dow30` — Dow Jones Industrial Average (static, current as of CLI version).
+        - `@sic:NNNN` — all filers with that SIC code, from the ticker/CIK map.
+        - `@cik` for a literal — pass-through.
+        Unknown groups return an error.
+        """
+        text = expression.strip()
+        if not text.startswith("@"):
+            return {"error": f"Not a group expression: {expression}"}
+        body = text[1:]
+        if body.lower() == "dow30":
+            return {"group": "dow30", "identifiers": list(DOW30_TICKERS),
+                    "source": "static", "as_of": "2026-05-08"}
+        if body.lower().startswith("sic:"):
+            try:
+                sic = int(body.split(":", 1)[1])
+            except ValueError:
+                return {"error": f"Invalid SIC: {body}"}
+            companies = self.companies()
+            if "error" in companies:
+                return companies
+            matches = [c for c in companies.get("companies", [])
+                       if str(c.get("sic", "")) == str(sic)]
+            return {"group": f"sic:{sic}", "identifiers": [c["ticker"] for c in matches if c.get("ticker")],
+                    "ciks": [c["cik"] for c in matches],
+                    "source": "ticker_map"}
+        return {"error": f"Unknown group: {expression}"}
+
+    def dei(self, identifier: str | int) -> dict:
+        """Surface entity-level (DEI) metadata for a filer.
+
+        Pulls from the submissions JSON which already includes filer status,
+        SIC, fiscal year end, exchanges, addresses, and former names.
+        """
+        company = self.resolve_company(identifier)
+        if "error" in company:
+            return company
+        cik = company["cik"]
+        result = self._get(f"/submissions/CIK{cik}.json")
+        if "error" in result:
+            return result
+        return {
+            "cik": cik,
+            "ticker": company.get("ticker", ""),
+            "name": result.get("name", company.get("name", "")),
+            "entityType": result.get("entityType", ""),
+            "sic": result.get("sic", ""),
+            "sicDescription": result.get("sicDescription", ""),
+            "category": result.get("category", ""),
+            "fiscalYearEnd": result.get("fiscalYearEnd", ""),
+            "stateOfIncorporation": result.get("stateOfIncorporation", ""),
+            "stateOfIncorporationDescription": result.get("stateOfIncorporationDescription", ""),
+            "tickers": result.get("tickers", []),
+            "exchanges": result.get("exchanges", []),
+            "ein": result.get("ein", ""),
+            "addresses": result.get("addresses", {}),
+            "phone": result.get("phone", ""),
+            "website": result.get("website", ""),
+            "formerNames": result.get("formerNames", []),
+            "investorWebsite": result.get("investorWebsite", ""),
+            "description": result.get("description", ""),
+        }
+
+    def peers(self, identifier: str | int, candidates: Optional[list[str]] = None,
+              by: str = "sic", limit: int = 10) -> dict:
+        """Return peer filers from a candidate list, grouped by SIC code.
+
+        The SEC ticker/CIK/exchange map does not carry SIC codes, so peer
+        discovery requires a candidate set. Pass `candidates` (e.g. tickers from
+        `expand_group("@dow30")` or any custom list) and this method fetches
+        each candidate's filer metadata and keeps those matching the target's
+        SIC.
+        """
+        target = self.dei(identifier)
+        if "error" in target:
+            return target
+        sic = str(target.get("sic", ""))
+        if not sic:
+            return {"error": f"No SIC code for {identifier}", "peers": []}
+        if by != "sic":
+            return {"error": f"Unsupported peer ranking: {by}", "peers": []}
+
+        if candidates is None:
+            candidates = list(DOW30_TICKERS)
+        peers = []
+        for cand in candidates:
+            if str(cand).strip().upper() == str(target.get("ticker", "")).upper():
+                continue
+            cand_dei = self.dei(cand)
+            if "error" in cand_dei:
+                continue
+            if str(cand_dei.get("sic", "")) != sic:
+                continue
+            peers.append({
+                "cik": cand_dei["cik"],
+                "ticker": cand_dei.get("ticker", ""),
+                "name": cand_dei.get("name", ""),
+                "exchanges": cand_dei.get("exchanges", []),
+                "sic": cand_dei.get("sic", ""),
+                "sicDescription": cand_dei.get("sicDescription", ""),
+            })
+        peers.sort(key=lambda p: p.get("name", ""))
+        return {
+            "target": {"cik": target["cik"], "ticker": target.get("ticker", ""),
+                       "name": target.get("name", ""), "sic": sic,
+                       "sicDescription": target.get("sicDescription", "")},
+            "by": by,
+            "candidate_set_size": len(candidates),
+            "peers": peers[:limit],
+            "total": len(peers),
+        }
+
+    def tag_search(self, query: str, filer: str = "AAPL", taxonomy: str = "us-gaap",
+                   limit: int = 25) -> dict:
+        """Search XBRL tag labels and descriptions in a reference filer's facts.
+
+        Returns matches by substring or fuzzy match. Default reference filer is
+        Apple, which reports a broad set of common tags. Override `--filer` for
+        domain-specific tags (e.g. financial-services concepts).
+        """
+        if not query.strip():
+            return {"error": "Tag search query cannot be blank", "matches": []}
+        facts = self.company_facts(filer, taxonomy=taxonomy, limit=10000)
+        if "error" in facts:
+            return {"error": facts["error"], "matches": []}
+        needle = query.strip().lower()
+        scored = []
+        for index, concept in enumerate(facts.get("concepts", [])):
+            tag = concept.get("tag", "")
+            label = str(concept.get("label") or "")
+            description = str(concept.get("description") or "")
+            haystack = f"{tag} {label} {description}".lower()
+            score = None
+            if needle == tag.lower():
+                score = 0
+            elif needle in tag.lower():
+                score = 1
+            elif needle in label.lower():
+                score = 2
+            elif needle in haystack:
+                score = 3
+            if score is None:
+                continue
+            scored.append((score, index, {
+                "taxonomy": concept.get("taxonomy", taxonomy),
+                "tag": tag,
+                "label": label,
+                "description": description[:200],
+                "units": concept.get("units", ""),
+                "fact_count": concept.get("fact_count", 0),
+                "latest_filed": concept.get("latest_filed", ""),
+            }))
+        scored.sort(key=lambda x: (x[0], x[1]))
+        return {
+            "query": query,
+            "reference_filer": filer,
+            "taxonomy": taxonomy,
+            "matches": [item for _, _, item in scored[:limit]],
+            "total": len(scored),
+        }
+
+    @staticmethod
+    def list_frames(taxonomy: str = "us-gaap", since_year: Optional[int] = None,
+                    until_year: Optional[int] = None, kinds: Optional[set] = None) -> dict:
+        """Enumerate plausible frame strings deterministically.
+
+        SEC does not expose a frames-listing endpoint; valid frame strings follow
+        a known pattern (`CY{YYYY}`, `CY{YYYY}Q{1..4}`, `CY{YYYY}Q{1..4}I` for
+        instants). This generator emits all such strings for a year range so
+        agents do not have to guess.
+        """
+        if not since_year:
+            since_year = 2009
+        if not until_year:
+            until_year = date.today().year
+        kinds = kinds or {"annual", "quarterly", "instant"}
+        frames = []
+        for year in range(int(since_year), int(until_year) + 1):
+            if "annual" in kinds:
+                frames.append({"frame": f"CY{year}", "kind": "annual",
+                               "year": year, "quarter": None})
+            for q in (1, 2, 3, 4):
+                if "quarterly" in kinds:
+                    frames.append({"frame": f"CY{year}Q{q}", "kind": "quarterly",
+                                   "year": year, "quarter": q})
+                if "instant" in kinds:
+                    frames.append({"frame": f"CY{year}Q{q}I", "kind": "instant",
+                                   "year": year, "quarter": q})
+        return {
+            "taxonomy": taxonomy,
+            "since_year": since_year,
+            "until_year": until_year,
+            "kinds": sorted(kinds),
+            "frames": frames,
+            "total": len(frames),
+        }
 
     def suggest_concepts(self, identifier: str | int, taxonomy: str, tag: str,
                          limit: int = 8) -> list[dict]:
@@ -658,9 +1191,14 @@ class EdgarClient(BaseAPIClient):
             }
         return {"error": "No recent Item 2.02 earnings 8-K found", "filings": result.get("filings", [])}
 
-    def events(self, identifier: str | int, limit: int = 20) -> dict:
+    def events(self, identifier: str | int, limit: int = 20,
+               since_last_fetch: bool = False,
+               state_store: Optional["StateStore"] = None) -> dict:
         """Detect notable recent filing events from 8-K metadata and document text."""
-        result = self.submissions(identifier, form="8-K", limit=limit)
+        result = self.submissions(
+            identifier, form="8-K", limit=limit,
+            since_last_fetch=since_last_fetch, state_store=state_store,
+        )
         if "error" in result:
             return result
         events = []
@@ -688,15 +1226,627 @@ class EdgarClient(BaseAPIClient):
                 })
         return {"cik": result["cik"], "name": result["name"], "events": events, "total": len(events)}
 
+    def resolve(self, identifiers: list[str]) -> dict:
+        """Batch resolve identifiers to CIKs, with ambiguity metadata per row."""
+        out = []
+        for ident in identifiers:
+            if str(ident).startswith("@"):
+                expanded = self.expand_group(ident)
+                if "error" in expanded:
+                    out.append({"identifier": ident, "error": expanded["error"]})
+                    continue
+                for sub in expanded.get("identifiers", []):
+                    out.append(self._resolve_one(sub))
+                continue
+            out.append(self._resolve_one(ident))
+        return {"results": out, "total": len(out)}
+
+    def _resolve_one(self, identifier: str) -> dict:
+        company = self.resolve_company(identifier)
+        if "error" in company:
+            row = {"identifier": identifier, "error": company["error"]}
+            # Surface ambiguity options when the resolver hit multiple matches.
+            if "matches" in company.get("error", "").lower() or "ambiguous" in company.get("error", "").lower():
+                search = self.search_companies(str(identifier), limit=10)
+                if "error" not in search:
+                    row["candidates"] = [
+                        {"ticker": c.get("ticker", ""), "cik": c.get("cik", ""),
+                         "name": c.get("name", ""), "exchange": c.get("exchange", "")}
+                        for c in search.get("companies", [])
+                    ]
+            return row
+        return {
+            "identifier": identifier,
+            "cik": company.get("cik", ""),
+            "ticker": company.get("ticker", ""),
+            "name": company.get("name", ""),
+            "exchange": company.get("exchange", ""),
+        }
+
+    def explain_concept(self, identifier: str | int, concept: str,
+                        unit: Optional[str] = None,
+                        period_type: Optional[str] = None) -> dict:
+        """Trace concept-alias resolution: candidates tried, freshness scores, winner."""
+        candidates = concept_alias_candidates(concept, unit=unit)
+        trials = []
+        for taxonomy, tag, resolved_unit in candidates:
+            r = self.company_concept(
+                identifier, taxonomy, tag, unit=resolved_unit, limit=4,
+                suggest_on_404=False, period_type=period_type,
+            )
+            if "error" in r:
+                trials.append({"taxonomy": taxonomy, "tag": tag, "unit": resolved_unit,
+                               "error": r["error"], "fact_count": 0})
+                continue
+            facts = r.get("facts", [])
+            latest = latest_distinct_fact(facts) or {}
+            trials.append({
+                "taxonomy": taxonomy, "tag": tag, "unit": resolved_unit,
+                "fact_count": len(facts),
+                "latest_filed": latest.get("filed", ""),
+                "latest_end": latest.get("end", ""),
+                "latest_val": latest.get("val", ""),
+                "freshness_key": str(fact_sort_key(latest)),
+            })
+        valid = [t for t in trials if t.get("fact_count", 0) > 0]
+        winner = max(valid, key=lambda t: t.get("freshness_key", "")) if valid else None
+        return {
+            "alias": concept,
+            "is_alias": concept_alias_key(concept) in COMMON_CONCEPT_CANDIDATES,
+            "candidates": trials,
+            "winner": winner,
+        }
+
+    def diff_concept(self, identifier_a: str, identifier_b: str, concept: str,
+                     period_type: str = "annual", periods: int = 4,
+                     as_of: Optional[str] = None) -> dict:
+        """Side-by-side diff of one concept across two filers."""
+        a = self.compare_concept([identifier_a, identifier_b], concept,
+                                 periods=periods, period_type=period_type, as_of=as_of)
+        if "error" in a:
+            return a
+        # Build a period-aligned grid: outer key = (start, end), value = {a: fact, b: fact}
+        grid: dict[tuple, dict] = {}
+        for i, side in enumerate(("a", "b")):
+            company = (a.get("companies") or [None, None])[i] or {}
+            for fact in company.get("facts", []):
+                key = (fact.get("start", ""), fact.get("end", ""))
+                grid.setdefault(key, {"a": None, "b": None,
+                                      "frame": fact.get("frame", ""),
+                                      "calendar_period": fact.get("calendar_period", "")})[side] = fact
+        rows = []
+        for (start, end), entry in sorted(grid.items(), key=lambda x: x[0][1] or "", reverse=True):
+            va = compute._value_or_none(entry.get("a")) if entry.get("a") else None
+            vb = compute._value_or_none(entry.get("b")) if entry.get("b") else None
+            rows.append({
+                "start": start, "end": end,
+                "frame": entry.get("frame", ""),
+                "a_value": va, "b_value": vb,
+                "delta": (va - vb) if (va is not None and vb is not None) else None,
+                "ratio": (va / vb) if (va is not None and vb not in (None, 0)) else None,
+            })
+        return {
+            "concept": concept,
+            "period_type": period_type,
+            "as_of": as_of,
+            "a": {"identifier": identifier_a, "name": (a.get("companies") or [{}])[0].get("name", "")},
+            "b": {"identifier": identifier_b, "name": (a.get("companies") or [{}, {}])[1].get("name", "") if len(a.get("companies", [])) > 1 else ""},
+            "rows": rows,
+        }
+
+    def audit_trail(self, identifier: str | int, concept: str, period: Optional[str] = None,
+                    period_start: Optional[str] = None, period_end: Optional[str] = None) -> dict:
+        """Return every filing that reported a given concept value, in chrono order.
+
+        Surfaces restatements: if a fact's `(start, end)` matches across filings
+        but `val` differs, the value was restated.
+        """
+        result = self.company_concept_alias(identifier, concept, limit=10000,
+                                            canonical_union=True)
+        if "error" in result:
+            return result
+        facts = result.get("facts", [])
+        if period:
+            facts = [f for f in facts if (f.get("frame") or f.get("calendar_period")) == period]
+        if period_start:
+            facts = [f for f in facts if f.get("start", "") == period_start]
+        if period_end:
+            facts = [f for f in facts if f.get("end", "") == period_end]
+        ordered = sorted(facts, key=lambda f: (f.get("filed", ""), f.get("end", "")))
+        # Detect restatements: same (start, end) reported with different val.
+        seen_periods: dict[tuple, list] = {}
+        for fact in ordered:
+            key = (fact.get("start", ""), fact.get("end", ""))
+            seen_periods.setdefault(key, []).append(fact)
+        restated_periods = []
+        for key, ents in seen_periods.items():
+            vals = {f.get("val") for f in ents}
+            if len(vals) > 1:
+                restated_periods.append({
+                    "start": key[0],
+                    "end": key[1],
+                    "values_seen": sorted(vals, key=lambda v: str(v)),
+                    "filings": [{"filed": f.get("filed"), "val": f.get("val"),
+                                 "form": f.get("form"), "accn": f.get("accn"),
+                                 "tag": f.get("source_tag") or f.get("tag", "")}
+                                for f in ents],
+                })
+        return {
+            "cik": result.get("cik", ""),
+            "name": result.get("name", ""),
+            "alias": concept,
+            "period_filter": {"frame": period, "start": period_start, "end": period_end},
+            "facts": ordered,
+            "total": len(ordered),
+            "restated_periods": restated_periods,
+        }
+
+    def amendments(self, identifier: str | int, since: Optional[str] = None,
+                   limit: int = 50) -> dict:
+        """Pair primary filings with their `/A` amendments.
+
+        For each `FORM/A` in the recent set, find the most recent prior `FORM`
+        from the same filer. The amendment's primary is whichever original
+        filing it amends (matched by form + form-type heuristic).
+        """
+        result = self.submissions(identifier, limit=400, start_date=since)
+        if "error" in result:
+            return result
+        filings = result.get("filings", [])
+        primaries: dict[str, list] = {}
+        amendments: list[dict] = []
+        for f in filings:
+            form = f.get("form", "").upper()
+            if form.endswith("/A"):
+                amendments.append(f)
+            else:
+                primaries.setdefault(form, []).append(f)
+
+        chains = []
+        for amd in amendments:
+            base_form = amd.get("form", "").upper().rstrip("/A").rstrip()
+            primary_pool = primaries.get(base_form, [])
+            best = None
+            for cand in primary_pool:
+                if cand.get("filingDate", "") < amd.get("filingDate", ""):
+                    if not best or cand.get("filingDate", "") > best.get("filingDate", ""):
+                        best = cand
+            chains.append({
+                "amendment": {
+                    "filingDate": amd.get("filingDate"),
+                    "form": amd.get("form"),
+                    "accessionNumber": amd.get("accessionNumber"),
+                    "filing_url": amd.get("filing_url"),
+                },
+                "primary": {
+                    "filingDate": best.get("filingDate"),
+                    "form": best.get("form"),
+                    "accessionNumber": best.get("accessionNumber"),
+                    "filing_url": best.get("filing_url"),
+                } if best else None,
+            })
+        chains = chains[:limit]
+        return {
+            "cik": result.get("cik", ""),
+            "ticker": result.get("ticker", ""),
+            "name": result.get("name", ""),
+            "since": since,
+            "chains": chains,
+            "total": len(chains),
+        }
+
+    def delta(self, identifier: str | int, since: Optional[str] = None,
+              state_store: Optional["StateStore"] = None) -> dict:
+        """Return new filings and (where detectable) restated facts since a date.
+
+        `since` controls the starting date. If `state_store` is provided and
+        `since` is empty, the state store's high-water mark is used and updated.
+        """
+        company = self.resolve_company(identifier)
+        if "error" in company:
+            return company
+        cik = company["cik"]
+        new_filings_result = self.submissions(
+            identifier, limit=200, start_date=since,
+            since_last_fetch=bool(state_store and not since),
+            state_store=state_store,
+        )
+        new_filings = new_filings_result.get("filings", [])
+        # Restatements: recompute audit-trail for revenue and assets as a probe set.
+        restated_facts = []
+        for probe in ("revenue", "net_income", "assets"):
+            trail = self.audit_trail(identifier, probe)
+            if "error" in trail:
+                continue
+            for entry in trail.get("restated_periods", []):
+                restated_facts.append({"metric": probe, **entry})
+        return {
+            "cik": cik,
+            "ticker": company.get("ticker", ""),
+            "name": company.get("name", ""),
+            "since": since,
+            "new_filings": new_filings,
+            "restated_facts": restated_facts,
+            "summary": {
+                "new_filings": len(new_filings),
+                "restated_periods": len(restated_facts),
+            },
+        }
+
+    def _latest_fact_for_alias(self, identifier: str | int, alias: str,
+                               period_type: Optional[str] = None,
+                               as_of: Optional[str] = None) -> Optional[dict]:
+        """Find the freshest fact across all candidate tags for an alias."""
+        result = self.company_concept_alias(
+            identifier, alias, limit=12, period_type=period_type, as_of=as_of,
+        )
+        if "error" in result:
+            return None
+        facts = result.get("facts", [])
+        if not facts:
+            return None
+        fact = latest_distinct_fact(facts)
+        if fact is not None:
+            fact["tag"] = result.get("tag", "")
+        return fact
+
+    def _facts_for_alias(self, identifier: str | int, alias: str,
+                         period_type: Optional[str] = None,
+                         as_of: Optional[str] = None,
+                         limit: int = 24) -> list[dict]:
+        result = self.company_concept_alias(
+            identifier, alias, limit=limit, period_type=period_type, as_of=as_of,
+        )
+        if "error" in result:
+            return []
+        facts = result.get("facts", [])
+        for f in facts:
+            f.setdefault("tag", result.get("tag", ""))
+        return facts
+
+    def _instant_fact_at_period_end(self, identifier: str | int, alias: str,
+                                    target_end: str,
+                                    as_of: Optional[str] = None,
+                                    tolerance_days: int = 14) -> Optional[dict]:
+        """Pick the instant fact whose `end` is closest to `target_end`.
+
+        Used by ratios to keep balance-sheet snapshots aligned with the period
+        end of the flow (income/cash-flow) facts. Without alignment, ROA/ROE
+        can mix FY revenue with a later quarter's assets.
+        """
+        if not target_end:
+            return self._latest_fact_for_alias(
+                identifier, alias, period_type="instant", as_of=as_of,
+            )
+        from datetime import datetime
+        try:
+            target = datetime.strptime(target_end, "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            return self._latest_fact_for_alias(
+                identifier, alias, period_type="instant", as_of=as_of,
+            )
+        result = self.company_concept_alias(
+            identifier, alias, limit=40, period_type="instant", as_of=as_of,
+        )
+        if "error" in result:
+            return None
+        best = None
+        best_delta = None
+        for fact in result.get("facts", []):
+            try:
+                end = datetime.strptime(fact.get("end", ""), "%Y-%m-%d").date()
+            except (ValueError, TypeError):
+                continue
+            delta = abs((end - target).days)
+            # Strongly prefer facts at or before the target; same-day is ideal.
+            penalty = 0 if end <= target else delta * 2
+            score = delta + penalty
+            if best is None or score < best_delta:
+                best = fact
+                best_delta = score
+        if best is not None:
+            best.setdefault("tag", result.get("tag", ""))
+        # Don't return a wildly mismatched fact (>1 quarter off) without flagging.
+        if best is not None and best_delta is not None and best_delta > tolerance_days:
+            best = dict(best)
+            best["_period_alignment_warning"] = (
+                f"Closest instant fact ends {best.get('end')}, "
+                f"flow period ends {target_end} (off by {best_delta} days)."
+            )
+        return best
+
+    def ttm(self, identifier: str | int, bundle: Optional[list[str]] = None,
+            as_of: Optional[str] = None) -> dict:
+        """Compute trailing-twelve-months for a bundle of canonical metrics.
+
+        Strategy:
+        1. If 4 contiguous quarterly facts exist, sum them.
+        2. Otherwise, reconstruct via stub period: AnnualFY + CurrentYTD - PriorYearYTD.
+        Filers that only tag Q4 inside the annual 10-K (Apple, Microsoft, NVIDIA)
+        require path 2.
+        """
+        bundle = bundle or ["revenue", "net_income", "operating_income", "operating_cash_flow"]
+        company = self.resolve_company(identifier)
+        if "error" in company:
+            return company
+        out = {"cik": company["cik"], "ticker": company.get("ticker", ""),
+               "name": company.get("name", ""), "as_of": as_of, "metrics": []}
+        for label in bundle:
+            if concept_alias_key(label) not in COMMON_CONCEPT_CANDIDATES:
+                out["metrics"].append({"metric": label, "error": f"Unknown alias '{label}'"})
+                continue
+            quarter_facts = self._facts_for_alias(
+                company["cik"], label, period_type="quarterly", as_of=as_of, limit=12,
+            )
+            envelope = compute.ttm_from_quarters(quarter_facts)
+            if envelope.get("value") is None:
+                # Try stub-period reconstruction.
+                stub = self._ttm_stub_period(company["cik"], label, as_of=as_of)
+                if stub is not None:
+                    envelope = stub
+            envelope["metric"] = label
+            out["metrics"].append(envelope)
+        return out
+
+    def _ttm_stub_period(self, cik: str, alias: str, as_of: Optional[str]) -> Optional[dict]:
+        """Build TTM from FY + current_YTD - prior_year_same_YTD."""
+        annual_facts = self._facts_for_alias(cik, alias, period_type="annual",
+                                             as_of=as_of, limit=4)
+        ytd_facts = self._facts_for_alias(cik, alias, period_type="ytd",
+                                          as_of=as_of, limit=20)
+        if not annual_facts or not ytd_facts:
+            return None
+        # Latest annual fact (highest end).
+        annual = max(annual_facts, key=lambda f: f.get("end", ""))
+        annual_end = annual.get("end", "")
+        if not annual_end:
+            return None
+        # Current YTD: most recent YTD whose end is AFTER the latest FY end.
+        future_ytd = [f for f in ytd_facts if f.get("end", "") > annual_end]
+        if not future_ytd:
+            # No interim filings since FY end — TTM equals the most recent FY.
+            return {
+                "metric": "ttm",
+                "value": compute._value_or_none(annual),
+                "formula": "AnnualFY (no interim filings since FY end; TTM = latest FY)",
+                "inputs": [compute._input_record("AnnualFY", annual)],
+                "caveats": ["TTM resolves to the latest annual fact because no interim YTD filings have been made since."],
+                "period_end": annual_end,
+            }
+        current_ytd = max(future_ytd, key=lambda f: f.get("end", ""))
+        # Period length of the current YTD (e.g. 3, 6, 9 months).
+        try:
+            from datetime import datetime
+            cur_start = datetime.strptime(current_ytd.get("start", ""), "%Y-%m-%d").date()
+            cur_end = datetime.strptime(current_ytd.get("end", ""), "%Y-%m-%d").date()
+            cur_length = (cur_end - cur_start).days
+        except (ValueError, TypeError):
+            return None
+        # Prior-year matching YTD: same approximate length, end date roughly 365 days earlier.
+        prior_ytd = None
+        for f in ytd_facts:
+            try:
+                f_start = datetime.strptime(f.get("start", ""), "%Y-%m-%d").date()
+                f_end = datetime.strptime(f.get("end", ""), "%Y-%m-%d").date()
+            except (ValueError, TypeError):
+                continue
+            length = (f_end - f_start).days
+            year_offset = (cur_end - f_end).days
+            if abs(length - cur_length) <= 7 and 350 <= year_offset <= 380:
+                prior_ytd = f
+                break
+        if prior_ytd is None:
+            return None
+        return compute.ttm_from_stub_period(annual, current_ytd, prior_ytd)
+
+    def ratios(self, identifier: str | int, period_type: str = "annual",
+               as_of: Optional[str] = None) -> dict:
+        """Compute the canonical ratio set for one company at one period kind."""
+        company = self.resolve_company(identifier)
+        if "error" in company:
+            return company
+        cik = company["cik"]
+
+        flow_pt = period_type if period_type in ("annual", "quarterly", "ytd") else "annual"
+        instant_pt = "instant"
+
+        revenue = self._latest_fact_for_alias(cik, "revenue", period_type=flow_pt, as_of=as_of)
+        net_income = self._latest_fact_for_alias(cik, "net_income", period_type=flow_pt, as_of=as_of)
+        operating_income = self._latest_fact_for_alias(cik, "operating_income", period_type=flow_pt, as_of=as_of)
+        cogs = self._latest_fact_for_alias(cik, "cogs", period_type=flow_pt, as_of=as_of)
+        gross_profit = self._latest_fact_for_alias(cik, "gross_profit", period_type=flow_pt, as_of=as_of)
+        dna = self._latest_fact_for_alias(cik, "dna", period_type=flow_pt, as_of=as_of)
+        ocf = self._latest_fact_for_alias(cik, "operating_cash_flow", period_type=flow_pt, as_of=as_of)
+        capex = self._latest_fact_for_alias(cik, "capex", period_type=flow_pt, as_of=as_of)
+
+        # Align balance-sheet (instant) facts to the period end of the flow
+        # facts so ROE/ROA/turnover do not silently mix FY revenue with a later
+        # quarter's balance sheet.
+        flow_anchor = (revenue or net_income or operating_income or {}).get("end", "")
+        anchor = lambda alias_name: self._instant_fact_at_period_end(
+            cik, alias_name, target_end=flow_anchor, as_of=as_of,
+        )
+        assets = anchor("assets")
+        equity = anchor("equity")
+        cash = anchor("cash")
+        debt = anchor("debt")
+        std = anchor("short_term_debt")
+        ac = anchor("assets_current")
+        lc = anchor("liabilities_current")
+        inv = anchor("inventory")
+
+        ratios = [
+            compute.gross_margin(revenue, cogs, gross_profit),
+            compute.operating_margin(revenue, operating_income),
+            compute.net_margin(revenue, net_income),
+            compute.ebitda_margin(revenue, operating_income, dna),
+            compute.roe(net_income, equity),
+            compute.roa(net_income, assets),
+            compute.asset_turnover(revenue, assets),
+            compute.current_ratio(ac, lc),
+            compute.quick_ratio(ac, inv, lc),
+            compute.debt_to_equity(debt, std, equity),
+            compute.debt_to_ebitda(debt, std, operating_income, dna),
+            compute.net_debt(debt, std, cash),
+            compute.free_cash_flow(ocf, capex),
+            compute.fcf_margin(revenue, ocf, capex),
+        ]
+        not_applicable = [
+            {"metric": "pe_ratio", "reason": "requires market price (out of scope without price feed)"},
+            {"metric": "ev_ebitda", "reason": "requires market price (out of scope without price feed)"},
+            {"metric": "dividend_yield", "reason": "requires market price (out of scope without price feed)"},
+        ]
+        # Surface any per-instant alignment warnings so agents can detect when
+        # the balance sheet was not perfectly aligned with the flow period end.
+        alignment_warnings = []
+        for label, fact in [("assets", assets), ("equity", equity), ("cash", cash),
+                            ("debt", debt), ("short_term_debt", std),
+                            ("assets_current", ac), ("liabilities_current", lc),
+                            ("inventory", inv)]:
+            if fact and fact.get("_period_alignment_warning"):
+                alignment_warnings.append({"input": label,
+                                            "warning": fact["_period_alignment_warning"]})
+        return {
+            "cik": cik,
+            "ticker": company.get("ticker", ""),
+            "name": company.get("name", ""),
+            "period_type": flow_pt,
+            "flow_period_end": flow_anchor or None,
+            "as_of": as_of,
+            "ratios": ratios,
+            "not_applicable": not_applicable,
+            "alignment_warnings": alignment_warnings,
+        }
+
+    def trend(self, identifier: str | int, metric: str, periods: int = 8,
+              period_type: str = "quarterly", as_of: Optional[str] = None) -> dict:
+        """Multi-period trend on a metric: facts list + slope + categorical label."""
+        company = self.resolve_company(identifier)
+        if "error" in company:
+            return company
+        if concept_alias_key(metric) not in COMMON_CONCEPT_CANDIDATES:
+            return {"error": f"Unknown metric alias '{metric}'"}
+        facts = self._facts_for_alias(
+            company["cik"], metric, period_type=period_type, as_of=as_of, limit=periods,
+        )
+        facts = facts[:periods]
+        summary = compute.trend_summary(facts)
+        return {
+            "cik": company["cik"],
+            "ticker": company.get("ticker", ""),
+            "name": company.get("name", ""),
+            "metric": metric,
+            "period_type": period_type,
+            "as_of": as_of,
+            "facts": facts,
+            "summary": summary,
+        }
+
+    def growth(self, identifier: str | int, metric: str,
+               basis: Optional[list[str]] = None, period_type: str = "annual",
+               periods: int = 8, as_of: Optional[str] = None) -> dict:
+        """Compute multi-basis growth: yoy, qoq, cagr3, cagr5."""
+        basis = basis or ["yoy"]
+        company = self.resolve_company(identifier)
+        if "error" in company:
+            return company
+        if concept_alias_key(metric) not in COMMON_CONCEPT_CANDIDATES:
+            return {"error": f"Unknown metric alias '{metric}'"}
+        facts = self._facts_for_alias(
+            company["cik"], metric, period_type=period_type, as_of=as_of, limit=periods,
+        )
+        sorted_facts = sorted(facts, key=lambda f: f.get("end", ""))
+        values = [v for v in (compute._value_or_none(f) for f in sorted_facts) if v is not None]
+
+        out = {"cik": company["cik"], "ticker": company.get("ticker", ""),
+               "name": company.get("name", ""), "metric": metric, "period_type": period_type,
+               "as_of": as_of, "facts": sorted_facts, "growth": []}
+
+        per_period = compute.growth_rates(sorted_facts)
+        for entry in basis:
+            entry = entry.strip().lower()
+            if entry == "yoy" or entry == "qoq":
+                out["growth"].append({
+                    "basis": entry,
+                    "rates": per_period,
+                    "latest": per_period[-1]["growth"] if per_period else None,
+                })
+            elif entry.startswith("cagr"):
+                try:
+                    yrs = int(entry[4:])
+                except ValueError:
+                    continue
+                ppy = 4 if period_type == "quarterly" else 1
+                window = values[-(yrs * ppy + 1):] if len(values) >= yrs * ppy + 1 else values
+                out["growth"].append({
+                    "basis": entry,
+                    "value": compute.cagr(window, periods_per_year=ppy),
+                    "window_size": len(window),
+                })
+        return out
+
+    def reconstruct(self, identifier: str | int, target: str, period_type: str = "annual",
+                    as_of: Optional[str] = None) -> dict:
+        """Reconstruct a derived line item not directly tagged by SEC."""
+        company = self.resolve_company(identifier)
+        if "error" in company:
+            return company
+        cik = company["cik"]
+        target = target.lower()
+        flow_pt = period_type if period_type in ("annual", "quarterly", "ytd") else "annual"
+        instant_pt = "instant"
+
+        if target == "ebitda":
+            envelope = compute.ebitda(
+                self._latest_fact_for_alias(cik, "operating_income", period_type=flow_pt, as_of=as_of),
+                self._latest_fact_for_alias(cik, "dna", period_type=flow_pt, as_of=as_of),
+            )
+        elif target == "fcf":
+            envelope = compute.free_cash_flow(
+                self._latest_fact_for_alias(cik, "operating_cash_flow", period_type=flow_pt, as_of=as_of),
+                self._latest_fact_for_alias(cik, "capex", period_type=flow_pt, as_of=as_of),
+            )
+        elif target == "net_debt":
+            envelope = compute.net_debt(
+                self._latest_fact_for_alias(cik, "debt", period_type=instant_pt, as_of=as_of),
+                self._latest_fact_for_alias(cik, "short_term_debt", period_type=instant_pt, as_of=as_of),
+                self._latest_fact_for_alias(cik, "cash", period_type=instant_pt, as_of=as_of),
+            )
+        elif target in ("nwc", "working_capital"):
+            envelope = compute.working_capital(
+                self._latest_fact_for_alias(cik, "assets_current", period_type=instant_pt, as_of=as_of),
+                self._latest_fact_for_alias(cik, "liabilities_current", period_type=instant_pt, as_of=as_of),
+            )
+        elif target in ("tangible_book", "tangible_book_value"):
+            envelope = compute.tangible_book_value(
+                self._latest_fact_for_alias(cik, "equity", period_type=instant_pt, as_of=as_of),
+                None,  # goodwill alias not in COMMON_CONCEPT_CANDIDATES yet
+                None,
+            )
+        else:
+            return {"error": f"Unknown reconstruct target: {target}"}
+
+        return {
+            "cik": cik,
+            "ticker": company.get("ticker", ""),
+            "name": company.get("name", ""),
+            "target": target,
+            "period_type": flow_pt,
+            "as_of": as_of,
+            **envelope,
+        }
+
     def compare_concept(self, identifiers: list[str], concept: str, taxonomy: Optional[str] = None,
                         unit: Optional[str] = None, periods: int = 4,
-                        period_type: Optional[str] = None) -> dict:
+                        period_type: Optional[str] = None,
+                        as_of: Optional[str] = None) -> dict:
         """Compare a concept across companies."""
         candidates = concept_alias_candidates(concept, taxonomy, unit)
         companies = []
         for identifier in identifiers:
             company = self._company_candidate_facts(
-                identifier, candidates, periods=max(periods * 12, 36), period_type=period_type,
+                identifier, candidates, periods=max(periods * 12, 36),
+                period_type=period_type, as_of=as_of,
             )
             if company.get("error"):
                 companies.append(company)
@@ -808,14 +1958,15 @@ class EdgarClient(BaseAPIClient):
         }
 
     def _company_candidate_facts(self, identifier: str | int, candidates: list[tuple[str, str, Optional[str]]],
-                                 periods: int, period_type: Optional[str] = None) -> dict:
+                                 periods: int, period_type: Optional[str] = None,
+                                 as_of: Optional[str] = None) -> dict:
         errors = []
         candidate_facts = []
         metadata = {}
         for taxonomy, tag, unit in candidates:
             result = self.company_concept(
                 identifier, taxonomy, tag, unit=unit, limit=periods,
-                suggest_on_404=False, period_type=period_type,
+                suggest_on_404=False, period_type=period_type, as_of=as_of,
             )
             if "error" in result:
                 errors.append(result["error"])
@@ -878,16 +2029,21 @@ class EdgarClient(BaseAPIClient):
     @staticmethod
     def _recent_filings(data: dict, limit: int = 20, form: Optional[str] = None,
                         start_date: Optional[str] = None,
-                        end_date: Optional[str] = None) -> list[dict]:
+                        end_date: Optional[str] = None,
+                        form_class: Optional[str] = None) -> list[dict]:
         recent = data.get("filings", {}).get("recent", {})
         accessions = recent.get("accessionNumber", [])
         cik = normalize_cik(data.get("cik", "0"))
         rows = []
         wanted_form = form.upper() if form else None
+        wanted_class = FORM_CLASSES.get(form_class) if form_class else None
 
         for index, accession in enumerate(accessions):
             row = {key: values[index] for key, values in recent.items() if index < len(values)}
-            if wanted_form and row.get("form", "").upper() != wanted_form:
+            row_form = row.get("form", "").upper()
+            if wanted_form and row_form != wanted_form:
+                continue
+            if wanted_class and row_form not in wanted_class:
                 continue
             filing_date = row.get("filingDate", "")
             if start_date and filing_date < start_date:
@@ -1207,7 +2363,12 @@ def event_types_from_items(items: str) -> set[str]:
 
 
 def extract_earnings_highlights(text: str) -> list[dict]:
-    """Extract simple key-value-ish sentences from an earnings release."""
+    """Extract narrative sentences from an earnings release, skipping table dumps.
+
+    A "table dump" is detected by counting numeric tokens, columnar structure
+    (multiple consecutive Q/period labels), or excessive length. These get
+    dropped before the keyword-based narrative match runs.
+    """
     if not text:
         return []
     patterns = [
@@ -1218,17 +2379,31 @@ def extract_earnings_highlights(text: str) -> list[dict]:
     highlights = []
     seen = set()
     for sentence in sentences:
-        lower = sentence.lower()
-        if any(pattern in lower for pattern in patterns) and re.search(r"\$?\d", sentence):
-            cleaned = clean_text(sentence)
-            if "document exhibit" in cleaned.lower():
-                continue
-            if len(re.findall(r"\$?\d[\d,]*(?:\.\d+)?%?", cleaned)) > 8:
-                continue
-            if cleaned in seen:
-                continue
-            highlights.append({"text": cleaned[:420]})
-            seen.add(cleaned)
+        cleaned = clean_text(sentence)
+        if not cleaned or len(cleaned) > 600:
+            continue
+        if "document exhibit" in cleaned.lower():
+            continue
+        # Skip table dumps: many numbers OR columnar period-label patterns.
+        numeric_tokens = re.findall(r"\$?\d[\d,]*(?:\.\d+)?%?", cleaned)
+        if len(numeric_tokens) > 6:
+            continue
+        if len(re.findall(r"\bQ[1-4]\b", cleaned)) >= 2:
+            continue
+        if re.search(r"\bThree Months Ended\b.+\bThree Months Ended\b", cleaned, re.I):
+            continue
+        # Heuristic: ratio of digits to letters > 0.4 means table-like.
+        digits = sum(c.isdigit() for c in cleaned)
+        letters = sum(c.isalpha() for c in cleaned)
+        if letters and digits / max(1, letters) > 0.4:
+            continue
+        lower = cleaned.lower()
+        if not (any(pattern in lower for pattern in patterns) and re.search(r"\$?\d", cleaned)):
+            continue
+        if cleaned in seen:
+            continue
+        highlights.append({"text": cleaned[:420]})
+        seen.add(cleaned)
         if len(highlights) >= 12:
             break
     return highlights
