@@ -1,9 +1,11 @@
 # EDGAR CLI
 
-A command-line tool for the SEC EDGAR public data APIs.
+A SEC EDGAR public-data CLI built for agents. Returns JSON by default when
+stdout is not a TTY, attaches provenance to every fact, and ships derived
+metrics with formula + source facts so an agent can defend every number.
 
-Built for research agents and human analysts with rich terminal output, markdown
-tables, raw JSON, and streaming NDJSON.
+Human-readable rich-table output is also available; agent paths are the
+primary surface and the docs lead with them.
 
 ## Install
 
@@ -13,205 +15,241 @@ pip install -e .
 
 ## Setup
 
-The public `data.sec.gov` APIs do not require an API key. SEC does ask automated
-tools to declare a user agent with organization/contact information:
+The public `data.sec.gov` APIs are keyless. SEC asks automated tools to
+declare a User-Agent with organization/contact info:
 
 ```bash
 cp .env.example .env
 # Edit SEC_USER_AGENT to your organization/contact string
 ```
 
-## Commands
-
-### `search-companies` - Find ticker/CIK mappings
+## Agent quickstart
 
 ```bash
-edgar search-companies apple
-edgar search-companies NVDA --json-output
+# JSON is the default when stdout is not a TTY — no flag needed in pipelines.
+edgar concept NVDA revenue --limit 1 | jq '.facts[0].val'
+
+# Every JSON envelope carries `schema_version`, `cli_version`, and a `cache`
+# summary so agents can branch on freshness.
+edgar metrics AAPL --bundle revenue,net_income | jq '{schema_version, cache}'
+
+# Citations on demand — one per row, agent-quotable.
+edgar concept NVDA revenue --limit 1 --cite | jq '.facts[].citation'
+# "NVIDIA CORP FY2026 10-K · 0001045810-26-000021 · filed 2026-02-25"
+
+# Point-in-time queries. Eliminates look-ahead bias for backtests.
+edgar concept NVDA revenue --as-of 2024-01-01 | jq '.facts[0]'
+
+# Batch fan-out across one CLI invocation.
+edgar metrics --tickers AAPL,MSFT,GOOGL --bundle revenue
+edgar metrics --tickers @dow30 --bundle revenue,net_income --ndjson
+
+# Subscribe + drain: a delta-driven workflow without a separate daemon.
+edgar subscribe add NVDA --form 8-K
+edgar pending --ndjson    # streams new filings since last drain
 ```
 
-### `company` - Company profile plus recent filings
-
-```bash
-edgar company AAPL
-edgar company 0000320193 --limit 5
-edgar company MSFT --form 10-K --markdown
-edgar company AAPL --form 10-K --start-date 2024-01-01 --end-date 2024-12-31
-edgar company NVDA --form S-1 --all
-```
-
-### `filings` - Recent filings
-
-```bash
-edgar filings TSLA --limit 20
-edgar filings GOOGL --form 8-K
-edgar filings NVDA --form S-1 --start-date 2020-01-01 --show-urls
-edgar filings NVDA --form S-1 --all --markdown
-```
-
-### `facts` - Available XBRL concepts for one company
-
-```bash
-edgar facts AAPL --taxonomy us-gaap --tag-filter revenue
-edgar facts MSFT --limit 100 --json-output
-```
-
-### `concept` - One company's facts for a single concept
-
-```bash
-edgar concept AAPL revenue
-edgar concept AAPL us-gaap Assets --unit USD
-edgar concept MSFT us-gaap Revenues --limit 12 --markdown
-edgar concept NVDA revenue --annual --limit 5 --json-output
-edgar concept AAPL us-gaap RevenueFromContractWithCustomerExcludingAssessedTax --deltas
-edgar concept --tickers AAPL,MSFT,GOOGL revenue --quarterly --ndjson
-edgar concept --input tickers.txt revenue --annual --json-output
-```
-
-Friendly aliases such as `revenue`, `net_income`, and `cash` try fallback tags
-so migrated XBRL concepts prefer fresh facts. Use `--annual`, `--quarterly`,
-`--ytd`, or `--instant` to keep period math and downstream modeling clean.
-
-### `frame` - Cross-company XBRL frame
-
-```bash
-edgar frame us-gaap Assets USD CY2024Q4I --limit 25
-edgar frame us-gaap Revenues USD CY2024 --sort name --markdown
-```
-
-### `open` - Open or print the latest filing index URL
-
-```bash
-edgar open AAPL --form 10-K
-edgar open AGL --form 8-K --print-only
-```
-
-### `exhibits` - List or download documents from a filing
-
-```bash
-edgar exhibits 0001628280-26-031254 --cik 1831097
-edgar exhibits https://www.sec.gov/Archives/edgar/data/1831097/000162828026031254/0001628280-26-031254-index.htm --type-filter EX-99 --markdown
-edgar exhibits 0001628280-26-031254 --cik 1831097 --download ./downloads/agiliti
-```
-
-### `earnings` - Latest Item 2.02 earnings 8-K summary
-
-```bash
-edgar earnings AAPL
-edgar earnings AGL --markdown
-```
-
-### `events` - Recent notable 8-K events
-
-```bash
-edgar events AGL --limit 10
-edgar events TSLA --markdown
-```
-
-### `compare` - Compare a concept across companies
-
-Common aliases include `revenue`, `net_income`, `operating_income`, `cash`,
-`assets`, `liabilities`, `debt`, `eps`, and `shares`.
-
-```bash
-edgar compare AAPL MSFT GOOGL --concept revenue --periods 4
-edgar compare AAPL MSFT --concept Assets --unit USD --markdown
-edgar compare AAPL MSFT GOOGL --concept revenue --quarterly --periods 8 --json-output
-```
-
-Friendly aliases try issuer-specific fallback tags and align on shared period
-frames, so companies that migrated XBRL tags can still be compared without
-mixing years or period types.
-
-### `metrics` - Bundled canonical metrics
-
-```bash
-edgar metrics NVDA
-edgar metrics AAPL --bundle revenue,net_income,cash,debt,shares --ndjson
-edgar metrics --tickers AAPL,MSFT,GOOGL --bundle revenue,net_income,cash --json-output
-```
-
-`metrics` returns several common facts in one CLI invocation and includes the
-source XBRL tag plus freshness metadata for each metric. Metric bundles accept
-known aliases such as `revenue`, `net_income`, `operating_income`,
-`operating_cash_flow`, `cash`, `debt`, and `shares`; unknown aliases are
-reported explicitly in the result instead of being treated as SEC tags.
-
-### `brief` - Compact company brief
-
-```bash
-edgar brief AAPL
-edgar brief AGL --markdown
-cat tickers.txt | edgar brief --batch --ndjson
-```
-
-Brief metrics use fallback tags for common concepts and include a freshness
-column so stale facts are visible instead of silently looking current.
-
-### `bulk-urls` - Official nightly bulk archive URLs
-
-```bash
-edgar bulk-urls
-```
-
-### `clear-cache` - Remove cached API responses
-
-```bash
-edgar clear-cache
-```
-
-## Output Formats
-
-Most data commands support three output modes:
-
-| Flag | Format | Use case |
-|------|--------|----------|
-| default on a TTY | Rich terminal tables/panels | Human terminal use |
-| default when piped | Raw JSON | Programmatic pipelines |
-| `--markdown` / `-m` | Markdown output | Agent parsing and reports |
-| `--json-output` / `-j` | Raw JSON | Programmatic pipelines |
-| `--ndjson` | Newline-delimited JSON rows | Streaming, `head`, `jq`, and long results |
-
-Human table output abbreviates numeric values, hides long filing URLs by
-default, and keeps raw values in JSON. Use `--show-urls` on filing commands
-when you want filing index URLs in the table. For agent-to-agent work or narrow
-terminals, prefer JSON/NDJSON or `--markdown`; they avoid rich-table truncation.
-
-Concept and frame fact rows include provenance and normalized period metadata in
-JSON/NDJSON: `source_url`, `accession`, `filed`, `as_of`, `period_type`,
-`period_length_days`, `fiscal_period`, `calendar_period`, `is_restated`,
-`is_cumulative`, and `superseded_by`.
-
-Agent fan-out is available on the core research commands: `concept`, `metrics`,
-and `brief` accept `--tickers`, `--input FILE`, and `--batch` stdin. If you pass
-both a positional identifier and `--tickers`, the positional identifier is kept
-first and the ticker list is appended, which is useful for primary-vs-peer
-queries.
-
-Stable exit codes are reserved for agent branching:
+### Stable exit codes
 
 | Code | Meaning |
 |------|---------|
-| 0 | Success |
-| 2 | No data found |
-| 3 | Rate-limited |
-| 4 | SEC outage, blocked request, or unavailable service |
-| 5 | Validation error |
+| 0    | Success |
+| 2    | No data found (well-formed query, empty result, 404) |
+| 3    | Rate-limited |
+| 4    | SEC outage / 403 / unavailable service |
+| 5    | Validation error (malformed input) |
 
-## API Scope
+### Envelope on every JSON response
 
-This first version targets the keyless public-data endpoints:
+```json
+{
+  "schema_version": "1.0.0",
+  "cli_version": "0.1.0",
+  "cache": {"calls": 10, "hits": 7, "misses": 3, "ttl_min_remaining": 52867,
+            "last_key": "...", "last_hit": false, "last_etag": null},
+  "facts": [...]
+}
+```
 
-- Submissions history by filer: `https://data.sec.gov/submissions/CIK##########.json`
-- Company facts: `https://data.sec.gov/api/xbrl/companyfacts/CIK##########.json`
-- Company concept: `https://data.sec.gov/api/xbrl/companyconcept/CIK##########/{taxonomy}/{tag}.json`
-- Frames: `https://data.sec.gov/api/xbrl/frames/{taxonomy}/{tag}/{unit}/{frame}.json`
-- Ticker/CIK map: `https://www.sec.gov/files/company_tickers_exchange.json`
+`edgar schema [COMMAND]` returns the JSON Schema for any command output, so
+agents can validate without sampling live SEC data.
 
-The EDGAR Next filer APIs described in `api-overview.pdf` are a different,
-authenticated surface for submissions, submission status, operational status,
-and filer management. They are intentionally out of scope for this public
-research CLI skeleton.
+### Per-fact provenance + period metadata
+
+Every concept/frame fact ships with:
+
+```json
+{
+  "val": 215938000000,
+  "start": "2025-01-27", "end": "2026-01-25",
+  "period_type": "annual",
+  "period_length_days": 363,
+  "fiscal_period": "FY2026",
+  "calendar_period": "CY2025",
+  "source_url": "https://www.sec.gov/Archives/edgar/data/...",
+  "as_of": "2026-01-25",
+  "accession": "0001045810-26-000021",
+  "is_restated": false, "is_cumulative": false, "superseded_by": null
+}
+```
+
+### Universe groups
+
+`--tickers` accepts plain tickers and `@group` expressions:
+
+- `@dow30` — current Dow Jones 30 (static list)
+- `@sic:NNNN` — every filer in a SIC code (dynamic from the ticker map)
+
+`edgar resolve @dow30` expands a group to its concrete CIKs.
+
+## Commands
+
+### Discovery
+
+```bash
+edgar search-companies apple                        # ticker/CIK/name search
+edgar tags "deferred revenue"                       # XBRL tag search
+edgar frames --since 2024 --until 2025              # enumerate frame strings
+edgar concept-info revenue                          # candidates + freshness
+edgar dei NVDA                                      # filer entity metadata
+edgar peers MRK --candidates @dow30                 # SIC-matched peers
+edgar resolve AAPL @dow30 GOOGL                     # batch ticker→CIK
+```
+
+### Filings
+
+```bash
+edgar company NVDA --form 10-K --all
+edgar filings AAPL --major --limit 5                # 10-K/Q/8-K/S-1/proxy
+edgar filings AAPL --insider                        # Forms 3/4/5
+edgar filings AAPL --institutional                  # 13D/F/G
+edgar filings AAPL --start-date 2024-01-01 --end-date 2024-12-31
+edgar filings AAPL --form 8-K --since-last-fetch    # incremental mode
+edgar open AAPL --form 10-K --print-only            # print latest filing URL
+edgar exhibits 0000320193-25-000079 --cik 320193 --type-filter EX-99
+edgar earnings AAPL                                 # latest Item 2.02 8-K
+edgar events TSLA --limit 10                        # 8-K event detection
+```
+
+### Concepts
+
+```bash
+edgar concept NVDA revenue                          # alias resolution
+edgar concept NVDA us-gaap Revenues --unit USD      # explicit tag
+edgar concept NVDA revenue --annual --as-of 2024-01-01
+edgar concept NVDA revenue --canonical --quarterly  # union across alias tags
+edgar concept NVDA revenue --explain                # resolution trace
+edgar concept --tickers AAPL,MSFT,GOOGL revenue --quarterly --ndjson
+edgar facts AAPL --tag-filter revenue
+edgar frame us-gaap Assets USD CY2024Q4I --limit 25
+edgar compare AAPL MSFT GOOGL --concept revenue --periods 4
+edgar diff AAPL MSFT --concept revenue --periods 3  # period-aligned
+```
+
+`compare` and `diff` align on `frame`/`calendar_period` so filers with
+different fiscal calendars (AAPL FY ends Sep, MSFT FY ends Jun) still pair on
+the same row.
+
+### Computed metrics — formula + provenance
+
+Every derived number returns `{value, formula, inputs, caveats, missing_inputs}`.
+See [docs/definitions.md](docs/definitions.md) for canonical formulas
+(EBITDA SBC treatment, FCF capex scope, etc.).
+
+```bash
+edgar metrics NVDA --bundle revenue,net_income,cash,debt
+edgar metrics --tickers @dow30 --bundle income-statement --ndjson
+edgar ttm NVDA --bundle revenue                     # trailing 12 months
+edgar ratios NVDA --period-type annual              # 14 canonical ratios
+edgar trend NVDA --metric revenue --periods 8       # slope + label
+edgar growth NVDA --metric revenue --basis yoy,qoq,cagr3
+edgar reconstruct NVDA --metric ebitda              # ebitda|fcf|net_debt|nwc|tangible_book
+edgar brief AAPL                                    # profile + metrics + events
+```
+
+`metrics --bundle` accepts named groups: `income-statement`,
+`balance-sheet`, `cash-flow`, `liquidity`, `capital-structure`, `quality`.
+
+`ttm` falls back to stub-period reconstruction (`AnnualFY + CurrentYTD −
+PriorYTD`) for filers that only tag Q4 inside the annual 10-K (Apple,
+Microsoft, NVIDIA). Each TTM envelope tags the formula it used.
+
+`ratios` anchors balance-sheet (instant) facts to the income/cash-flow period
+end so ROA/ROE/turnover do not silently mix FY revenue with a later
+quarter's balance sheet. Drift over 14 days surfaces in
+`alignment_warnings`.
+
+### Audit / point-in-time
+
+```bash
+edgar audit-trail NVDA --concept revenue --period CY2024  # restatement detection
+edgar amendments AAPL --since 2025-01-01                  # primary↔/A pairs
+edgar delta NVDA --use-state                              # new + restated since last fetch
+```
+
+Add `--as-of YYYY-MM-DD` to `concept`, `compare`, `diff`, `ttm`, `ratios`,
+`trend`, `growth`, `reconstruct`, or `delta` to filter to facts filed on or
+before that date — eliminates look-ahead bias.
+
+### Subscribe / drain
+
+```bash
+edgar subscribe add AAPL --form 8-K
+edgar subscribe list
+edgar pending --ndjson                              # streams new filings, advances state
+edgar mark-seen AAPL 0000320193-26-000011 --form 8-K
+edgar subscribe remove AAPL --form 8-K
+```
+
+State lives in `~/.edgar/state.json` keyed by `(cik, form)`.
+
+### Cache
+
+```bash
+edgar --cache-max-mb 100 cache stats                # bound cache to 100 MB
+edgar cache invalidate '*CIK0000320193*'            # surgical glob invalidation
+edgar cache warm --tickers @dow30                   # pre-fetch submissions+facts
+edgar clear-cache
+```
+
+The cache is endpoint-aware (ticker map 7d, companyfacts/concept 1d, frames
+90d, recent submissions 1h, 404s 1h). Conditional `If-None-Match` /
+`If-Modified-Since` requests refresh entries without re-downloading.
+
+### Other
+
+```bash
+edgar bulk-urls                                     # nightly bulk archive URLs
+edgar schema concept                                # JSON Schema for an output
+edgar --webhook https://hooks.example.com/edgar metrics AAPL  # POST result
+```
+
+## Output formats
+
+| Flag | Format | Best for |
+|------|--------|----------|
+| default on TTY | Rich tables/panels | Humans |
+| default when piped | Pretty JSON envelope | Agents |
+| `--markdown` / `-m` | Markdown tables | Reports, agent prompts |
+| `--json-output` / `-j` | Pretty JSON envelope (force) | Forced JSON |
+| `--ndjson` | Newline-delimited rows | Streaming, `jq`, `head` |
+
+NDJSON rows are flat and self-describing — each line carries enough metadata
+to be processed independently.
+
+## API scope
+
+Public, keyless `data.sec.gov` endpoints:
+
+- `/submissions/CIK##########.json`
+- `/api/xbrl/companyfacts/CIK##########.json`
+- `/api/xbrl/companyconcept/CIK##########/{taxonomy}/{tag}.json`
+- `/api/xbrl/frames/{taxonomy}/{tag}/{unit}/{frame}.json`
+- `/files/company_tickers_exchange.json`
+
+The authenticated EDGAR Next filer APIs are out of scope. Market-data ratios
+(P/E, EV/EBITDA, dividend yield) appear in the `ratios` envelope under
+`not_applicable` so agents do not retry them.
 
 ## Development
 
@@ -223,21 +261,18 @@ python -m edgar --help
 
 ## Notes
 
-- SEC's published maximum scripted access rate is 10 requests per second. This
-  CLI uses a shared local limiter of 5 requests per second.
-- Responses are cached in `~/.edgar_cache` for 15 minutes. Use `--no-cache`
-  when freshness matters.
-- Filing commands search SEC's recent filing set by default. The CLI warns when
-  a form/date query is likely to be limited by that recent set, such as a
-  filtered result hitting `--limit` or a date filter reaching the oldest recent
-  filing. Use `--all` to fetch historical chunks from `filings.files[]` when
-  researching older IPO-era forms.
-- `concept` suggests similar company-specific XBRL tags when SEC returns a 404,
-  which helps with issuer-specific tags like revenue concepts.
-- `concept --deltas` only compares adjacent rows with matching period lengths;
-  mixed quarterly/annual rows are skipped to avoid misleading math.
-- Exhibit downloads use the same SEC user agent and shared rate limiter as API
-  requests.
+- SEC's scripted access ceiling is 10 req/s; this CLI uses a shared local
+  limiter at 5 req/s.
+- Cache lives at `~/.edgar_cache`. Use `--no-cache` to bypass per call,
+  `cache invalidate` for surgical busting, `--cache-max-mb` for LRU bound.
+- Filing commands search SEC's recent filing set by default; pass `--all`
+  to fetch historical chunks from `filings.files[]`.
+- `concept` suggests similar issuer-specific tags when SEC returns 404.
+- `concept --deltas` skips adjacent rows with mismatched period lengths.
+- Exhibit downloads use the same User-Agent and shared rate limiter.
+- Multi-day items (full-text search, mirror SQLite, governance proxy
+  parsing, item-level 10-K extraction, insider/holder aggregation) are
+  tracked in [docs/BACKLOG.md](docs/BACKLOG.md).
 
 ## License
 
