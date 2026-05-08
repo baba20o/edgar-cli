@@ -81,6 +81,15 @@ COMMON_CONCEPTS = {
 }
 
 BRIEF_METRICS = ["assets", "cash", "debt", "net_income", "operating_income", "revenue"]
+DEFAULT_METRIC_BUNDLE = [
+    "revenue",
+    "net_income",
+    "operating_income",
+    "operating_cash_flow",
+    "cash",
+    "debt",
+    "shares",
+]
 STALE_METRIC_DAYS = 548
 
 EVENT_KEYWORDS = {
@@ -409,7 +418,8 @@ class EdgarClient(BaseAPIClient):
 
     def company_concept(self, identifier: str | int, taxonomy: str, tag: str,
                         unit: Optional[str] = None, limit: int = 20,
-                        suggest_on_404: bool = True) -> dict:
+                        suggest_on_404: bool = True,
+                        period_type: Optional[str] = None) -> dict:
         """Return all facts for a single company concept."""
         company = self.resolve_company(identifier)
         if "error" in company:
@@ -433,6 +443,9 @@ class EdgarClient(BaseAPIClient):
                 item = dict(row)
                 item["unit"] = unit_name
                 item.update(filing_urls(company["cik"], item.get("accn", ""), ""))
+                enrich_fact_metadata(item, company["cik"])
+                if period_type and item.get("period_type") != period_type:
+                    continue
                 facts.append(item)
 
         facts.sort(key=lambda x: (x.get("filed", ""), x.get("end", "")), reverse=True)
@@ -448,19 +461,23 @@ class EdgarClient(BaseAPIClient):
         }
 
     def company_concept_alias(self, identifier: str | int, concept: str,
-                              unit: Optional[str] = None, limit: int = 20) -> dict:
+                              unit: Optional[str] = None, limit: int = 20,
+                              period_type: Optional[str] = None) -> dict:
         """Return facts for a friendly concept alias, choosing the freshest candidate tag."""
         key = concept.strip().lower().replace("-", "_").replace(" ", "_")
         candidates = concept_alias_candidates(concept, unit=unit)
         if key not in COMMON_CONCEPT_CANDIDATES:
             taxonomy, tag, resolved_unit = candidates[0]
-            return self.company_concept(identifier, taxonomy, tag, unit=resolved_unit, limit=limit)
+            return self.company_concept(
+                identifier, taxonomy, tag, unit=resolved_unit, limit=limit, period_type=period_type,
+            )
 
         errors = []
         results = []
         for taxonomy, tag, resolved_unit in candidates:
             result = self.company_concept(
-                identifier, taxonomy, tag, unit=resolved_unit, limit=limit, suggest_on_404=False,
+                identifier, taxonomy, tag, unit=resolved_unit, limit=limit,
+                suggest_on_404=False, period_type=period_type,
             )
             if "error" in result:
                 errors.append(result["error"])
@@ -523,6 +540,8 @@ class EdgarClient(BaseAPIClient):
             item = dict(row)
             if "cik" in item:
                 item["cik"] = normalize_cik(item["cik"])
+            item.setdefault("frame", result.get("ccp", frame))
+            enrich_fact_metadata(item, item.get("cik", "0"))
             rows.append(item)
 
         if sort_by == "name":
@@ -666,12 +685,15 @@ class EdgarClient(BaseAPIClient):
         return {"cik": result["cik"], "name": result["name"], "events": events, "total": len(events)}
 
     def compare_concept(self, identifiers: list[str], concept: str, taxonomy: Optional[str] = None,
-                        unit: Optional[str] = None, periods: int = 4) -> dict:
+                        unit: Optional[str] = None, periods: int = 4,
+                        period_type: Optional[str] = None) -> dict:
         """Compare a concept across companies."""
         candidates = concept_alias_candidates(concept, taxonomy, unit)
         companies = []
         for identifier in identifiers:
-            company = self._company_candidate_facts(identifier, candidates, periods=max(periods * 12, 36))
+            company = self._company_candidate_facts(
+                identifier, candidates, periods=max(periods * 12, 36), period_type=period_type,
+            )
             if company.get("error"):
                 companies.append(company)
                 continue
@@ -724,7 +746,31 @@ class EdgarClient(BaseAPIClient):
             "unit": first.get("unit", candidates[0][2]),
             "frames": shared_frames,
             "warnings": warnings,
+            "period_alignment_warning": " ".join(warnings),
             "companies": companies,
+        }
+
+    def metrics(self, identifier: str | int, bundle: Optional[list[str]] = None) -> dict:
+        """Return a bundle of canonical metrics for one company."""
+        profile = self.submissions(identifier, limit=5)
+        if "error" in profile:
+            return profile
+
+        reference_date = latest_filing_date(profile)
+        metrics = []
+        for label in bundle or DEFAULT_METRIC_BUNDLE:
+            metric = self._best_metric(label, profile["cik"], reference_date)
+            if metric:
+                metrics.append(metric)
+            else:
+                metrics.append({"metric": label, "error": "No facts found"})
+
+        return {
+            "cik": profile.get("cik", ""),
+            "ticker": profile.get("ticker", ""),
+            "name": profile.get("name", ""),
+            "reference_date": reference_date,
+            "metrics": metrics,
         }
 
     def brief(self, identifier: str | int) -> dict:
@@ -751,13 +797,14 @@ class EdgarClient(BaseAPIClient):
         }
 
     def _company_candidate_facts(self, identifier: str | int, candidates: list[tuple[str, str, Optional[str]]],
-                                 periods: int) -> dict:
+                                 periods: int, period_type: Optional[str] = None) -> dict:
         errors = []
         candidate_facts = []
         metadata = {}
         for taxonomy, tag, unit in candidates:
             result = self.company_concept(
-                identifier, taxonomy, tag, unit=unit, limit=periods, suggest_on_404=False,
+                identifier, taxonomy, tag, unit=unit, limit=periods,
+                suggest_on_404=False, period_type=period_type,
             )
             if "error" in result:
                 errors.append(result["error"])
@@ -895,6 +942,86 @@ def _number_or_zero(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def enrich_fact_metadata(fact: dict, cik: str | int) -> dict:
+    """Add provenance and normalized period metadata to a fact row."""
+    accession = fact.get("accn") or fact.get("accession") or ""
+    if accession:
+        fact["accession"] = accession
+        if not fact.get("source_url"):
+            try:
+                fact["source_url"] = filing_urls(cik, accession, "").get("filing_url", "")
+            except ValueError:
+                fact["source_url"] = ""
+    else:
+        fact.setdefault("source_url", "")
+    fact["as_of"] = fact.get("end") or fact.get("filed") or ""
+
+    start = parse_date(fact.get("start", ""))
+    end = parse_date(fact.get("end", ""))
+    if end and not start:
+        period_length_days = 0
+        period_type = "instant"
+    elif start and end:
+        period_length_days = (end - start).days
+        period_type = period_type_from_days(period_length_days)
+    else:
+        period_length_days = None
+        period_type = ""
+
+    fact["period_type"] = period_type
+    fact["period_length_days"] = period_length_days
+    fact["fiscal_period"] = fiscal_period_label(fact)
+    fact["calendar_period"] = fact.get("frame") or calendar_period_label(fact)
+    fact["is_restated"] = False
+    fact["is_cumulative"] = is_cumulative_fact(fact)
+    fact["superseded_by"] = None
+    return fact
+
+
+def period_type_from_days(days: int) -> str:
+    if 300 <= days <= 380:
+        return "annual"
+    if 70 <= days <= 110:
+        return "quarterly"
+    if 110 < days < 300:
+        return "ytd"
+    return "other"
+
+
+def fiscal_period_label(fact: dict) -> str:
+    fy = fact.get("fy")
+    fp = str(fact.get("fp") or "").upper()
+    if not fy:
+        return ""
+    if fp.startswith("Q"):
+        return f"{fp}-FY{fy}"
+    if fp == "FY":
+        return f"FY{fy}"
+    return f"{fp}-FY{fy}" if fp else f"FY{fy}"
+
+
+def calendar_period_label(fact: dict) -> str:
+    end = parse_date(fact.get("end", ""))
+    if not end:
+        return ""
+    period_type = fact.get("period_type")
+    if period_type == "annual":
+        return f"CY{end.year}"
+    if period_type == "quarterly":
+        quarter = (end.month - 1) // 3 + 1
+        return f"CY{end.year}Q{quarter}"
+    if period_type == "instant":
+        quarter = (end.month - 1) // 3 + 1
+        return f"CY{end.year}Q{quarter}I"
+    return ""
+
+
+def is_cumulative_fact(fact: dict) -> bool:
+    fp = str(fact.get("fp") or "").upper()
+    days = fact.get("period_length_days")
+    return bool(fp in {"Q2", "Q3"} and days and days > 110)
 
 
 def parse_date(value: str) -> Optional[date]:

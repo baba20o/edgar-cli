@@ -134,6 +134,69 @@ def test_company_concept_quotes_path_segments():
     assert paths == ["/api/xbrl/companyconcept/CIK0000320193/us-gaap/Assets%2F..%2FLiabilities.json"]
 
 
+def test_company_concept_adds_provenance_and_period_metadata():
+    client = EdgarClient(cache=None, rate_limiter=None, use_cache=False)
+    client.resolve_company = lambda identifier: {"cik": "0000320193", "name": "Apple Inc."}
+
+    def fake_get(path, params=None, skip_cache=False):
+        return {
+            "cik": 320193,
+            "entityName": "Apple Inc.",
+            "taxonomy": "us-gaap",
+            "tag": "RevenueFromContractWithCustomerExcludingAssessedTax",
+            "units": {
+                "USD": [{
+                    "val": 100,
+                    "accn": "0000320193-26-000013",
+                    "start": "2025-12-28",
+                    "end": "2026-03-28",
+                    "filed": "2026-05-01",
+                    "fy": 2026,
+                    "fp": "Q2",
+                    "frame": "CY2026Q1",
+                }]
+            },
+        }
+
+    client._get = fake_get
+
+    result = client.company_concept("AAPL", "us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax")
+    fact = result["facts"][0]
+
+    assert fact["source_url"].endswith("0000320193-26-000013-index.htm")
+    assert fact["accession"] == "0000320193-26-000013"
+    assert fact["as_of"] == "2026-03-28"
+    assert fact["period_type"] == "quarterly"
+    assert fact["period_length_days"] == 90
+    assert fact["fiscal_period"] == "Q2-FY2026"
+    assert fact["calendar_period"] == "CY2026Q1"
+    assert fact["is_cumulative"] is False
+    assert fact["is_restated"] is False
+    assert fact["superseded_by"] is None
+
+
+def test_company_concept_filters_period_type():
+    client = EdgarClient(cache=None, rate_limiter=None, use_cache=False)
+    client.resolve_company = lambda identifier: {"cik": "0000320193", "name": "Apple Inc."}
+
+    def fake_get(path, params=None, skip_cache=False):
+        return {
+            "cik": 320193,
+            "units": {
+                "USD": [
+                    {"val": 1, "start": "2025-01-01", "end": "2025-12-31", "filed": "2026-01-01"},
+                    {"val": 2, "start": "2026-01-01", "end": "2026-03-31", "filed": "2026-04-01"},
+                ]
+            },
+        }
+
+    client._get = fake_get
+
+    result = client.company_concept("AAPL", "us-gaap", "Revenues", period_type="quarterly")
+
+    assert [fact["val"] for fact in result["facts"]] == [2]
+
+
 def test_frame_quotes_path_segments():
     client = EdgarClient(cache=None, rate_limiter=None, use_cache=False)
     paths = []
@@ -146,6 +209,38 @@ def test_frame_quotes_path_segments():
     client.frame("us-gaap", "Assets/../Liabilities", "USD/shares", "CY2024Q4I/../CY2023")
 
     assert paths == ["/api/xbrl/frames/us-gaap/Assets%2F..%2FLiabilities/USD%2Fshares/CY2024Q4I%2F..%2FCY2023.json"]
+
+
+def test_frame_rows_inherit_frame_for_period_metadata():
+    client = EdgarClient(cache=None, rate_limiter=None, use_cache=False)
+
+    def fake_get(path, params=None, skip_cache=False):
+        return {
+            "taxonomy": "us-gaap",
+            "tag": "Revenues",
+            "uom": "USD",
+            "ccp": "CY2025Q1",
+            "data": [
+                {
+                    "cik": 104169,
+                    "entityName": "Walmart Inc.",
+                    "val": 165609000000,
+                    "accn": "0000104169-25-000090",
+                    "start": "2025-02-01",
+                    "end": "2025-04-30",
+                    "filed": "2025-06-06",
+                }
+            ],
+        }
+
+    client._get = fake_get
+
+    result = client.frame("us-gaap", "Revenues", "USD", "CY2025Q1")
+    fact = result["facts"][0]
+
+    assert fact["frame"] == "CY2025Q1"
+    assert fact["calendar_period"] == "CY2025Q1"
+    assert fact["period_type"] == "quarterly"
 
 
 def test_submissions_all_history_fetches_historical_chunks():

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import webbrowser
 from pathlib import Path
 
@@ -15,25 +16,63 @@ from rich.table import Table
 from edgar.api import BULK_ARCHIVES, get_client
 
 console = Console()
+click.UsageError.exit_code = 5
 
 
 def _json(data) -> None:
     click.echo(json.dumps(data, indent=2, default=str))
 
 
+def _ndjson(rows) -> None:
+    for row in rows:
+        click.echo(json.dumps(row, default=str, separators=(",", ":")))
+
+
+def _wants_json(json_output: bool, markdown: bool, ndjson: bool) -> bool:
+    return json_output or (not markdown and not ndjson and not sys.stdout.isatty())
+
+
 def _error_exit(result: dict) -> None:
     if "error" in result:
-        click.echo(f"Error: {result['error']}", err=True)
+        message = str(result["error"])
         suggestions = result.get("suggestions") or []
         if suggestions:
-            click.echo("Suggestions:", err=True)
+            lines = [message, "Suggestions:"]
             for suggestion in suggestions[:8]:
-                click.echo(
+                lines.append(
                     f"  {suggestion.get('taxonomy', '')} {suggestion.get('tag', '')}"
-                    f"  ({suggestion.get('label', '')})",
-                    err=True,
+                    f"  ({suggestion.get('label', '')})"
                 )
-        raise click.Abort()
+            message = "\n".join(lines)
+        exc = click.ClickException(message)
+        exc.exit_code = _exit_code_for_error(str(result["error"]))
+        raise exc
+
+
+def _exit_code_for_error(error: str) -> int:
+    text = error.lower()
+    if "429" in text or "rate limit" in text or "rate-limited" in text:
+        return 3
+    if (
+        "no matching" in text
+        or "no recent" in text
+        or "no facts" in text
+        or "404" in text
+        or "not found" in text
+    ):
+        return 2
+    if (
+        "not a cik" in text
+        or "required" in text
+        or "blank" in text
+        or "ambiguous" in text
+        or "could not create" in text
+        or "could not write" in text
+    ):
+        return 5
+    if "403" in text or "failed after" in text or "timeout" in text or "unavailable" in text:
+        return 4
+    return 1
 
 
 def _truncate(text: str, width: int = 72) -> str:
@@ -58,9 +97,71 @@ def _markdown_table(headers: list[str], rows: list[list]) -> str:
 
 
 def output_options(fn):
+    fn = click.option("--ndjson", is_flag=True, help="Stream primary rows as newline-delimited JSON")(fn)
     fn = click.option("--json-output", "-j", is_flag=True, help="Output raw JSON")(fn)
     fn = click.option("--markdown", "-m", is_flag=True, help="Output markdown; best for agents and reports")(fn)
     return fn
+
+
+def _period_type_from_flags(annual: bool, quarterly: bool, ytd: bool, instant: bool) -> str | None:
+    selected = [
+        label for label, enabled in [
+            ("annual", annual),
+            ("quarterly", quarterly),
+            ("ytd", ytd),
+            ("instant", instant),
+        ] if enabled
+    ]
+    if len(selected) > 1:
+        raise click.UsageError("Choose only one period filter: --annual, --quarterly, --ytd, or --instant")
+    return selected[0] if selected else None
+
+
+def batch_options(fn):
+    fn = click.option("--batch", is_flag=True, help="Read identifiers from stdin, one per line or comma-separated")(fn)
+    fn = click.option("--input", "input_file", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+                      default=None, help="Read identifiers from a file")(fn)
+    fn = click.option("--tickers", default=None, help="Comma-separated identifiers to query in one invocation")(fn)
+    return fn
+
+
+def _split_input_values(text: str) -> list[str]:
+    values = []
+    for line in text.replace(",", "\n").splitlines():
+        value = line.strip()
+        if value and not value.startswith("#"):
+            values.append(value)
+    return values
+
+
+def _collect_identifiers(identifier: str | None, tickers: str | None, input_file: Path | None,
+                         batch: bool) -> list[str]:
+    identifiers = [identifier] if identifier else []
+    if tickers:
+        identifiers.extend(_split_input_values(tickers))
+    if input_file:
+        try:
+            identifiers.extend(_split_input_values(input_file.read_text()))
+        except OSError as exc:
+            error = click.ClickException(f"Could not read input file: {exc}")
+            error.exit_code = 5
+            raise error from exc
+    if batch:
+        identifiers.extend(_split_input_values(sys.stdin.read()))
+
+    deduped = []
+    seen = set()
+    for value in identifiers:
+        if value not in seen:
+            deduped.append(value)
+            seen.add(value)
+    if not deduped:
+        raise click.UsageError("Provide an identifier, --tickers, --input, or --batch stdin")
+    return deduped
+
+
+def _batch_failed(results: list[dict]) -> bool:
+    return bool(results) and all("error" in result for result in results)
 
 
 @click.group()
@@ -80,10 +181,10 @@ def main(ctx, debug: bool, no_cache: bool):
 @click.option("--limit", "-n", default=20, show_default=True, help="Maximum matches")
 @output_options
 @click.pass_context
-def search_companies(ctx, query, limit, json_output, markdown):
+def search_companies(ctx, query, limit, markdown, json_output, ndjson):
     """Search SEC ticker, CIK, company, and exchange mappings."""
     result = get_client(use_cache=not ctx.obj["no_cache"]).search_companies(query, limit=limit)
-    _output_companies(result, json_output, markdown)
+    _output_companies(result, json_output, markdown, ndjson)
 
 
 @main.command()
@@ -96,13 +197,14 @@ def search_companies(ctx, query, limit, json_output, markdown):
 @click.option("--show-urls", is_flag=True, help="Show filing URLs in table output")
 @output_options
 @click.pass_context
-def company(ctx, identifier, limit, form_type, start_date, end_date, all_history, show_urls, json_output, markdown):
+def company(ctx, identifier, limit, form_type, start_date, end_date, all_history, show_urls,
+            markdown, json_output, ndjson):
     """Show company profile and recent filings for a ticker or CIK."""
     result = get_client(use_cache=not ctx.obj["no_cache"]).submissions(
         identifier, limit=limit, form=form_type, start_date=start_date,
         end_date=end_date, all_history=all_history,
     )
-    _output_company(result, json_output, markdown, show_urls=show_urls)
+    _output_company(result, json_output, markdown, ndjson, show_urls=show_urls)
 
 
 @main.command()
@@ -115,13 +217,14 @@ def company(ctx, identifier, limit, form_type, start_date, end_date, all_history
 @click.option("--show-urls", is_flag=True, help="Show filing URLs in table output")
 @output_options
 @click.pass_context
-def filings(ctx, identifier, limit, form_type, start_date, end_date, all_history, show_urls, json_output, markdown):
+def filings(ctx, identifier, limit, form_type, start_date, end_date, all_history, show_urls,
+            markdown, json_output, ndjson):
     """Show recent filings for a ticker or CIK."""
     result = get_client(use_cache=not ctx.obj["no_cache"]).submissions(
         identifier, limit=limit, form=form_type, start_date=start_date,
         end_date=end_date, all_history=all_history,
     )
-    _output_filings(result, f"Recent Filings: {identifier}", json_output, markdown, show_urls=show_urls)
+    _output_filings(result, f"Recent Filings: {identifier}", json_output, markdown, ndjson, show_urls=show_urls)
 
 
 @main.command()
@@ -131,33 +234,62 @@ def filings(ctx, identifier, limit, form_type, start_date, end_date, all_history
 @click.option("--tag-filter", "-q", default=None, help="Filter tag, label, or description")
 @output_options
 @click.pass_context
-def facts(ctx, identifier, limit, taxonomy, tag_filter, json_output, markdown):
+def facts(ctx, identifier, limit, taxonomy, tag_filter, markdown, json_output, ndjson):
     """List XBRL concepts available for one company."""
     result = get_client(use_cache=not ctx.obj["no_cache"]).company_facts(
         identifier, taxonomy=taxonomy, tag_filter=tag_filter, limit=limit,
     )
-    _output_concepts(result, json_output, markdown)
+    _output_concepts(result, json_output, markdown, ndjson)
 
 
 @main.command()
-@click.argument("identifier")
-@click.argument("terms", nargs=-1, required=True)
+@click.argument("args", nargs=-1, required=True)
 @click.option("--unit", "-u", default=None, help="Restrict to one unit, e.g. USD")
 @click.option("--limit", "-n", default=20, show_default=True, help="Facts to show")
 @click.option("--deltas", is_flag=True, help="Show change vs previous comparable displayed period")
+@click.option("--annual", is_flag=True, help="Only annual-duration facts")
+@click.option("--quarterly", is_flag=True, help="Only quarterly-duration facts")
+@click.option("--ytd", is_flag=True, help="Only year-to-date facts")
+@click.option("--instant", is_flag=True, help="Only instant facts")
+@batch_options
 @output_options
 @click.pass_context
-def concept(ctx, identifier, terms, unit, limit, deltas, json_output, markdown):
+def concept(ctx, args, unit, limit, deltas, annual, quarterly, ytd, instant,
+            tickers, input_file, batch, markdown, json_output, ndjson):
     """Show facts for one company XBRL concept or alias."""
     client = get_client(use_cache=not ctx.obj["no_cache"])
+    period_type = _period_type_from_flags(annual, quarterly, ytd, instant)
+    batch_mode = bool(tickers or input_file or batch)
+    if batch_mode:
+        identifiers = _collect_identifiers(None, tickers, input_file, batch)
+        terms = args
+    else:
+        if len(args) < 2:
+            raise click.UsageError("Use either: concept IDENTIFIER ALIAS or concept IDENTIFIER TAXONOMY TAG")
+        identifiers = [args[0]]
+        terms = args[1:]
+
     if len(terms) == 1:
-        result = client.company_concept_alias(identifier, terms[0], unit=unit, limit=limit)
+        fetch = lambda identifier: client.company_concept_alias(
+            identifier, terms[0], unit=unit, limit=limit, period_type=period_type,
+        )
     elif len(terms) == 2:
         taxonomy, tag = terms
-        result = client.company_concept(identifier, taxonomy, tag, unit=unit, limit=limit)
+        fetch = lambda identifier: client.company_concept(
+            identifier, taxonomy, tag, unit=unit, limit=limit, period_type=period_type,
+        )
     else:
         raise click.UsageError("Use either: concept IDENTIFIER ALIAS or concept IDENTIFIER TAXONOMY TAG")
-    _output_concept_facts(result, json_output, markdown, deltas=deltas)
+
+    results = []
+    for identifier in identifiers:
+        result = fetch(identifier)
+        result.setdefault("identifier", identifier)
+        results.append(result)
+    if len(results) == 1 and not batch_mode:
+        _output_concept_facts(results[0], json_output, markdown, ndjson, deltas=deltas)
+    else:
+        _output_concept_batch(results, json_output, markdown, ndjson, deltas=deltas)
 
 
 @main.command()
@@ -170,12 +302,12 @@ def concept(ctx, identifier, terms, unit, limit, deltas, json_output, markdown):
               default="value", show_default=True)
 @output_options
 @click.pass_context
-def frame(ctx, taxonomy, tag, unit, frame, limit, sort_by, json_output, markdown):
+def frame(ctx, taxonomy, tag, unit, frame, limit, sort_by, markdown, json_output, ndjson):
     """Show a cross-company XBRL frame."""
     result = get_client(use_cache=not ctx.obj["no_cache"]).frame(
         taxonomy, tag, unit, frame, limit=limit, sort_by=sort_by,
     )
-    _output_frame(result, json_output, markdown)
+    _output_frame(result, json_output, markdown, ndjson)
 
 
 @main.command()
@@ -204,7 +336,7 @@ def open(ctx, identifier, form_type, all_history, print_only):
 @click.option("--type-filter", default=None, help="Only include document types containing this text")
 @output_options
 @click.pass_context
-def exhibits(ctx, accession_or_url, cik, download, type_filter, json_output, markdown):
+def exhibits(ctx, accession_or_url, cik, download, type_filter, markdown, json_output, ndjson):
     """List or download documents/exhibits from a filing."""
     client = get_client(use_cache=not ctx.obj["no_cache"])
     result = client.filing_documents_for_accession(accession_or_url, cik=cik)
@@ -218,17 +350,17 @@ def exhibits(ctx, accession_or_url, cik, download, type_filter, json_output, mar
     if download:
         result = _download_documents(client, result, download)
         _error_exit(result)
-    _output_documents(result, json_output, markdown)
+    _output_documents(result, json_output, markdown, ndjson)
 
 
 @main.command()
 @click.argument("identifier")
 @output_options
 @click.pass_context
-def earnings(ctx, identifier, json_output, markdown):
+def earnings(ctx, identifier, markdown, json_output, ndjson):
     """Summarize the latest Item 2.02 earnings 8-K and exhibit."""
     result = get_client(use_cache=not ctx.obj["no_cache"]).latest_earnings(identifier)
-    _output_earnings(result, json_output, markdown)
+    _output_earnings(result, json_output, markdown, ndjson)
 
 
 @main.command()
@@ -236,10 +368,10 @@ def earnings(ctx, identifier, json_output, markdown):
 @click.option("--limit", "-n", default=20, show_default=True, help="Recent 8-Ks to inspect")
 @output_options
 @click.pass_context
-def events(ctx, identifier, limit, json_output, markdown):
+def events(ctx, identifier, limit, markdown, json_output, ndjson):
     """Detect notable recent 8-K events."""
     result = get_client(use_cache=not ctx.obj["no_cache"]).events(identifier, limit=limit)
-    _output_events(result, json_output, markdown)
+    _output_events(result, json_output, markdown, ndjson)
 
 
 @main.command()
@@ -248,32 +380,75 @@ def events(ctx, identifier, limit, json_output, markdown):
 @click.option("--taxonomy", "-t", default=None, help="Taxonomy override, e.g. us-gaap")
 @click.option("--unit", "-u", default=None, help="Unit override, e.g. USD")
 @click.option("--periods", "-n", default=4, show_default=True, help="Periods per company")
+@click.option("--annual", is_flag=True, help="Only annual-duration facts")
+@click.option("--quarterly", is_flag=True, help="Only quarterly-duration facts")
+@click.option("--ytd", is_flag=True, help="Only year-to-date facts")
+@click.option("--instant", is_flag=True, help="Only instant facts")
 @output_options
 @click.pass_context
-def compare(ctx, identifiers, concept, taxonomy, unit, periods, json_output, markdown):
+def compare(ctx, identifiers, concept, taxonomy, unit, periods, annual, quarterly, ytd, instant,
+            markdown, json_output, ndjson):
     """Compare one concept across companies."""
+    period_type = _period_type_from_flags(annual, quarterly, ytd, instant)
     result = get_client(use_cache=not ctx.obj["no_cache"]).compare_concept(
         list(identifiers), concept, taxonomy=taxonomy, unit=unit, periods=periods,
+        period_type=period_type,
     )
-    _output_compare(result, json_output, markdown)
+    _output_compare(result, json_output, markdown, ndjson)
 
 
 @main.command()
-@click.argument("identifier")
+@click.argument("identifier", required=False)
+@click.option("--bundle", default="revenue,net_income,operating_income,operating_cash_flow,cash,debt,shares",
+              show_default=True, help="Comma-separated metric aliases")
+@batch_options
 @output_options
 @click.pass_context
-def brief(ctx, identifier, json_output, markdown):
+def metrics(ctx, identifier, bundle, tickers, input_file, batch, markdown, json_output, ndjson):
+    """Return a bundled canonical metric set for one company."""
+    labels = [item.strip() for item in bundle.split(",") if item.strip()]
+    identifiers = _collect_identifiers(identifier, tickers, input_file, batch)
+    client = get_client(use_cache=not ctx.obj["no_cache"])
+    results = []
+    for value in identifiers:
+        result = client.metrics(value, labels)
+        result.setdefault("identifier", value)
+        results.append(result)
+    if len(results) == 1 and not (tickers or input_file or batch):
+        _output_metrics(results[0], json_output, markdown, ndjson)
+    else:
+        _output_metrics_batch(results, json_output, markdown, ndjson)
+
+
+@main.command()
+@click.argument("identifier", required=False)
+@batch_options
+@output_options
+@click.pass_context
+def brief(ctx, identifier, tickers, input_file, batch, markdown, json_output, ndjson):
     """Build a compact company brief."""
-    result = get_client(use_cache=not ctx.obj["no_cache"]).brief(identifier)
-    _output_brief(result, json_output, markdown)
+    identifiers = _collect_identifiers(identifier, tickers, input_file, batch)
+    client = get_client(use_cache=not ctx.obj["no_cache"])
+    results = []
+    for value in identifiers:
+        result = client.brief(value)
+        result.setdefault("identifier", value)
+        results.append(result)
+    if len(results) == 1 and not (tickers or input_file or batch):
+        _output_brief(results[0], json_output, markdown, ndjson)
+    else:
+        _output_brief_batch(results, json_output, markdown, ndjson)
 
 
 @main.command("bulk-urls")
 @output_options
-def bulk_urls(json_output, markdown):
+def bulk_urls(markdown, json_output, ndjson):
     """List official SEC nightly bulk archive URLs."""
     result = {"archives": BULK_ARCHIVES}
-    if json_output:
+    if ndjson:
+        _ndjson(result["archives"])
+        return
+    if _wants_json(json_output, markdown, ndjson):
         _json(result)
         return
     rows = [[a["name"], a["description"], a["url"]] for a in BULK_ARCHIVES]
@@ -298,9 +473,12 @@ def clear_cache():
     click.echo(f"Cleared {count} cached entries.")
 
 
-def _output_companies(result: dict, json_output: bool, markdown: bool) -> None:
+def _output_companies(result: dict, json_output: bool, markdown: bool, ndjson: bool = False) -> None:
     _error_exit(result)
-    if json_output:
+    if ndjson:
+        _ndjson(result.get("companies", []))
+        return
+    if _wants_json(json_output, markdown, ndjson):
         _json(result)
         return
 
@@ -322,9 +500,13 @@ def _output_companies(result: dict, json_output: bool, markdown: bool) -> None:
     console.print(table)
 
 
-def _output_company(result: dict, json_output: bool, markdown: bool, show_urls: bool = False) -> None:
+def _output_company(result: dict, json_output: bool, markdown: bool, ndjson: bool = False,
+                    show_urls: bool = False) -> None:
     _error_exit(result)
-    if json_output:
+    if ndjson:
+        _ndjson(result.get("filings", []))
+        return
+    if _wants_json(json_output, markdown, ndjson):
         _json(result)
         return
 
@@ -341,7 +523,7 @@ def _output_company(result: dict, json_output: bool, markdown: bool, show_urls: 
             ]],
         ))
         click.echo()
-        _output_filings(result, "Recent Filings", False, True, show_urls=show_urls)
+        _output_filings(result, "Recent Filings", False, True, False, show_urls=show_urls)
         return
 
     body = "\n".join([
@@ -352,13 +534,16 @@ def _output_company(result: dict, json_output: bool, markdown: bool, show_urls: 
         f"Fiscal year end: {result.get('fiscalYearEnd', '')}",
     ])
     console.print(Panel(body, title=result.get("name", ""), expand=False))
-    _output_filings(result, "Recent Filings", False, False, show_urls=show_urls)
+    _output_filings(result, "Recent Filings", False, False, False, show_urls=show_urls)
 
 
 def _output_filings(result: dict, title: str, json_output: bool, markdown: bool,
-                    show_urls: bool = False) -> None:
+                    ndjson: bool = False, show_urls: bool = False) -> None:
     _error_exit(result)
-    if json_output:
+    if ndjson:
+        _ndjson(result.get("filings", []))
+        return
+    if _wants_json(json_output, markdown, ndjson):
         _json({"cik": result.get("cik"), "name": result.get("name"), "filings": result.get("filings", [])})
         return
 
@@ -403,9 +588,12 @@ def _output_filings(result: dict, title: str, json_output: bool, markdown: bool,
     console.print(table)
 
 
-def _output_concepts(result: dict, json_output: bool, markdown: bool) -> None:
+def _output_concepts(result: dict, json_output: bool, markdown: bool, ndjson: bool = False) -> None:
     _error_exit(result)
-    if json_output:
+    if ndjson:
+        _ndjson(result.get("concepts", []))
+        return
+    if _wants_json(json_output, markdown, ndjson):
         _json(result)
         return
 
@@ -437,13 +625,19 @@ def _output_concepts(result: dict, json_output: bool, markdown: bool) -> None:
 
 
 def _output_concept_facts(result: dict, json_output: bool, markdown: bool,
-                          deltas: bool = False) -> None:
+                          ndjson: bool = False, deltas: bool = False) -> None:
     _error_exit(result)
-    if json_output:
+    facts = _add_deltas(result.get("facts", [])) if deltas else result.get("facts", [])
+    if ndjson:
+        _ndjson(facts)
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        if deltas:
+            result = dict(result)
+            result["facts"] = facts
         _json(result)
         return
 
-    facts = _add_deltas(result.get("facts", [])) if deltas else result.get("facts", [])
     rows = []
     for fact in facts:
         row = [
@@ -491,9 +685,67 @@ def _output_concept_facts(result: dict, json_output: bool, markdown: bool,
     console.print(table)
 
 
-def _output_documents(result: dict, json_output: bool, markdown: bool) -> None:
+def _flatten_concept_batch(results: list[dict], deltas: bool = False) -> list[dict]:
+    rows = []
+    for result in results:
+        if "error" in result:
+            rows.append({"identifier": result.get("identifier", ""), "error": result.get("error", "")})
+            continue
+        facts = _add_deltas(result.get("facts", [])) if deltas else result.get("facts", [])
+        for fact in facts:
+            row = dict(fact)
+            row.update({
+                "identifier": result.get("identifier", ""),
+                "cik": result.get("cik", ""),
+                "name": result.get("name", ""),
+                "taxonomy": result.get("taxonomy", ""),
+                "tag": result.get("tag", ""),
+            })
+            rows.append(row)
+    return rows
+
+
+def _output_concept_batch(results: list[dict], json_output: bool, markdown: bool,
+                          ndjson: bool = False, deltas: bool = False) -> None:
+    if _batch_failed(results):
+        _error_exit(results[0])
+    rows = _flatten_concept_batch(results, deltas=deltas)
+    if ndjson:
+        _ndjson(rows)
+        return
+    payload = {"results": results}
+    if deltas:
+        payload["facts"] = rows
+    if _wants_json(json_output, markdown, ndjson):
+        _json(payload)
+        return
+
+    table_rows = [
+        [
+            row.get("identifier", ""),
+            row.get("name", ""),
+            row.get("tag", ""),
+            row.get("filed", ""),
+            _format_period(row),
+            row.get("frame", ""),
+            _format_value(row.get("val", ""), row.get("unit", "")),
+            row.get("error", ""),
+        ]
+        for row in rows
+    ]
+    headers = ["Identifier", "Company", "Tag", "Filed", "Period", "Frame", "Value", "Error"]
+    if markdown:
+        click.echo(_markdown_table(headers, table_rows))
+        return
+    console.print(_simple_table("Concept Batch", headers, table_rows))
+
+
+def _output_documents(result: dict, json_output: bool, markdown: bool, ndjson: bool = False) -> None:
     _error_exit(result)
-    if json_output:
+    if ndjson:
+        _ndjson(result.get("documents", []))
+        return
+    if _wants_json(json_output, markdown, ndjson):
         _json(result)
         return
 
@@ -521,9 +773,12 @@ def _output_documents(result: dict, json_output: bool, markdown: bool) -> None:
     console.print(table)
 
 
-def _output_earnings(result: dict, json_output: bool, markdown: bool) -> None:
+def _output_earnings(result: dict, json_output: bool, markdown: bool, ndjson: bool = False) -> None:
     _error_exit(result)
-    if json_output:
+    if ndjson:
+        _ndjson(result.get("highlights", []))
+        return
+    if _wants_json(json_output, markdown, ndjson):
         _json(result)
         return
 
@@ -559,9 +814,12 @@ def _output_earnings(result: dict, json_output: bool, markdown: bool) -> None:
         console.print(f"- {item.get('text', '')}")
 
 
-def _output_events(result: dict, json_output: bool, markdown: bool) -> None:
+def _output_events(result: dict, json_output: bool, markdown: bool, ndjson: bool = False) -> None:
     _error_exit(result)
-    if json_output:
+    if ndjson:
+        _ndjson(result.get("events", []))
+        return
+    if _wants_json(json_output, markdown, ndjson):
         _json(result)
         return
 
@@ -590,9 +848,19 @@ def _output_events(result: dict, json_output: bool, markdown: bool) -> None:
     console.print(table)
 
 
-def _output_compare(result: dict, json_output: bool, markdown: bool) -> None:
+def _output_compare(result: dict, json_output: bool, markdown: bool, ndjson: bool = False) -> None:
     _error_exit(result)
-    if json_output:
+    if ndjson:
+        rows = []
+        for company in result.get("companies", []):
+            for fact in company.get("facts", []):
+                item = dict(fact)
+                item["identifier"] = company.get("identifier", "")
+                item["company"] = company.get("name", "")
+                rows.append(item)
+        _ndjson(rows)
+        return
+    if _wants_json(json_output, markdown, ndjson):
         _json(result)
         return
 
@@ -630,14 +898,8 @@ def _output_compare(result: dict, json_output: bool, markdown: bool) -> None:
     console.print(table)
 
 
-def _output_brief(result: dict, json_output: bool, markdown: bool) -> None:
-    _error_exit(result)
-    if json_output:
-        _json(result)
-        return
-
-    profile = result.get("profile", {})
-    metric_rows = [
+def _metric_rows(result: dict) -> list[list]:
+    return [
         [
             metric.get("metric", ""),
             metric.get("tag", ""),
@@ -647,6 +909,87 @@ def _output_brief(result: dict, json_output: bool, markdown: bool) -> None:
         ]
         for metric in result.get("metrics", [])
     ]
+
+
+def _output_metrics(result: dict, json_output: bool, markdown: bool, ndjson: bool = False) -> None:
+    _error_exit(result)
+    if ndjson:
+        _ndjson(result.get("metrics", []))
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+
+    rows = _metric_rows(result)
+    if markdown:
+        click.echo(f"## Metrics: {result.get('name', '')}\n")
+        click.echo(_markdown_table(["Metric", "Tag", "Period", "Value", "Freshness"], rows))
+        return
+
+    console.print(_simple_table(f"Metrics: {result.get('name', '')}", ["Metric", "Tag", "Period", "Value", "Freshness"], rows))
+
+
+def _flatten_metrics_batch(results: list[dict]) -> list[dict]:
+    rows = []
+    for result in results:
+        if "error" in result:
+            rows.append({"identifier": result.get("identifier", ""), "error": result.get("error", "")})
+            continue
+        for metric in result.get("metrics", []):
+            row = dict(metric)
+            row.update({
+                "identifier": result.get("identifier", ""),
+                "cik": result.get("cik", ""),
+                "ticker": result.get("ticker", ""),
+                "name": result.get("name", ""),
+                "reference_date": result.get("reference_date", ""),
+            })
+            rows.append(row)
+    return rows
+
+
+def _output_metrics_batch(results: list[dict], json_output: bool, markdown: bool, ndjson: bool = False) -> None:
+    if _batch_failed(results):
+        _error_exit(results[0])
+    rows = _flatten_metrics_batch(results)
+    if ndjson:
+        _ndjson(rows)
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json({"results": results})
+        return
+
+    table_rows = [
+        [
+            row.get("identifier", ""),
+            row.get("name", ""),
+            row.get("metric", ""),
+            row.get("tag", ""),
+            _format_period(row.get("fact", {})),
+            _format_value(row.get("fact", {}).get("val", ""), row.get("unit", "")),
+            _format_freshness(row),
+            row.get("error", ""),
+        ]
+        for row in rows
+    ]
+    headers = ["Identifier", "Company", "Metric", "Tag", "Period", "Value", "Freshness", "Error"]
+    if markdown:
+        click.echo(_markdown_table(headers, table_rows))
+        return
+    console.print(_simple_table("Metrics Batch", headers, table_rows))
+
+
+def _output_brief(result: dict, json_output: bool, markdown: bool, ndjson: bool = False) -> None:
+    _error_exit(result)
+    if ndjson:
+        _ndjson(result.get("metrics", []))
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+
+    profile = result.get("profile", {})
+    metric_rows = _metric_rows(result)
     event_rows = [
         [
             event.get("filingDate", ""),
@@ -662,7 +1005,7 @@ def _output_brief(result: dict, json_output: bool, markdown: bool) -> None:
             ", ".join(profile.get("exchanges", [])), profile.get("sicDescription", ""),
         ]]))
         click.echo("\n### Latest Filings\n")
-        _output_filings(profile, "Latest Filings", False, True)
+        _output_filings(profile, "Latest Filings", False, True, False)
         earnings = result.get("earnings") or {}
         if earnings:
             filing = earnings.get("filing", {})
@@ -678,7 +1021,7 @@ def _output_brief(result: dict, json_output: bool, markdown: bool) -> None:
         click.echo(_markdown_table(["Filed", "Events", "Accession"], event_rows))
         return
 
-    _output_company(profile, False, False)
+    _output_company(profile, False, False, False)
     earnings = result.get("earnings") or {}
     if earnings:
         filing = earnings.get("filing", {})
@@ -694,6 +1037,44 @@ def _output_brief(result: dict, json_output: bool, markdown: bool) -> None:
     console.print(_simple_table("Key Metrics", ["Metric", "Tag", "Period", "Value", "Freshness"], metric_rows))
     if event_rows:
         console.print(_simple_table("Recent Events", ["Filed", "Events", "Accession"], event_rows))
+
+
+def _brief_summary_rows(results: list[dict]) -> list[list]:
+    rows = []
+    for result in results:
+        if "error" in result:
+            rows.append([result.get("identifier", ""), "", "", "", "", result.get("error", "")])
+            continue
+        profile = result.get("profile", {})
+        latest_filing = (profile.get("filings") or [{}])[0]
+        revenue = next((metric for metric in result.get("metrics", []) if metric.get("metric") == "revenue"), {})
+        rows.append([
+            result.get("identifier", ""),
+            profile.get("name", ""),
+            profile.get("cik", ""),
+            latest_filing.get("filingDate", ""),
+            _format_value(revenue.get("fact", {}).get("val", ""), revenue.get("unit", "")),
+            "",
+        ])
+    return rows
+
+
+def _output_brief_batch(results: list[dict], json_output: bool, markdown: bool, ndjson: bool = False) -> None:
+    if _batch_failed(results):
+        _error_exit(results[0])
+    if ndjson:
+        _ndjson(results)
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json({"results": results})
+        return
+
+    rows = _brief_summary_rows(results)
+    headers = ["Identifier", "Company", "CIK", "Latest Filing", "Revenue", "Error"]
+    if markdown:
+        click.echo(_markdown_table(headers, rows))
+        return
+    console.print(_simple_table("Brief Batch", headers, rows))
 
 
 def _simple_table(title: str, headers: list[str], rows: list[list]) -> Table:
@@ -839,9 +1220,12 @@ def _format_period(fact: dict) -> str:
     return end or start
 
 
-def _output_frame(result: dict, json_output: bool, markdown: bool) -> None:
+def _output_frame(result: dict, json_output: bool, markdown: bool, ndjson: bool = False) -> None:
     _error_exit(result)
-    if json_output:
+    if ndjson:
+        _ndjson(result.get("facts", []))
+        return
+    if _wants_json(json_output, markdown, ndjson):
         _json(result)
         return
 

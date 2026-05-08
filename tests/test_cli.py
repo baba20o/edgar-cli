@@ -1,5 +1,8 @@
+import json
+
 from click.testing import CliRunner
 
+from edgar.api import BULK_ARCHIVES
 from edgar.cli import _add_deltas, _download_documents, _format_delta, _format_value, main
 
 
@@ -17,6 +20,89 @@ def test_help_lists_core_commands():
     assert "brief" in result.output
     assert "earnings" in result.output
     assert "events" in result.output
+    assert "metrics" in result.output
+
+
+def test_bulk_urls_defaults_to_json_when_stdout_is_not_tty():
+    result = CliRunner().invoke(main, ["bulk-urls"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["archives"][0]["name"] == BULK_ARCHIVES[0]["name"]
+
+
+def test_bulk_urls_ndjson_streams_rows():
+    result = CliRunner().invoke(main, ["bulk-urls", "--ndjson"])
+
+    assert result.exit_code == 0
+    rows = [json.loads(line) for line in result.output.splitlines()]
+    assert len(rows) == len(BULK_ARCHIVES)
+    assert rows[0]["url"].startswith("https://www.sec.gov/")
+
+
+def test_validation_errors_use_stable_exit_code():
+    result = CliRunner().invoke(
+        main,
+        ["exhibits", "0001045810-26-000019", "--cik", "abc; rm -rf /tmp/x"],
+    )
+
+    assert result.exit_code == 5
+    assert "Not a CIK" in result.output
+
+
+def test_click_usage_errors_use_stable_validation_exit_code():
+    result = CliRunner().invoke(main, ["concept", "AAPL", "revenue", "--annual", "--quarterly"])
+
+    assert result.exit_code == 5
+    assert "Choose only one period filter" in result.output
+
+
+def test_metrics_accepts_ticker_batch(monkeypatch):
+    class FakeClient:
+        def metrics(self, identifier, labels):
+            return {
+                "identifier": identifier,
+                "cik": identifier,
+                "ticker": identifier,
+                "name": f"{identifier} Inc.",
+                "metrics": [{"metric": labels[0], "tag": "Revenues", "fact": {"val": 123}, "unit": "USD"}],
+            }
+
+    monkeypatch.setattr("edgar.cli.get_client", lambda use_cache=True: FakeClient())
+
+    result = CliRunner().invoke(
+        main,
+        ["metrics", "--tickers", "AAPL,MSFT", "--bundle", "revenue", "--json-output"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert [item["identifier"] for item in payload["results"]] == ["AAPL", "MSFT"]
+
+
+def test_concept_accepts_input_file_batch(monkeypatch, tmp_path):
+    input_file = tmp_path / "tickers.txt"
+    input_file.write_text("AAPL\nMSFT\n")
+
+    class FakeClient:
+        def company_concept_alias(self, identifier, concept, unit=None, limit=20, period_type=None):
+            return {
+                "identifier": identifier,
+                "cik": identifier,
+                "name": f"{identifier} Inc.",
+                "taxonomy": "us-gaap",
+                "tag": concept,
+                "facts": [{"val": 123, "unit": "USD", "filed": "2026-01-01"}],
+            }
+
+    monkeypatch.setattr("edgar.cli.get_client", lambda use_cache=True: FakeClient())
+
+    result = CliRunner().invoke(main, ["concept", "--input", str(input_file), "revenue", "--ndjson"])
+
+    assert result.exit_code == 0
+    rows = [json.loads(line) for line in result.output.splitlines()]
+    assert [row["identifier"] for row in rows] == ["AAPL", "MSFT"]
+    assert all(row["tag"] == "revenue" for row in rows)
 
 
 def test_format_value_abbreviates_money_and_shares():

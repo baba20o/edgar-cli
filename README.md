@@ -3,7 +3,7 @@
 A command-line tool for the SEC EDGAR public data APIs.
 
 Built for research agents and human analysts with rich terminal output, markdown
-tables, and raw JSON.
+tables, raw JSON, and streaming NDJSON.
 
 ## Install
 
@@ -62,8 +62,15 @@ edgar facts MSFT --limit 100 --json-output
 edgar concept AAPL revenue
 edgar concept AAPL us-gaap Assets --unit USD
 edgar concept MSFT us-gaap Revenues --limit 12 --markdown
+edgar concept NVDA revenue --annual --limit 5 --json-output
 edgar concept AAPL us-gaap RevenueFromContractWithCustomerExcludingAssessedTax --deltas
+edgar concept --tickers AAPL,MSFT,GOOGL revenue --quarterly --ndjson
+edgar concept --input tickers.txt revenue --annual --json-output
 ```
+
+Friendly aliases such as `revenue`, `net_income`, and `cash` try fallback tags
+so migrated XBRL concepts prefer fresh facts. Use `--annual`, `--quarterly`,
+`--ytd`, or `--instant` to keep period math and downstream modeling clean.
 
 ### `frame` - Cross-company XBRL frame
 
@@ -109,17 +116,30 @@ Common aliases include `revenue`, `net_income`, `operating_income`, `cash`,
 ```bash
 edgar compare AAPL MSFT GOOGL --concept revenue --periods 4
 edgar compare AAPL MSFT --concept Assets --unit USD --markdown
+edgar compare AAPL MSFT GOOGL --concept revenue --quarterly --periods 8 --json-output
 ```
 
 Friendly aliases try issuer-specific fallback tags and align on shared period
 frames, so companies that migrated XBRL tags can still be compared without
 mixing years or period types.
 
+### `metrics` - Bundled canonical metrics
+
+```bash
+edgar metrics NVDA
+edgar metrics AAPL --bundle revenue,net_income,cash,debt,shares --ndjson
+edgar metrics --tickers AAPL,MSFT,GOOGL --bundle revenue,net_income,cash --json-output
+```
+
+`metrics` returns several common facts in one CLI invocation and includes the
+source XBRL tag plus freshness metadata for each metric.
+
 ### `brief` - Compact company brief
 
 ```bash
 edgar brief AAPL
 edgar brief AGL --markdown
+cat tickers.txt | edgar brief --batch --ndjson
 ```
 
 Brief metrics use fallback tags for common concepts and include a freshness
@@ -143,14 +163,34 @@ Most data commands support three output modes:
 
 | Flag | Format | Use case |
 |------|--------|----------|
-| default | Rich terminal tables/panels | Human terminal use |
+| default on a TTY | Rich terminal tables/panels | Human terminal use |
+| default when piped | Raw JSON | Programmatic pipelines |
 | `--markdown` / `-m` | Markdown output | Agent parsing and reports |
 | `--json-output` / `-j` | Raw JSON | Programmatic pipelines |
+| `--ndjson` | Newline-delimited JSON rows | Streaming, `head`, `jq`, and long results |
 
 Human table output abbreviates numeric values, hides long filing URLs by
-default, and keeps raw values in `--json-output`. Use `--show-urls` on filing
-commands when you want filing index URLs in the table. For agent-to-agent work
-or narrow terminals, prefer `--markdown`; it avoids rich-table truncation.
+default, and keeps raw values in JSON. Use `--show-urls` on filing commands
+when you want filing index URLs in the table. For agent-to-agent work or narrow
+terminals, prefer JSON/NDJSON or `--markdown`; they avoid rich-table truncation.
+
+Concept and frame fact rows include provenance and normalized period metadata in
+JSON/NDJSON: `source_url`, `accession`, `filed`, `as_of`, `period_type`,
+`period_length_days`, `fiscal_period`, `calendar_period`, `is_restated`,
+`is_cumulative`, and `superseded_by`.
+
+Agent fan-out is available on the core research commands: `concept`, `metrics`,
+and `brief` accept `--tickers`, `--input FILE`, and `--batch` stdin.
+
+Stable exit codes are reserved for agent branching:
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success |
+| 2 | No data found |
+| 3 | Rate-limited |
+| 4 | SEC outage, blocked request, or unavailable service |
+| 5 | Validation error |
 
 ## API Scope
 
