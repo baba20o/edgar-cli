@@ -166,10 +166,14 @@ def resolve_concept_alias(concept: str, taxonomy: Optional[str] = None,
     return concept_alias_candidates(concept, taxonomy, unit)[0]
 
 
+def concept_alias_key(concept: str) -> str:
+    return concept.strip().lower().replace("-", "_").replace(" ", "_")
+
+
 def concept_alias_candidates(concept: str, taxonomy: Optional[str] = None,
                              unit: Optional[str] = None) -> list[tuple[str, str, Optional[str]]]:
     """Return candidate taxonomy/tag/unit triples for a concept alias or exact tag."""
-    key = concept.strip().lower().replace("-", "_").replace(" ", "_")
+    key = concept_alias_key(concept)
     candidates = COMMON_CONCEPT_CANDIDATES.get(key)
     if not candidates:
         return [(taxonomy or "us-gaap", concept, unit)]
@@ -464,7 +468,7 @@ class EdgarClient(BaseAPIClient):
                               unit: Optional[str] = None, limit: int = 20,
                               period_type: Optional[str] = None) -> dict:
         """Return facts for a friendly concept alias, choosing the freshest candidate tag."""
-        key = concept.strip().lower().replace("-", "_").replace(" ", "_")
+        key = concept_alias_key(concept)
         candidates = concept_alias_candidates(concept, unit=unit)
         if key not in COMMON_CONCEPT_CANDIDATES:
             taxonomy, tag, resolved_unit = candidates[0]
@@ -759,6 +763,13 @@ class EdgarClient(BaseAPIClient):
         reference_date = latest_filing_date(profile)
         metrics = []
         for label in bundle or DEFAULT_METRIC_BUNDLE:
+            if concept_alias_key(label) not in COMMON_CONCEPT_CANDIDATES:
+                metrics.append({
+                    "metric": label,
+                    "error": f"Unknown metric alias '{label}'",
+                    "known_aliases": sorted(COMMON_CONCEPT_CANDIDATES),
+                })
+                continue
             metric = self._best_metric(label, profile["cik"], reference_date)
             if metric:
                 metrics.append(metric)

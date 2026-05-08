@@ -132,7 +132,10 @@ edgar metrics --tickers AAPL,MSFT,GOOGL --bundle revenue,net_income,cash --json-
 ```
 
 `metrics` returns several common facts in one CLI invocation and includes the
-source XBRL tag plus freshness metadata for each metric.
+source XBRL tag plus freshness metadata for each metric. Metric bundles accept
+known aliases such as `revenue`, `net_income`, `operating_income`,
+`operating_cash_flow`, `cash`, `debt`, and `shares`; unknown aliases are
+reported explicitly in the result instead of being treated as SEC tags.
 
 ### `brief` - Compact company brief
 
@@ -180,7 +183,10 @@ JSON/NDJSON: `source_url`, `accession`, `filed`, `as_of`, `period_type`,
 `is_cumulative`, and `superseded_by`.
 
 Agent fan-out is available on the core research commands: `concept`, `metrics`,
-and `brief` accept `--tickers`, `--input FILE`, and `--batch` stdin.
+and `brief` accept `--tickers`, `--input FILE`, and `--batch` stdin. If you pass
+both a positional identifier and `--tickers`, the positional identifier is kept
+first and the ticker list is appended, which is useful for primary-vs-peer
+queries.
 
 Stable exit codes are reserved for agent branching:
 

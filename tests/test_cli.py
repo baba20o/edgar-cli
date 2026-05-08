@@ -50,6 +50,19 @@ def test_validation_errors_use_stable_exit_code():
     assert "Not a CIK" in result.output
 
 
+def test_unknown_company_uses_no_data_exit_code(monkeypatch):
+    class FakeClient:
+        def submissions(self, *args, **kwargs):
+            return {"error": "No company found for FAKETICKER"}
+
+    monkeypatch.setattr("edgar.cli.get_client", lambda use_cache=True: FakeClient())
+
+    result = CliRunner().invoke(main, ["company", "FAKETICKER"])
+
+    assert result.exit_code == 2
+    assert "No company found" in result.output
+
+
 def test_click_usage_errors_use_stable_validation_exit_code():
     result = CliRunner().invoke(main, ["concept", "AAPL", "revenue", "--annual", "--quarterly"])
 

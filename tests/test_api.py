@@ -507,6 +507,28 @@ def test_best_metric_prefers_fresher_revenue_fallback_tag():
     assert metric["stale"] is False
 
 
+def test_metrics_reports_unknown_alias_without_sec_lookup():
+    client = EdgarClient(cache=None, rate_limiter=None, use_cache=False)
+    client.submissions = lambda identifier, **kwargs: {
+        "cik": "0001045810",
+        "ticker": "NVDA",
+        "name": "NVIDIA CORP",
+        "filings": [{"filingDate": "2026-02-25"}],
+    }
+
+    def fail_company_concept(*args, **kwargs):
+        raise AssertionError("unknown metric aliases should not hit SEC concept endpoints")
+
+    client.company_concept = fail_company_concept
+
+    result = client.metrics("NVDA", ["fakemetric"])
+
+    metric = result["metrics"][0]
+    assert metric["metric"] == "fakemetric"
+    assert metric["error"] == "Unknown metric alias 'fakemetric'"
+    assert "revenue" in metric["known_aliases"]
+
+
 def test_company_concept_alias_prefers_fresher_candidate_tag():
     client = EdgarClient(cache=None, rate_limiter=None, use_cache=False)
 

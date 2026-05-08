@@ -17,6 +17,8 @@ misleading-output fixes before convenience features.
 - [x] Add normalized period metadata to concept/frame facts.
 - [x] Add provenance to concept/frame facts: `source_url`, `accession`, `filed`, and `as_of`.
 - [x] Use stable agent-friendly exit codes for no-data, rate-limit, outage, and validation failures.
+- [x] Map unknown ticker/company resolution failures to the no-data exit code.
+- [x] Report unknown `metrics --bundle` aliases explicitly without wasting a SEC concept lookup.
 
 ## Output UX
 

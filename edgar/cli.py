@@ -55,6 +55,7 @@ def _exit_code_for_error(error: str) -> int:
         return 3
     if (
         "no matching" in text
+        or "no company found" in text
         or "no recent" in text
         or "no facts" in text
         or "404" in text
