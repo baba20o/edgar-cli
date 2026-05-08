@@ -36,6 +36,7 @@ edgar search-companies NVDA --json-output
 edgar company AAPL
 edgar company 0000320193 --limit 5
 edgar company MSFT --form 10-K --markdown
+edgar company AAPL --form 10-K --start-date 2024-01-01 --end-date 2024-12-31
 ```
 
 ### `filings` - Recent filings
@@ -43,6 +44,7 @@ edgar company MSFT --form 10-K --markdown
 ```bash
 edgar filings TSLA --limit 20
 edgar filings GOOGL --form 8-K
+edgar filings NVDA --form S-1 --start-date 2020-01-01 --show-urls
 ```
 
 ### `facts` - Available XBRL concepts for one company
@@ -88,6 +90,10 @@ Most data commands support three output modes:
 | `--markdown` / `-m` | Markdown output | Agent parsing and reports |
 | `--json-output` / `-j` | Raw JSON | Programmatic pipelines |
 
+Human table output abbreviates numeric values, hides long filing URLs by
+default, and keeps raw values in `--json-output`. Use `--show-urls` on filing
+commands when you want filing index URLs in the table.
+
 ## API Scope
 
 This first version targets the keyless public-data endpoints:
@@ -117,6 +123,9 @@ python -m edgar --help
   CLI uses a shared local limiter of 5 requests per second.
 - Responses are cached in `~/.edgar_cache` for 15 minutes. Use `--no-cache`
   when freshness matters.
+- Filing commands currently search SEC's recent filing set. If older historical
+  chunks exist, the CLI warns instead of silently implying full-history coverage.
+  Full `--all` history fetching is tracked in `docs/BACKLOG.md`.
 
 ## License
 

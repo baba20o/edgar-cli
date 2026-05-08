@@ -65,6 +65,11 @@ def is_cik_like(value: str | int) -> bool:
         return False
 
 
+def quote_path_segment(value: str | int) -> str:
+    """Quote one URL path segment without allowing slashes through."""
+    return quote(str(value), safe="")
+
+
 def filing_urls(cik: str | int, accession_number: str, primary_document: str = "") -> dict:
     """Build SEC filing detail and primary document URLs."""
     cik10 = normalize_cik(cik)
@@ -128,6 +133,9 @@ class EdgarClient(BaseAPIClient):
 
     def search_companies(self, query: str, limit: int = 20) -> dict:
         """Search SEC's ticker/CIK/company-name map."""
+        if not str(query).strip():
+            return {"error": "Company search query cannot be blank", "companies": [], "total": 0}
+
         result = self.companies()
         if "error" in result:
             return result
@@ -158,6 +166,9 @@ class EdgarClient(BaseAPIClient):
 
     def resolve_company(self, identifier: str | int) -> dict:
         """Resolve a CIK, ticker, or unambiguous company-name search to a CIK."""
+        if not str(identifier).strip():
+            return {"error": "Company identifier cannot be blank"}
+
         if is_cik_like(identifier):
             cik = normalize_cik(identifier)
             return {"cik": cik, "ticker": "", "name": "", "exchange": ""}
@@ -179,7 +190,8 @@ class EdgarClient(BaseAPIClient):
         choices = ", ".join(f"{c['ticker']} ({c['cik']})" for c in companies[:5])
         return {"error": f"Ambiguous company identifier {identifier}; matches: {choices}"}
 
-    def submissions(self, identifier: str | int, limit: int = 20, form: Optional[str] = None) -> dict:
+    def submissions(self, identifier: str | int, limit: int = 20, form: Optional[str] = None,
+                    start_date: Optional[str] = None, end_date: Optional[str] = None) -> dict:
         """Return company submission metadata and recent filings."""
         company = self.resolve_company(identifier)
         if "error" in company:
@@ -190,7 +202,22 @@ class EdgarClient(BaseAPIClient):
         if "error" in result:
             return result
 
-        filings = self._recent_filings(result, limit=limit, form=form)
+        files = result.get("filings", {}).get("files", [])
+        filings = self._recent_filings(
+            result,
+            limit=limit,
+            form=form,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        warning = ""
+        if not filings and (form or start_date or end_date):
+            warning = "No matching filings found in the recent filing set."
+            if files:
+                warning += " Older filings may exist in historical chunks; full-history fetch is tracked for --all."
+        elif files:
+            warning = "Only the SEC recent filing set is searched; older historical chunks exist."
+
         return {
             "cik": cik,
             "ticker": company.get("ticker", ""),
@@ -203,7 +230,9 @@ class EdgarClient(BaseAPIClient):
             "fiscalYearEnd": result.get("fiscalYearEnd", ""),
             "filings": filings,
             "total_recent": len(filings),
-            "files": result.get("filings", {}).get("files", []),
+            "files": files,
+            "history_limited": bool(files),
+            "warning": warning,
         }
 
     def company_facts(self, identifier: str | int, taxonomy: Optional[str] = None,
@@ -232,7 +261,10 @@ class EdgarClient(BaseAPIClient):
         if "error" in company:
             return company
 
-        path = f"/api/xbrl/companyconcept/CIK{company['cik']}/{quote(taxonomy)}/{quote(tag)}.json"
+        path = (
+            f"/api/xbrl/companyconcept/CIK{company['cik']}/"
+            f"{quote_path_segment(taxonomy)}/{quote_path_segment(tag)}.json"
+        )
         result = self._get(path)
         if "error" in result:
             return result
@@ -263,8 +295,8 @@ class EdgarClient(BaseAPIClient):
               limit: int = 25, sort_by: str = "value") -> dict:
         """Return a cross-company XBRL frame."""
         path = (
-            f"/api/xbrl/frames/{quote(taxonomy)}/{quote(tag)}/"
-            f"{quote(unit, safe='-')}/{quote(frame)}.json"
+            f"/api/xbrl/frames/{quote_path_segment(taxonomy)}/{quote_path_segment(tag)}/"
+            f"{quote_path_segment(unit)}/{quote_path_segment(frame)}.json"
         )
         result = self._get(path)
         if "error" in result:
@@ -294,7 +326,9 @@ class EdgarClient(BaseAPIClient):
         }
 
     @staticmethod
-    def _recent_filings(data: dict, limit: int = 20, form: Optional[str] = None) -> list[dict]:
+    def _recent_filings(data: dict, limit: int = 20, form: Optional[str] = None,
+                        start_date: Optional[str] = None,
+                        end_date: Optional[str] = None) -> list[dict]:
         recent = data.get("filings", {}).get("recent", {})
         accessions = recent.get("accessionNumber", [])
         cik = normalize_cik(data.get("cik", "0"))
@@ -304,6 +338,11 @@ class EdgarClient(BaseAPIClient):
         for index, accession in enumerate(accessions):
             row = {key: values[index] for key, values in recent.items() if index < len(values)}
             if wanted_form and row.get("form", "").upper() != wanted_form:
+                continue
+            filing_date = row.get("filingDate", "")
+            if start_date and filing_date < start_date:
+                continue
+            if end_date and filing_date > end_date:
                 continue
             row.update(filing_urls(cik, accession, row.get("primaryDocument", "")))
             rows.append(row)

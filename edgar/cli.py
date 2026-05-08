@@ -79,28 +79,34 @@ def search_companies(ctx, query, limit, json_output, markdown):
 @click.argument("identifier")
 @click.option("--limit", "-n", default=10, show_default=True, help="Recent filings to show")
 @click.option("--form", "form_type", default=None, help="Only show a form type, e.g. 10-K")
+@click.option("--start-date", default=None, help="Only filings on/after YYYY-MM-DD")
+@click.option("--end-date", default=None, help="Only filings on/before YYYY-MM-DD")
+@click.option("--show-urls", is_flag=True, help="Show filing URLs in table output")
 @output_options
 @click.pass_context
-def company(ctx, identifier, limit, form_type, json_output, markdown):
+def company(ctx, identifier, limit, form_type, start_date, end_date, show_urls, json_output, markdown):
     """Show company profile and recent filings for a ticker or CIK."""
     result = get_client(use_cache=not ctx.obj["no_cache"]).submissions(
-        identifier, limit=limit, form=form_type,
+        identifier, limit=limit, form=form_type, start_date=start_date, end_date=end_date,
     )
-    _output_company(result, json_output, markdown)
+    _output_company(result, json_output, markdown, show_urls=show_urls)
 
 
 @main.command()
 @click.argument("identifier")
 @click.option("--limit", "-n", default=20, show_default=True, help="Recent filings to show")
 @click.option("--form", "form_type", default=None, help="Only show a form type, e.g. 8-K")
+@click.option("--start-date", default=None, help="Only filings on/after YYYY-MM-DD")
+@click.option("--end-date", default=None, help="Only filings on/before YYYY-MM-DD")
+@click.option("--show-urls", is_flag=True, help="Show filing URLs in table output")
 @output_options
 @click.pass_context
-def filings(ctx, identifier, limit, form_type, json_output, markdown):
+def filings(ctx, identifier, limit, form_type, start_date, end_date, show_urls, json_output, markdown):
     """Show recent filings for a ticker or CIK."""
     result = get_client(use_cache=not ctx.obj["no_cache"]).submissions(
-        identifier, limit=limit, form=form_type,
+        identifier, limit=limit, form=form_type, start_date=start_date, end_date=end_date,
     )
-    _output_filings(result, f"Recent Filings: {identifier}", json_output, markdown)
+    _output_filings(result, f"Recent Filings: {identifier}", json_output, markdown, show_urls=show_urls)
 
 
 @main.command()
@@ -206,7 +212,7 @@ def _output_companies(result: dict, json_output: bool, markdown: bool) -> None:
     console.print(table)
 
 
-def _output_company(result: dict, json_output: bool, markdown: bool) -> None:
+def _output_company(result: dict, json_output: bool, markdown: bool, show_urls: bool = False) -> None:
     _error_exit(result)
     if json_output:
         _json(result)
@@ -225,7 +231,7 @@ def _output_company(result: dict, json_output: bool, markdown: bool) -> None:
             ]],
         ))
         click.echo()
-        _output_filings(result, "Recent Filings", False, True)
+        _output_filings(result, "Recent Filings", False, True, show_urls=show_urls)
         return
 
     body = "\n".join([
@@ -236,10 +242,11 @@ def _output_company(result: dict, json_output: bool, markdown: bool) -> None:
         f"Fiscal year end: {result.get('fiscalYearEnd', '')}",
     ])
     console.print(Panel(body, title=result.get("name", ""), expand=False))
-    _output_filings(result, "Recent Filings", False, False)
+    _output_filings(result, "Recent Filings", False, False, show_urls=show_urls)
 
 
-def _output_filings(result: dict, title: str, json_output: bool, markdown: bool) -> None:
+def _output_filings(result: dict, title: str, json_output: bool, markdown: bool,
+                    show_urls: bool = False) -> None:
     _error_exit(result)
     if json_output:
         _json({"cik": result.get("cik"), "name": result.get("name"), "filings": result.get("filings", [])})
@@ -247,16 +254,27 @@ def _output_filings(result: dict, title: str, json_output: bool, markdown: bool)
 
     rows = []
     for filing in result.get("filings", []):
-        rows.append([
+        row = [
             filing.get("filingDate", ""),
             filing.get("form", ""),
             filing.get("accessionNumber", ""),
             _truncate(filing.get("primaryDocDescription", "") or filing.get("primaryDocument", ""), 52),
-            filing.get("filing_url", ""),
-        ])
+        ]
+        if show_urls:
+            row.append(filing.get("filing_url", ""))
+        rows.append(row)
+
+    headers = ["Filed", "Form", "Accession", "Description"]
+    if show_urls:
+        headers.append("URL")
 
     if markdown:
-        click.echo(_markdown_table(["Filed", "Form", "Accession", "Description", "URL"], rows))
+        if result.get("warning"):
+            click.echo(f"> {result['warning']}\n")
+        if not rows:
+            click.echo("_No matching filings found._")
+            return
+        click.echo(_markdown_table(headers, rows))
         return
 
     table = Table(title=title)
@@ -264,9 +282,14 @@ def _output_filings(result: dict, title: str, json_output: bool, markdown: bool)
     table.add_column("Form", style="cyan", no_wrap=True)
     table.add_column("Accession", style="magenta", no_wrap=True)
     table.add_column("Description")
-    table.add_column("URL")
+    if show_urls:
+        table.add_column("URL")
     for row in rows:
         table.add_row(*row)
+    if result.get("warning"):
+        table.caption = result["warning"]
+    if not rows:
+        table.add_row(*(["", "", "No matching filings found", ""] + ([""] if show_urls else [])))
     console.print(table)
 
 
@@ -293,14 +316,10 @@ def _output_concepts(result: dict, json_output: bool, markdown: bool) -> None:
         return
 
     table = Table(title=f"XBRL Concepts: {result.get('name', '')}")
-    table.add_column("Taxonomy", style="cyan", no_wrap=True)
-    table.add_column("Tag", style="magenta")
-    table.add_column("Label")
-    table.add_column("Units")
-    table.add_column("Facts", justify="right")
+    table.add_column("Tag", style="magenta", no_wrap=False, overflow="fold")
     table.add_column("Latest Filed", style="green", no_wrap=True)
     for row in rows:
-        table.add_row(*[str(cell) for cell in row])
+        table.add_row(str(row[1]), str(row[5]))
     table.caption = f"Showing {len(rows)} of {result.get('total', len(rows))} concepts"
     console.print(table)
 
@@ -315,30 +334,27 @@ def _output_concept_facts(result: dict, json_output: bool, markdown: bool) -> No
     for fact in result.get("facts", []):
         rows.append([
             fact.get("filed", ""),
-            fact.get("fy", ""),
-            fact.get("fp", ""),
+            _format_period(fact),
+            fact.get("frame", ""),
             fact.get("form", ""),
-            fact.get("unit", ""),
-            fact.get("val", ""),
+            _format_value(fact.get("val", ""), fact.get("unit", "")),
             fact.get("accn", ""),
         ])
 
     title = f"{result.get('taxonomy', '')}/{result.get('tag', '')}: {result.get('name', '')}"
     if markdown:
         click.echo(f"## {title}\n")
-        click.echo(_markdown_table(["Filed", "FY", "FP", "Form", "Unit", "Value", "Accession"], rows))
+        click.echo(_markdown_table(["Filed", "Period", "Frame", "Form", "Value", "Accession"], rows))
         return
 
     table = Table(title=title)
     table.add_column("Filed", style="green", no_wrap=True)
-    table.add_column("FY", no_wrap=True)
-    table.add_column("FP", no_wrap=True)
+    table.add_column("Period", no_wrap=True)
+    table.add_column("Frame", no_wrap=True)
     table.add_column("Form", style="cyan", no_wrap=True)
-    table.add_column("Unit", no_wrap=True)
-    table.add_column("Value", justify="right")
-    table.add_column("Accession", style="magenta", no_wrap=True)
+    table.add_column("Value", justify="right", no_wrap=True)
     for row in rows:
-        table.add_row(*[str(cell) for cell in row])
+        table.add_row(*[str(cell) for cell in row[:-1]])
     table.caption = result.get("label", "")
     console.print(table)
 
@@ -356,7 +372,7 @@ def _output_frame(result: dict, json_output: bool, markdown: bool) -> None:
             _truncate(fact.get("entityName", ""), 44),
             fact.get("loc", ""),
             fact.get("end", ""),
-            fact.get("val", ""),
+            _format_value(fact.get("val", ""), result.get("unit", "")),
             fact.get("accn", ""),
         ])
 
@@ -377,6 +393,46 @@ def _output_frame(result: dict, json_output: bool, markdown: bool) -> None:
         table.add_row(*[str(cell) for cell in row])
     table.caption = f"Showing {len(rows)} of {result.get('total', len(rows))} facts"
     console.print(table)
+
+
+def _format_value(value, unit: str = "") -> str:
+    if value in ("", None):
+        return ""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+    suffix = ""
+    display = number
+    abs_number = abs(number)
+    for threshold, label in [
+        (1_000_000_000_000, "T"),
+        (1_000_000_000, "B"),
+        (1_000_000, "M"),
+        (1_000, "K"),
+    ]:
+        if abs_number >= threshold:
+            display = number / threshold
+            suffix = label
+            break
+
+    text = f"{display:.2f}".rstrip("0").rstrip(".") + suffix
+    if unit == "USD":
+        return f"${text}"
+    if unit in {"USD/shares", "USD/share"}:
+        return f"${number:.2f}/share"
+    if unit == "shares":
+        return text
+    return text
+
+
+def _format_period(fact: dict) -> str:
+    start = fact.get("start", "")
+    end = fact.get("end", "")
+    if start and end:
+        return f"{start}..{end}"
+    return end or start
 
 
 if __name__ == "__main__":
