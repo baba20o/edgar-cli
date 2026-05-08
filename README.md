@@ -173,10 +173,11 @@ python -m edgar --help
   CLI uses a shared local limiter of 5 requests per second.
 - Responses are cached in `~/.edgar_cache` for 15 minutes. Use `--no-cache`
   when freshness matters.
-- Filing commands search SEC's recent filing set by default. If older
-  historical chunks exist, the CLI warns instead of silently implying
-  full-history coverage. Use `--all` to fetch historical chunks from
-  `filings.files[]` when researching older IPO-era forms.
+- Filing commands search SEC's recent filing set by default. The CLI warns when
+  a form/date query is likely to be limited by that recent set, such as a
+  filtered result hitting `--limit` or a date filter reaching the oldest recent
+  filing. Use `--all` to fetch historical chunks from `filings.files[]` when
+  researching older IPO-era forms.
 - `concept` suggests similar company-specific XBRL tags when SEC returns a 404,
   which helps with issuer-specific tags like revenue concepts.
 

@@ -195,6 +195,85 @@ def test_submissions_all_history_fetches_historical_chunks():
     ]
 
 
+def test_submissions_does_not_warn_only_because_history_chunks_exist():
+    client = EdgarClient(cache=None, rate_limiter=None, use_cache=False)
+    client.resolve_company = lambda identifier: {"cik": "0000320193", "name": "Apple Inc."}
+
+    def fake_get(path, params=None, skip_cache=False):
+        return {
+            "cik": "0000320193",
+            "name": "Apple Inc.",
+            "filings": {
+                "recent": {
+                    "accessionNumber": ["0000320193-26-000001"],
+                    "filingDate": ["2026-01-01"],
+                    "form": ["10-K"],
+                    "primaryDocument": ["aapl-20260101.htm"],
+                },
+                "files": [{"name": "CIK0000320193-submissions-001.json"}],
+            },
+        }
+
+    client._get = fake_get
+
+    result = client.submissions("AAPL", limit=10)
+
+    assert result["warning"] == ""
+
+
+def test_submissions_warns_when_filtered_recent_matches_hit_limit():
+    client = EdgarClient(cache=None, rate_limiter=None, use_cache=False)
+    client.resolve_company = lambda identifier: {"cik": "0000320193", "name": "Apple Inc."}
+
+    def fake_get(path, params=None, skip_cache=False):
+        return {
+            "cik": "0000320193",
+            "name": "Apple Inc.",
+            "filings": {
+                "recent": {
+                    "accessionNumber": ["0000320193-26-000002", "0000320193-26-000001"],
+                    "filingDate": ["2026-02-01", "2026-01-01"],
+                    "form": ["8-K", "8-K"],
+                    "primaryDocument": ["aapl-20260201.htm", "aapl-20260101.htm"],
+                },
+                "files": [{"name": "CIK0000320193-submissions-001.json"}],
+            },
+        }
+
+    client._get = fake_get
+
+    result = client.submissions("AAPL", form="8-K", limit=1)
+
+    assert len(result["filings"]) == 1
+    assert result["warning"].startswith("Showing the first 1 matching recent filings")
+
+
+def test_submissions_warns_when_date_filter_reaches_recent_boundary():
+    client = EdgarClient(cache=None, rate_limiter=None, use_cache=False)
+    client.resolve_company = lambda identifier: {"cik": "0000320193", "name": "Apple Inc."}
+
+    def fake_get(path, params=None, skip_cache=False):
+        return {
+            "cik": "0000320193",
+            "name": "Apple Inc.",
+            "filings": {
+                "recent": {
+                    "accessionNumber": ["0000320193-26-000001", "0000320193-25-000001"],
+                    "filingDate": ["2026-01-01", "2025-01-01"],
+                    "form": ["10-K", "10-K"],
+                    "primaryDocument": ["aapl-20260101.htm", "aapl-20250101.htm"],
+                },
+                "files": [{"name": "CIK0000320193-submissions-001.json"}],
+            },
+        }
+
+    client._get = fake_get
+
+    result = client.submissions("AAPL", start_date="2025-01-01", limit=10)
+
+    assert "oldest SEC recent filing (2025-01-01)" in result["warning"]
+
+
 def test_company_concept_404_includes_similar_tag_suggestions():
     client = EdgarClient(cache=None, rate_limiter=None, use_cache=False)
     client.resolve_company = lambda identifier: {"cik": "0000320193", "name": "Apple Inc."}

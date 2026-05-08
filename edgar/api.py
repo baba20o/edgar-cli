@@ -271,15 +271,17 @@ class EdgarClient(BaseAPIClient):
             return result
 
         files = result.get("filings", {}).get("files", [])
-        filings = self._recent_filings(
+        recent_matches = self._recent_filings(
             result,
-            limit=limit,
+            limit=limit + 1,
             form=form,
             start_date=start_date,
             end_date=end_date,
         )
+        recent_truncated = len(recent_matches) > limit
+        filings = recent_matches[:limit]
         files_checked = 0
-        if all_history and len(filings) < limit:
+        if all_history and not recent_truncated and len(filings) < limit:
             seen = {f.get("accessionNumber") for f in filings}
             for file_info in files:
                 chunk_name = file_info.get("name")
@@ -306,6 +308,15 @@ class EdgarClient(BaseAPIClient):
                 if len(filings) >= limit:
                     break
 
+        oldest_recent_date = self._oldest_recent_filing_date(result)
+        date_reaches_recent_boundary = bool(
+            oldest_recent_date
+            and (
+                (start_date and start_date <= oldest_recent_date)
+                or (end_date and end_date <= oldest_recent_date)
+            )
+        )
+        filtered_recent_truncated = recent_truncated and bool(form or start_date or end_date)
         warning = ""
         if not filings and (form or start_date or end_date):
             if files_checked:
@@ -314,8 +325,10 @@ class EdgarClient(BaseAPIClient):
                 warning = "No matching filings found in the recent filing set."
                 if files and not all_history:
                     warning += " Older filings may exist in historical chunks; rerun with --all to search them."
-        elif files and not all_history:
-            warning = "Only the SEC recent filing set is searched; older historical chunks exist."
+        elif files and not all_history and filtered_recent_truncated:
+            warning = f"Showing the first {limit} matching recent filings; older historical chunks may also match. Rerun with --all to search them."
+        elif files and not all_history and date_reaches_recent_boundary:
+            warning = f"Date filters reach the oldest SEC recent filing ({oldest_recent_date}); rerun with --all to search historical chunks."
         elif files_checked:
             warning = f"Searched recent filings plus {files_checked} historical chunk(s)."
 
@@ -659,6 +672,15 @@ class EdgarClient(BaseAPIClient):
                 break
 
         return rows
+
+    @staticmethod
+    def _oldest_recent_filing_date(data: dict) -> str:
+        dates = [
+            filing_date
+            for filing_date in data.get("filings", {}).get("recent", {}).get("filingDate", [])
+            if filing_date
+        ]
+        return min(dates) if dates else ""
 
     @staticmethod
     def _summarize_concepts(facts: dict, taxonomy: Optional[str],

@@ -422,14 +422,12 @@ def _output_concepts(result: dict, json_output: bool, markdown: bool) -> None:
         return
 
     table = Table(title=f"XBRL Concepts: {result.get('name', '')}")
-    table.add_column("Taxonomy", style="cyan", no_wrap=True)
-    table.add_column("Tag", style="magenta", no_wrap=True)
-    table.add_column("Label")
+    table.add_column("Tag", style="magenta", overflow="fold")
     table.add_column("Units", no_wrap=True)
     table.add_column("Facts", justify="right", no_wrap=True)
-    table.add_column("Latest Filed", style="green", no_wrap=True)
+    table.add_column("Filed", style="green", no_wrap=True)
     for row in rows:
-        table.add_row(*[str(cell) for cell in row])
+        table.add_row(str(row[1]), str(row[3]), str(row[4]), str(row[5]))
     table.caption = f"Showing {len(rows)} of {result.get('total', len(rows))} concepts"
     console.print(table)
 
