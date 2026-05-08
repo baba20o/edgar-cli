@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "edgar-cli"
+version = "0.1.0"
+description = "A CLI for SEC EDGAR public data APIs - submissions, company facts, concepts, and frames"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "baba20o", email = "baba200@greenmountaincomputing.com"}
+]
+keywords = ["sec", "edgar", "filings", "xbrl", "finance", "cli"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "click>=8.1",
+    "python-dotenv>=1.0",
+    "requests>=2.31",
+    "rich>=13.0",
+    "research-cli-base>=0.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/baba20o/edgar-cli"
+Repository = "https://github.com/baba20o/edgar-cli"
+Issues = "https://github.com/baba20o/edgar-cli/issues"
+
+[project.scripts]
+edgar = "edgar.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["edgar*"]
