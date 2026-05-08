@@ -10,6 +10,10 @@ misleading-output fixes before convenience features.
 - [x] Avoid silent empty filing tables when a form/date filter has no matches.
 - [x] Support full filing history by fetching historical chunks from `filings.files[]` with an explicit `--all` flag and progress warning.
 - [x] Suggest similar company XBRL tags when `concept` returns 404.
+- [x] Try fallback tags for common concept aliases so `brief` and `compare` do not silently show stale migrated-tag facts.
+- [x] Return CLI errors instead of tracebacks for invalid exhibit CIKs and failed download paths.
+- [x] Route exhibit downloads through the SEC-aware client user agent and shared rate limiter.
+- [x] Align compare output on shared frames and one period kind.
 
 ## Output UX
 
@@ -19,6 +23,9 @@ misleading-output fixes before convenience features.
 - [x] Hide filing URLs in default tables; keep them in JSON and expose with `--show-urls`.
 - [x] Add width-aware rich table layouts or make markdown the recommended agent mode in help text.
 - [x] Add YoY/QoQ deltas in concept output.
+- [x] Skip delta calculations across mismatched period lengths.
+- [x] Show event snippets in rich output.
+- [x] Add metric freshness to `brief`.
 
 ## Filing Workflow
 

@@ -1,6 +1,7 @@
 from edgar.api import (
     EdgarClient,
     FilingIndexParser,
+    concept_alias_candidates,
     event_types_from_items,
     extract_accession,
     extract_cik_from_url,
@@ -352,6 +353,169 @@ def test_filing_documents_resolves_sec_root_relative_links():
     assert result["documents"][0]["url"] == (
         "https://www.sec.gov/Archives/edgar/data/1831097/000162828026031254/agl-ex991.htm"
     )
+
+
+def test_filing_documents_rejects_invalid_cik_without_traceback():
+    client = EdgarClient(cache=None, rate_limiter=None, use_cache=False)
+
+    result = client.filing_documents_for_accession("0001045810-26-000019", cik="abc; rm -rf /tmp/x")
+
+    assert result["error"] == "Not a CIK: abc; rm -rf /tmp/x"
+    assert result["documents"] == []
+
+
+def test_concept_alias_candidates_include_revenue_fallbacks():
+    assert concept_alias_candidates("revenue")[:2] == [
+        ("us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax", "USD"),
+        ("us-gaap", "Revenues", "USD"),
+    ]
+
+
+def test_best_metric_prefers_fresher_revenue_fallback_tag():
+    client = EdgarClient(cache=None, rate_limiter=None, use_cache=False)
+
+    def fake_company_concept(identifier, taxonomy, tag, unit=None, limit=20, **kwargs):
+        if tag == "RevenueFromContractWithCustomerExcludingAssessedTax":
+            return {
+                "taxonomy": taxonomy,
+                "tag": tag,
+                "facts": [{
+                    "val": 100,
+                    "unit": unit,
+                    "start": "2021-01-01",
+                    "end": "2021-12-31",
+                    "filed": "2022-01-31",
+                    "frame": "CY2021",
+                }],
+            }
+        if tag == "Revenues":
+            return {
+                "taxonomy": taxonomy,
+                "tag": tag,
+                "facts": [{
+                    "val": 800,
+                    "unit": unit,
+                    "start": "2025-01-01",
+                    "end": "2025-12-31",
+                    "filed": "2026-01-31",
+                    "frame": "CY2025",
+                }],
+            }
+        return {"error": "404 Not Found"}
+
+    client.company_concept = fake_company_concept
+
+    metric = client._best_metric("revenue", "0001045810", "2026-02-15")
+
+    assert metric["tag"] == "Revenues"
+    assert metric["fact"]["val"] == 800
+    assert metric["stale"] is False
+
+
+def test_company_concept_alias_prefers_fresher_candidate_tag():
+    client = EdgarClient(cache=None, rate_limiter=None, use_cache=False)
+
+    def fake_company_concept(identifier, taxonomy, tag, unit=None, limit=20, **kwargs):
+        if tag == "RevenueFromContractWithCustomerExcludingAssessedTax":
+            return {
+                "taxonomy": taxonomy,
+                "tag": tag,
+                "facts": [{"val": 100, "end": "2021-12-31", "filed": "2022-01-31"}],
+            }
+        if tag == "Revenues":
+            return {
+                "taxonomy": taxonomy,
+                "tag": tag,
+                "facts": [{"val": 800, "end": "2025-12-31", "filed": "2026-01-31"}],
+            }
+        return {"error": "404 Not Found"}
+
+    client.company_concept = fake_company_concept
+
+    result = client.company_concept_alias("NVDA", "revenue")
+
+    assert result["tag"] == "Revenues"
+    assert result["alias"] == "revenue"
+
+
+def test_best_metric_flags_stale_metric():
+    client = EdgarClient(cache=None, rate_limiter=None, use_cache=False)
+
+    def fake_company_concept(identifier, taxonomy, tag, unit=None, limit=20, **kwargs):
+        if tag == "Assets":
+            return {
+                "taxonomy": taxonomy,
+                "tag": tag,
+                "facts": [{
+                    "val": 100,
+                    "unit": unit,
+                    "end": "2021-12-31",
+                    "filed": "2022-01-31",
+                    "frame": "CY2021Q4I",
+                }],
+            }
+        return {"error": "404 Not Found"}
+
+    client.company_concept = fake_company_concept
+
+    metric = client._best_metric("assets", "0001045810", "2026-02-15")
+
+    assert metric["stale"] is True
+    assert metric["age_days"] > 548
+
+
+def test_compare_alias_aligns_on_shared_frames_across_fallback_tags():
+    client = EdgarClient(cache=None, rate_limiter=None, use_cache=False)
+
+    def fake_company_concept(identifier, taxonomy, tag, unit=None, limit=20, **kwargs):
+        if identifier == "AAPL" and tag == "RevenueFromContractWithCustomerExcludingAssessedTax":
+            return {
+                "cik": "0000320193",
+                "name": "Apple Inc.",
+                "taxonomy": taxonomy,
+                "tag": tag,
+                "facts": [
+                    {"val": 10, "unit": unit, "start": "2026-01-01", "end": "2026-03-31", "filed": "2026-04-01", "frame": "CY2026Q1"},
+                    {"val": 40, "unit": unit, "start": "2025-01-01", "end": "2025-12-31", "filed": "2026-01-31", "frame": "CY2025"},
+                    {"val": 8, "unit": unit, "start": "2025-01-01", "end": "2025-03-31", "filed": "2025-04-01", "frame": "CY2025Q1"},
+                ],
+            }
+        if identifier == "GOOGL" and tag == "Revenues":
+            return {
+                "cik": "0001652044",
+                "name": "Alphabet Inc.",
+                "taxonomy": taxonomy,
+                "tag": tag,
+                "facts": [
+                    {"val": 9, "unit": unit, "start": "2026-01-01", "end": "2026-03-31", "filed": "2026-04-01", "frame": "CY2026Q1"},
+                    {"val": 35, "unit": unit, "start": "2025-01-01", "end": "2025-12-31", "filed": "2026-01-31", "frame": "CY2025"},
+                    {"val": 7, "unit": unit, "start": "2025-01-01", "end": "2025-03-31", "filed": "2025-04-01", "frame": "CY2025Q1"},
+                ],
+            }
+        return {"error": "404 Not Found"}
+
+    client.company_concept = fake_company_concept
+
+    result = client.compare_concept(["AAPL", "GOOGL"], "revenue", periods=2)
+
+    assert result["frames"] == ["CY2026Q1", "CY2025Q1"]
+    assert [company["facts"][0]["frame"] for company in result["companies"]] == ["CY2026Q1", "CY2026Q1"]
+    assert result["companies"][1]["facts"][0]["_tag"] == "Revenues"
+    assert result["warnings"] == ["Aligned on quarterly frames."]
+
+
+def test_suggest_concepts_avoids_weak_false_positive():
+    client = EdgarClient(cache=None, rate_limiter=None, use_cache=False)
+    client.company_facts = lambda identifier, taxonomy=None, limit=50: {
+        "concepts": [{
+            "taxonomy": "us-gaap",
+            "tag": "NotesReceivableNet",
+            "label": "Notes Receivable, Net",
+            "description": "Notes receivable after allowances",
+        }]
+    }
+
+    assert client.suggest_concepts("TSLA", "us-gaap", "NotARealConcept") == []
 
 
 def test_event_types_from_8k_items():

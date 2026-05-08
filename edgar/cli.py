@@ -141,18 +141,22 @@ def facts(ctx, identifier, limit, taxonomy, tag_filter, json_output, markdown):
 
 @main.command()
 @click.argument("identifier")
-@click.argument("taxonomy")
-@click.argument("tag")
+@click.argument("terms", nargs=-1, required=True)
 @click.option("--unit", "-u", default=None, help="Restrict to one unit, e.g. USD")
 @click.option("--limit", "-n", default=20, show_default=True, help="Facts to show")
-@click.option("--deltas", is_flag=True, help="Show change vs previous displayed period")
+@click.option("--deltas", is_flag=True, help="Show change vs previous comparable displayed period")
 @output_options
 @click.pass_context
-def concept(ctx, identifier, taxonomy, tag, unit, limit, deltas, json_output, markdown):
-    """Show facts for one company XBRL concept."""
-    result = get_client(use_cache=not ctx.obj["no_cache"]).company_concept(
-        identifier, taxonomy, tag, unit=unit, limit=limit,
-    )
+def concept(ctx, identifier, terms, unit, limit, deltas, json_output, markdown):
+    """Show facts for one company XBRL concept or alias."""
+    client = get_client(use_cache=not ctx.obj["no_cache"])
+    if len(terms) == 1:
+        result = client.company_concept_alias(identifier, terms[0], unit=unit, limit=limit)
+    elif len(terms) == 2:
+        taxonomy, tag = terms
+        result = client.company_concept(identifier, taxonomy, tag, unit=unit, limit=limit)
+    else:
+        raise click.UsageError("Use either: concept IDENTIFIER ALIAS or concept IDENTIFIER TAXONOMY TAG")
     _output_concept_facts(result, json_output, markdown, deltas=deltas)
 
 
@@ -202,9 +206,8 @@ def open(ctx, identifier, form_type, all_history, print_only):
 @click.pass_context
 def exhibits(ctx, accession_or_url, cik, download, type_filter, json_output, markdown):
     """List or download documents/exhibits from a filing."""
-    result = get_client(use_cache=not ctx.obj["no_cache"]).filing_documents_for_accession(
-        accession_or_url, cik=cik,
-    )
+    client = get_client(use_cache=not ctx.obj["no_cache"])
+    result = client.filing_documents_for_accession(accession_or_url, cik=cik)
     _error_exit(result)
     if type_filter:
         needle = type_filter.upper()
@@ -213,7 +216,8 @@ def exhibits(ctx, accession_or_url, cik, download, type_filter, json_output, mar
             if needle in doc.get("type", "").upper()
         ]
     if download:
-        _download_documents(result, download)
+        result = _download_documents(client, result, download)
+        _error_exit(result)
     _output_documents(result, json_output, markdown)
 
 
@@ -460,8 +464,11 @@ def _output_concept_facts(result: dict, json_output: bool, markdown: bool,
     headers.append("Accession")
 
     title = f"{result.get('taxonomy', '')}/{result.get('tag', '')}: {result.get('name', '')}"
+    delta_note = deltas and any(fact.get("_delta_note") for fact in facts)
     if markdown:
         click.echo(f"## {title}\n")
+        if delta_note:
+            click.echo("> Deltas skip adjacent rows with mismatched period lengths.\n")
         click.echo(_markdown_table(headers, rows))
         return
 
@@ -476,7 +483,11 @@ def _output_concept_facts(result: dict, json_output: bool, markdown: bool,
     table.add_column("Accession", style="magenta", no_wrap=True)
     for row in rows:
         table.add_row(*[str(cell) for cell in row])
-    table.caption = result.get("label", "")
+    caption = result.get("label", "")
+    if delta_note:
+        note = "Deltas skip adjacent rows with mismatched period lengths."
+        caption = f"{caption} {note}".strip()
+    table.caption = caption
     console.print(table)
 
 
@@ -573,8 +584,9 @@ def _output_events(result: dict, json_output: bool, markdown: bool) -> None:
     table.add_column("Events")
     table.add_column("Items", no_wrap=True)
     table.add_column("Accession", style="magenta", no_wrap=True)
+    table.add_column("Snippet", overflow="fold")
     for row in rows:
-        table.add_row(*[str(cell) for cell in row[:-1]])
+        table.add_row(*[str(cell) for cell in row])
     console.print(table)
 
 
@@ -587,26 +599,32 @@ def _output_compare(result: dict, json_output: bool, markdown: bool) -> None:
     rows = []
     for company in result.get("companies", []):
         if company.get("error"):
-            rows.append([company.get("identifier", ""), "ERROR", company["error"], "", ""])
+            rows.append([company.get("identifier", ""), "ERROR", "", company["error"], "", ""])
             continue
         for fact in company.get("facts", []):
             rows.append([
                 company.get("identifier", ""),
                 company.get("name", ""),
+                fact.get("_tag", company.get("tag", "")),
                 _format_period(fact),
                 fact.get("frame", ""),
                 _format_value(fact.get("val", ""), company.get("unit", "")),
             ])
     if markdown:
-        click.echo(_markdown_table(["Identifier", "Company", "Period", "Frame", "Value"], rows))
+        for warning in result.get("warnings", []):
+            click.echo(f"> {warning}\n")
+        click.echo(_markdown_table(["Identifier", "Company", "Tag", "Period", "Frame", "Value"], rows))
         return
 
     table = Table(title=f"Compare: {result.get('taxonomy')}/{result.get('tag')}")
     table.add_column("ID", style="cyan", no_wrap=True)
     table.add_column("Company")
+    table.add_column("Tag", style="magenta", overflow="fold")
     table.add_column("Period", no_wrap=True)
     table.add_column("Frame", no_wrap=True)
     table.add_column("Value", justify="right", no_wrap=True)
+    if result.get("warnings"):
+        table.caption = " ".join(result["warnings"])
     for row in rows:
         table.add_row(*[str(cell) for cell in row])
     console.print(table)
@@ -625,6 +643,7 @@ def _output_brief(result: dict, json_output: bool, markdown: bool) -> None:
             metric.get("tag", ""),
             _format_period(metric.get("fact", {})),
             _format_value(metric.get("fact", {}).get("val", ""), metric.get("unit", "")),
+            _format_freshness(metric),
         ]
         for metric in result.get("metrics", [])
     ]
@@ -654,7 +673,7 @@ def _output_brief(result: dict, json_output: bool, markdown: bool) -> None:
                 filing.get("filing_url", ""),
             ]]))
         click.echo("\n### Key Metrics\n")
-        click.echo(_markdown_table(["Metric", "Tag", "Period", "Value"], metric_rows))
+        click.echo(_markdown_table(["Metric", "Tag", "Period", "Value", "Freshness"], metric_rows))
         click.echo("\n### Recent Events\n")
         click.echo(_markdown_table(["Filed", "Events", "Accession"], event_rows))
         return
@@ -672,7 +691,7 @@ def _output_brief(result: dict, json_output: bool, markdown: bool) -> None:
             title="Latest Earnings",
             expand=False,
         ))
-    console.print(_simple_table("Key Metrics", ["Metric", "Tag", "Period", "Value"], metric_rows))
+    console.print(_simple_table("Key Metrics", ["Metric", "Tag", "Period", "Value", "Freshness"], metric_rows))
     if event_rows:
         console.print(_simple_table("Recent Events", ["Filed", "Events", "Accession"], event_rows))
 
@@ -686,19 +705,25 @@ def _simple_table(title: str, headers: list[str], rows: list[list]) -> Table:
     return table
 
 
-def _download_documents(result: dict, directory: Path) -> None:
-    directory.mkdir(parents=True, exist_ok=True)
-    import requests
+def _download_documents(client, result: dict, directory: Path) -> dict:
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return {"error": f"Could not create download directory {directory}: {exc}", "documents": result.get("documents", [])}
 
-    headers = {"User-Agent": "edgar-cli/0.1.0 baba200@greenmountaincomputing.com"}
     for doc in result.get("documents", []):
         url = doc.get("url", "")
         if not url:
             continue
         target = directory / Path(doc.get("document") or "document").name
-        response = requests.get(url, headers=headers, timeout=60)
-        response.raise_for_status()
-        target.write_bytes(response.content)
+        try:
+            target.write_bytes(client._get_bytes(url))
+        except OSError as exc:
+            return {"error": f"Could not write {target}: {exc}", "documents": result.get("documents", [])}
+        except Exception as exc:
+            return {"error": f"Could not download {url}: {exc}", "documents": result.get("documents", [])}
+        doc["downloaded_to"] = str(target)
+    return result
 
 
 def _add_deltas(facts: list[dict]) -> list[dict]:
@@ -709,6 +734,9 @@ def _add_deltas(facts: list[dict]) -> list[dict]:
         current = _number_or_none(row.get("val"))
         previous = _number_or_none(rows[index + 1].get("val"))
         if current is None or previous in (None, 0):
+            continue
+        if not _same_period_length(row, rows[index + 1]):
+            row["_delta_note"] = "period mismatch"
             continue
         row["_delta_pct"] = (current - previous) / abs(previous) * 100
     return rows
@@ -725,6 +753,50 @@ def _format_delta(value) -> str:
     if value is None:
         return ""
     return f"{value:+.1f}%"
+
+
+def _format_freshness(metric: dict) -> str:
+    age_days = metric.get("age_days")
+    if age_days is None:
+        return ""
+    if metric.get("stale"):
+        return f"stale {_format_age(age_days)}"
+    return "current"
+
+
+def _format_age(days: int) -> str:
+    if days < 45:
+        return f"{days}d"
+    if days < 730:
+        return f"{days / 30:.1f}mo"
+    return f"{days / 365:.1f}y"
+
+
+def _same_period_length(left: dict, right: dict) -> bool:
+    left_days = _period_days(left)
+    right_days = _period_days(right)
+    if left_days is None or right_days is None:
+        return False
+    return abs(left_days - right_days) <= 7
+
+
+def _period_days(fact: dict) -> int | None:
+    start = _parse_date(fact.get("start", ""))
+    end = _parse_date(fact.get("end", ""))
+    if end and not start:
+        return 0
+    if start and end:
+        return (end - start).days
+    return None
+
+
+def _parse_date(value: str):
+    from datetime import datetime
+
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
 
 
 def _format_value(value, unit: str = "") -> str:

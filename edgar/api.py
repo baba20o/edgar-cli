@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from datetime import date, datetime
 from difflib import get_close_matches
 from html import unescape
 from html.parser import HTMLParser
@@ -49,19 +50,38 @@ BULK_ARCHIVES = [
     },
 ]
 
-COMMON_CONCEPTS = {
-    "assets": ("us-gaap", "Assets", "USD"),
-    "cash": ("us-gaap", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents", "USD"),
-    "debt": ("us-gaap", "LongTermDebtNoncurrent", "USD"),
-    "diluted_eps": ("us-gaap", "EarningsPerShareDiluted", "USD/shares"),
-    "eps": ("us-gaap", "EarningsPerShareDiluted", "USD/shares"),
-    "liabilities": ("us-gaap", "Liabilities", "USD"),
-    "net_income": ("us-gaap", "NetIncomeLoss", "USD"),
-    "operating_cash_flow": ("us-gaap", "NetCashProvidedByUsedInOperatingActivities", "USD"),
-    "operating_income": ("us-gaap", "OperatingIncomeLoss", "USD"),
-    "revenue": ("us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax", "USD"),
-    "shares": ("dei", "EntityCommonStockSharesOutstanding", "shares"),
+COMMON_CONCEPT_CANDIDATES = {
+    "assets": [("us-gaap", "Assets", "USD")],
+    "cash": [
+        ("us-gaap", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents", "USD"),
+        ("us-gaap", "CashAndCashEquivalentsAtCarryingValue", "USD"),
+    ],
+    "debt": [
+        ("us-gaap", "LongTermDebtNoncurrent", "USD"),
+        ("us-gaap", "LongTermDebtAndFinanceLeaseObligationsNoncurrent", "USD"),
+    ],
+    "diluted_eps": [("us-gaap", "EarningsPerShareDiluted", "USD/shares")],
+    "eps": [("us-gaap", "EarningsPerShareDiluted", "USD/shares")],
+    "liabilities": [("us-gaap", "Liabilities", "USD")],
+    "net_income": [("us-gaap", "NetIncomeLoss", "USD")],
+    "operating_cash_flow": [("us-gaap", "NetCashProvidedByUsedInOperatingActivities", "USD")],
+    "operating_income": [("us-gaap", "OperatingIncomeLoss", "USD")],
+    "revenue": [
+        ("us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax", "USD"),
+        ("us-gaap", "Revenues", "USD"),
+        ("us-gaap", "SalesRevenueNet", "USD"),
+        ("us-gaap", "SalesRevenueGoodsNet", "USD"),
+        ("us-gaap", "SalesRevenueServicesNet", "USD"),
+    ],
+    "shares": [("dei", "EntityCommonStockSharesOutstanding", "shares")],
 }
+
+COMMON_CONCEPTS = {
+    alias: candidates[0] for alias, candidates in COMMON_CONCEPT_CANDIDATES.items()
+}
+
+BRIEF_METRICS = ["assets", "cash", "debt", "net_income", "operating_income", "revenue"]
+STALE_METRIC_DAYS = 548
 
 EVENT_KEYWORDS = {
     "reverse_split": ["reverse stock split"],
@@ -134,11 +154,20 @@ def filing_urls(cik: str | int, accession_number: str, primary_document: str = "
 def resolve_concept_alias(concept: str, taxonomy: Optional[str] = None,
                           unit: Optional[str] = None) -> tuple[str, str, Optional[str]]:
     """Resolve a friendly concept alias to taxonomy/tag/unit."""
+    return concept_alias_candidates(concept, taxonomy, unit)[0]
+
+
+def concept_alias_candidates(concept: str, taxonomy: Optional[str] = None,
+                             unit: Optional[str] = None) -> list[tuple[str, str, Optional[str]]]:
+    """Return candidate taxonomy/tag/unit triples for a concept alias or exact tag."""
     key = concept.strip().lower().replace("-", "_").replace(" ", "_")
-    if key in COMMON_CONCEPTS:
-        alias_taxonomy, tag, alias_unit = COMMON_CONCEPTS[key]
-        return taxonomy or alias_taxonomy, tag, unit or alias_unit
-    return taxonomy or "us-gaap", concept, unit
+    candidates = COMMON_CONCEPT_CANDIDATES.get(key)
+    if not candidates:
+        return [(taxonomy or "us-gaap", concept, unit)]
+    return [
+        (taxonomy or candidate_taxonomy, tag, unit or candidate_unit)
+        for candidate_taxonomy, tag, candidate_unit in candidates
+    ]
 
 
 def get_client(use_cache: bool = True) -> "EdgarClient":
@@ -181,6 +210,14 @@ class EdgarClient(BaseAPIClient):
         response = self.session.get(url, timeout=self.request_timeout)
         response.raise_for_status()
         return response.text
+
+    def _get_bytes(self, url: str) -> bytes:
+        """GET bytes with the same session, headers, limiter, and timeout."""
+        if self.rate_limiter:
+            self.rate_limiter.acquire()
+        response = self.session.get(url, timeout=self.request_timeout)
+        response.raise_for_status()
+        return response.content
 
     def companies(self) -> dict:
         """Return ticker/CIK/company/exchange mappings."""
@@ -371,7 +408,8 @@ class EdgarClient(BaseAPIClient):
         }
 
     def company_concept(self, identifier: str | int, taxonomy: str, tag: str,
-                        unit: Optional[str] = None, limit: int = 20) -> dict:
+                        unit: Optional[str] = None, limit: int = 20,
+                        suggest_on_404: bool = True) -> dict:
         """Return all facts for a single company concept."""
         company = self.resolve_company(identifier)
         if "error" in company:
@@ -383,7 +421,7 @@ class EdgarClient(BaseAPIClient):
         )
         result = self._get(path)
         if "error" in result:
-            if "404" in result.get("error", ""):
+            if suggest_on_404 and "404" in result.get("error", ""):
                 result["suggestions"] = self.suggest_concepts(company["cik"], taxonomy, tag)
             return result
 
@@ -409,6 +447,35 @@ class EdgarClient(BaseAPIClient):
             "total": len(facts),
         }
 
+    def company_concept_alias(self, identifier: str | int, concept: str,
+                              unit: Optional[str] = None, limit: int = 20) -> dict:
+        """Return facts for a friendly concept alias, choosing the freshest candidate tag."""
+        key = concept.strip().lower().replace("-", "_").replace(" ", "_")
+        candidates = concept_alias_candidates(concept, unit=unit)
+        if key not in COMMON_CONCEPT_CANDIDATES:
+            taxonomy, tag, resolved_unit = candidates[0]
+            return self.company_concept(identifier, taxonomy, tag, unit=resolved_unit, limit=limit)
+
+        errors = []
+        results = []
+        for taxonomy, tag, resolved_unit in candidates:
+            result = self.company_concept(
+                identifier, taxonomy, tag, unit=resolved_unit, limit=limit, suggest_on_404=False,
+            )
+            if "error" in result:
+                errors.append(result["error"])
+                continue
+            if result.get("facts"):
+                results.append(result)
+
+        if not results:
+            return {"error": errors[0] if errors else f"No facts found for {concept}", "facts": []}
+
+        best = max(results, key=lambda result: fact_sort_key(latest_distinct_fact(result.get("facts", [])) or {}))
+        best["alias"] = concept
+        best["candidate_tags"] = [tag for _, tag, _ in candidates]
+        return best
+
     def suggest_concepts(self, identifier: str | int, taxonomy: str, tag: str,
                          limit: int = 8) -> list[dict]:
         """Suggest similar concept tags from companyfacts."""
@@ -423,16 +490,15 @@ class EdgarClient(BaseAPIClient):
         scored = []
         for concept in concepts:
             concept_tag = concept.get("tag", "")
-            haystack = " ".join([
-                concept_tag,
-                str(concept.get("label") or ""),
-                str(concept.get("description") or ""),
-            ]).lower()
-            if wanted in haystack or wanted_stem in haystack or haystack in wanted:
+            label = str(concept.get("label") or "")
+            description = str(concept.get("description") or "")
+            haystack = " ".join([concept_tag, label, description]).lower()
+            label_haystack = " ".join([label, description]).lower()
+            if wanted in haystack or (len(wanted_stem) >= 4 and wanted_stem in label_haystack):
                 scored.append((0, concept))
 
         seen = {c["tag"] for _, c in scored}
-        for match in get_close_matches(tag, tags, n=limit * 2, cutoff=0.35):
+        for match in get_close_matches(tag, tags, n=limit * 2, cutoff=0.6):
             if match in seen:
                 continue
             concept = next(c for c in concepts if c.get("tag") == match)
@@ -492,7 +558,10 @@ class EdgarClient(BaseAPIClient):
 
     def filing_documents(self, cik: str | int, accession_number: str) -> dict:
         """Parse the SEC filing index and return document/exhibit rows."""
-        urls = filing_urls(cik, accession_number)
+        try:
+            urls = filing_urls(cik, accession_number)
+        except ValueError as exc:
+            return {"error": str(exc), "documents": []}
         try:
             html = self._get_text(urls["filing_url"])
         except Exception as exc:
@@ -525,7 +594,10 @@ class EdgarClient(BaseAPIClient):
     def filing_documents_for_accession(self, accession_or_url: str, cik: Optional[str] = None) -> dict:
         """Return filing documents for an accession, filing index URL, or primary document URL."""
         accession = extract_accession(accession_or_url)
-        resolved_cik = cik or extract_cik_from_url(accession_or_url)
+        try:
+            resolved_cik = normalize_cik(cik) if cik else extract_cik_from_url(accession_or_url)
+        except ValueError as exc:
+            return {"error": str(exc), "documents": []}
         if not accession:
             return {"error": f"Could not find accession number in {accession_or_url}", "documents": []}
         if not resolved_cik:
@@ -596,30 +668,64 @@ class EdgarClient(BaseAPIClient):
     def compare_concept(self, identifiers: list[str], concept: str, taxonomy: Optional[str] = None,
                         unit: Optional[str] = None, periods: int = 4) -> dict:
         """Compare a concept across companies."""
-        resolved_taxonomy, tag, resolved_unit = resolve_concept_alias(concept, taxonomy, unit)
+        candidates = concept_alias_candidates(concept, taxonomy, unit)
         companies = []
         for identifier in identifiers:
-            result = self.company_concept(
-                identifier,
-                resolved_taxonomy,
-                tag,
-                unit=resolved_unit,
-                limit=max(periods * 4, periods),
-            )
-            if "error" in result:
-                companies.append({"identifier": identifier, "error": result["error"], "facts": []})
+            company = self._company_candidate_facts(identifier, candidates, periods=max(periods * 12, 36))
+            if company.get("error"):
+                companies.append(company)
                 continue
-            facts = pick_comparable_facts(result.get("facts", []), periods)
-            companies.append({
-                "identifier": identifier,
-                "cik": result.get("cik", ""),
-                "name": result.get("name", identifier),
-                "taxonomy": resolved_taxonomy,
-                "tag": tag,
-                "unit": resolved_unit,
-                "facts": facts,
-            })
-        return {"concept": concept, "taxonomy": resolved_taxonomy, "tag": tag, "unit": resolved_unit, "companies": companies}
+
+            frame_facts = [fact for fact in company.get("candidate_facts", []) if fact.get("frame")]
+            company["candidate_facts"] = frame_facts or company.get("candidate_facts", [])
+            companies.append(company)
+
+        comparable = [company for company in companies if not company.get("error")]
+        warnings = []
+        shared_frames = []
+        if comparable:
+            frame_sets = [
+                {fact.get("frame") for fact in company.get("candidate_facts", []) if fact.get("frame")}
+                for company in comparable
+            ]
+            shared = set.intersection(*frame_sets) if frame_sets and all(frame_sets) else set()
+            sorted_shared = sorted(shared, key=lambda frame: _frame_sort_key(comparable, frame), reverse=True)
+            preferred_kind = _frame_period_kind(comparable, sorted_shared[0]) if sorted_shared else ""
+            shared_frames = [
+                frame for frame in sorted_shared
+                if not preferred_kind or _frame_period_kind(comparable, frame) == preferred_kind
+            ][:periods]
+            if preferred_kind:
+                warnings.append(f"Aligned on {preferred_kind} frames.")
+
+        if shared_frames:
+            for company in comparable:
+                company["facts"] = [
+                    _best_fact_for_frame(company.get("candidate_facts", []), frame)
+                    for frame in shared_frames
+                ]
+                company["facts"] = [fact for fact in company["facts"] if fact]
+            if len(shared_frames) < periods:
+                warnings.append(f"Only {len(shared_frames)} shared frame(s) were available across all companies.")
+        else:
+            if len(comparable) > 1:
+                warnings.append("No shared frames were available across all companies; periods may not align.")
+            for company in comparable:
+                company["facts"] = pick_comparable_facts(company.get("candidate_facts", []), periods)
+
+        for company in companies:
+            company.pop("candidate_facts", None)
+
+        first = next((company for company in comparable if company.get("facts")), {})
+        return {
+            "concept": concept,
+            "taxonomy": first.get("taxonomy", candidates[0][0]),
+            "tag": first.get("tag", candidates[0][1]),
+            "unit": first.get("unit", candidates[0][2]),
+            "frames": shared_frames,
+            "warnings": warnings,
+            "companies": companies,
+        }
 
     def brief(self, identifier: str | int) -> dict:
         """Build a compact company brief."""
@@ -627,16 +733,13 @@ class EdgarClient(BaseAPIClient):
         if "error" in profile:
             return profile
 
+        reference_date = latest_filing_date(profile)
         metrics = []
-        for label, (taxonomy, tag, unit) in COMMON_CONCEPTS.items():
-            if label not in {"revenue", "net_income", "operating_income", "cash", "assets", "debt"}:
+        for label in BRIEF_METRICS:
+            metric = self._best_metric(label, profile["cik"], reference_date)
+            if not metric:
                 continue
-            result = self.company_concept(profile["cik"], taxonomy, tag, unit=unit, limit=3)
-            if "error" in result:
-                continue
-            fact = latest_distinct_fact(result.get("facts", []))
-            if fact:
-                metrics.append({"metric": label, "taxonomy": taxonomy, "tag": tag, "unit": unit, "fact": fact})
+            metrics.append(metric)
 
         earnings = self.latest_earnings(profile["cik"], limit=8)
         events = self.events(profile["cik"], limit=8)
@@ -646,6 +749,73 @@ class EdgarClient(BaseAPIClient):
             "earnings": earnings if "error" not in earnings else None,
             "events": events.get("events", [])[:5] if "error" not in events else [],
         }
+
+    def _company_candidate_facts(self, identifier: str | int, candidates: list[tuple[str, str, Optional[str]]],
+                                 periods: int) -> dict:
+        errors = []
+        candidate_facts = []
+        metadata = {}
+        for taxonomy, tag, unit in candidates:
+            result = self.company_concept(
+                identifier, taxonomy, tag, unit=unit, limit=periods, suggest_on_404=False,
+            )
+            if "error" in result:
+                errors.append(result["error"])
+                continue
+            metadata = {
+                "identifier": identifier,
+                "cik": result.get("cik", ""),
+                "name": result.get("name", identifier),
+            }
+            for fact in result.get("facts", []):
+                item = dict(fact)
+                item["_taxonomy"] = result.get("taxonomy", taxonomy)
+                item["_tag"] = result.get("tag", tag)
+                item["_unit"] = unit or item.get("unit", "")
+                candidate_facts.append(item)
+
+        if not candidate_facts:
+            return {
+                "identifier": identifier,
+                "error": errors[0] if errors else "No facts found",
+                "facts": [],
+            }
+
+        candidate_facts.sort(key=lambda fact: (fact.get("end", ""), fact.get("filed", "")), reverse=True)
+        best = candidate_facts[0]
+        return {
+            **metadata,
+            "taxonomy": best.get("_taxonomy", candidates[0][0]),
+            "tag": best.get("_tag", candidates[0][1]),
+            "unit": best.get("_unit", candidates[0][2]),
+            "candidate_facts": candidate_facts,
+            "facts": [],
+        }
+
+    def _best_metric(self, label: str, cik: str, reference_date: str) -> Optional[dict]:
+        best = None
+        for taxonomy, tag, unit in concept_alias_candidates(label):
+            result = self.company_concept(cik, taxonomy, tag, unit=unit, limit=24, suggest_on_404=False)
+            if "error" in result:
+                continue
+            fact = latest_distinct_fact(result.get("facts", []))
+            if not fact:
+                continue
+            candidate = {
+                "metric": label,
+                "taxonomy": result.get("taxonomy", taxonomy),
+                "tag": result.get("tag", tag),
+                "unit": unit or fact.get("unit", ""),
+                "fact": fact,
+            }
+            if not best or fact_sort_key(candidate["fact"]) > fact_sort_key(best["fact"]):
+                best = candidate
+
+        if best:
+            age_days = fact_age_days(best["fact"], reference_date)
+            best["age_days"] = age_days
+            best["stale"] = bool(age_days is not None and age_days > STALE_METRIC_DAYS)
+        return best
 
     @staticmethod
     def _recent_filings(data: dict, limit: int = 20, form: Optional[str] = None,
@@ -727,6 +897,81 @@ def _number_or_zero(value: Any) -> float:
         return 0.0
 
 
+def parse_date(value: str) -> Optional[date]:
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
+def latest_filing_date(profile: dict) -> str:
+    dates = [
+        filing.get("filingDate", "")
+        for filing in profile.get("filings", [])
+        if filing.get("filingDate")
+    ]
+    return max(dates) if dates else ""
+
+
+def fact_sort_key(fact: dict) -> tuple[str, str]:
+    return fact.get("end", ""), fact.get("filed", "")
+
+
+def fact_age_days(fact: dict, reference_date: str) -> Optional[int]:
+    end = parse_date(fact.get("end", ""))
+    reference = parse_date(reference_date)
+    if not end or not reference:
+        return None
+    return (reference - end).days
+
+
+def _frame_sort_key(companies: list[dict], frame: str) -> tuple[str, str]:
+    facts = [
+        fact
+        for company in companies
+        for fact in company.get("candidate_facts", [])
+        if fact.get("frame") == frame
+    ]
+    if not facts:
+        return "", frame
+    return max((fact.get("end", ""), frame) for fact in facts)
+
+
+def _best_fact_for_frame(facts: list[dict], frame: str) -> Optional[dict]:
+    matches = [fact for fact in facts if fact.get("frame") == frame]
+    if not matches:
+        return None
+    return max(matches, key=fact_sort_key)
+
+
+def _frame_period_kind(companies: list[dict], frame: str) -> str:
+    kinds = [
+        _fact_period_kind(fact)
+        for company in companies
+        for fact in company.get("candidate_facts", [])
+        if fact.get("frame") == frame
+    ]
+    kinds = [kind for kind in kinds if kind]
+    if not kinds:
+        return ""
+    return max(set(kinds), key=kinds.count)
+
+
+def _fact_period_kind(fact: dict) -> str:
+    start = parse_date(fact.get("start", ""))
+    end = parse_date(fact.get("end", ""))
+    if end and not start:
+        return "instant"
+    if not start or not end:
+        return ""
+    days = (end - start).days
+    if 300 <= days <= 380:
+        return "annual"
+    if 70 <= days <= 110:
+        return "quarterly"
+    return "other"
+
+
 class FilingIndexParser(HTMLParser):
     """Small parser for SEC filing-index document tables."""
 
@@ -779,6 +1024,7 @@ def clean_text(text: str) -> str:
 
 def html_to_text(html: str) -> str:
     text = re.sub(r"<script.*?</script>|<style.*?</style>", " ", html, flags=re.S | re.I)
+    text = re.sub(r"<table.*?</table>", " ", text, flags=re.S | re.I)
     text = re.sub(r"<[^>]+>", " ", text)
     return clean_text(unescape(text))
 
@@ -838,6 +1084,8 @@ def extract_earnings_highlights(text: str) -> list[dict]:
         if any(pattern in lower for pattern in patterns) and re.search(r"\$?\d", sentence):
             cleaned = clean_text(sentence)
             if "document exhibit" in cleaned.lower():
+                continue
+            if len(re.findall(r"\$?\d[\d,]*(?:\.\d+)?%?", cleaned)) > 8:
                 continue
             if cleaned in seen:
                 continue

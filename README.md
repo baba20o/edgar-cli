@@ -59,6 +59,7 @@ edgar facts MSFT --limit 100 --json-output
 ### `concept` - One company's facts for a single concept
 
 ```bash
+edgar concept AAPL revenue
 edgar concept AAPL us-gaap Assets --unit USD
 edgar concept MSFT us-gaap Revenues --limit 12 --markdown
 edgar concept AAPL us-gaap RevenueFromContractWithCustomerExcludingAssessedTax --deltas
@@ -110,12 +111,19 @@ edgar compare AAPL MSFT GOOGL --concept revenue --periods 4
 edgar compare AAPL MSFT --concept Assets --unit USD --markdown
 ```
 
+Friendly aliases try issuer-specific fallback tags and align on shared period
+frames, so companies that migrated XBRL tags can still be compared without
+mixing years or period types.
+
 ### `brief` - Compact company brief
 
 ```bash
 edgar brief AAPL
 edgar brief AGL --markdown
 ```
+
+Brief metrics use fallback tags for common concepts and include a freshness
+column so stale facts are visible instead of silently looking current.
 
 ### `bulk-urls` - Official nightly bulk archive URLs
 
@@ -180,6 +188,10 @@ python -m edgar --help
   researching older IPO-era forms.
 - `concept` suggests similar company-specific XBRL tags when SEC returns a 404,
   which helps with issuer-specific tags like revenue concepts.
+- `concept --deltas` only compares adjacent rows with matching period lengths;
+  mixed quarterly/annual rows are skipped to avoid misleading math.
+- Exhibit downloads use the same SEC user agent and shared rate limiter as API
+  requests.
 
 ## License
 
