@@ -1474,6 +1474,208 @@ def dashboard(ctx, identifier, markdown, json_output, ndjson):
 
 @main.command()
 @click.argument("identifier")
+@click.option("--year", type=int, default=None,
+              help="Pick the DEF 14A from this filing year (defaults to most recent)")
+@click.option("--db", "db_path", type=click.Path(dir_okay=False, path_type=Path), default=None,
+              help="Read body from a mirror SQLite if present (otherwise fetch live)")
+@output_options
+@click.pass_context
+def governance(ctx, identifier, year, db_path, markdown, json_output, ndjson):
+    """Heuristic DEF 14A extraction: audit fees, board size, shareholder proposals."""
+    client = get_client(use_cache=not ctx.obj["no_cache"],
+                       cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.governance(
+        identifier, year=year,
+        db_path=str(db_path) if db_path else None,
+    )
+    result = _finalize(client, result)
+    _error_exit(result)
+    if ndjson:
+        for fee in result.get("audit_fees", []):
+            click.echo(json.dumps({"kind": "audit_fee", **fee}, default=str))
+        for prop in result.get("proposals", []):
+            click.echo(json.dumps({"kind": "proposal", **prop}, default=str))
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+    body_lines = [
+        f"Filing: {result['filing']['form']} {result['filing']['filed']}",
+        f"Body source: {result.get('body_source', '')}  length: {result.get('body_length', 0)}",
+        "",
+    ]
+    if result.get("audit_fees"):
+        body_lines.append("Audit fees:")
+        for fee in result["audit_fees"][:6]:
+            body_lines.append(f"  {fee['label']:30s} ${fee['value_usd']:,}")
+    if result.get("board_size"):
+        body_lines.append(f"\nBoard size: {result['board_size']['count']} directors")
+    if result.get("proposals"):
+        body_lines.append(f"\nProposals ({len(result['proposals'])}):")
+        for p in result["proposals"][:8]:
+            body_lines.append(f"  Proposal {p['number']}: {p['title'][:60]}")
+    if result.get("neo_titles_mentioned"):
+        body_lines.append(f"\nExecutive titles mentioned: "
+                          f"{', '.join(result['neo_titles_mentioned'][:5])}")
+    console.print(Panel("\n".join(body_lines),
+                        title=f"Governance: {result.get('name', identifier)}",
+                        expand=False))
+
+
+@main.command()
+@click.argument("identifier")
+@click.option("--form", default="10-K", show_default=True,
+              type=click.Choice(["10-K", "10-Q"]))
+@click.option("--section", "-s", required=True,
+              help="Item code (e.g. 1A) or title (e.g. 'Risk Factors')")
+@click.option("--as-of", "as_of", default=None, callback=_validate_date_option,
+              help="Use the latest filing on/before YYYY-MM-DD")
+@click.option("--db", "db_path", type=click.Path(dir_okay=False, path_type=Path), default=None,
+              help="Read body from a mirror SQLite if present (otherwise fetch live)")
+@click.option("--max-chars", default=50000, show_default=True, type=PositiveInt,
+              help="Truncate the section text at this many characters")
+@output_options
+@click.pass_context
+def item(ctx, identifier, form, section, as_of, db_path, max_chars,
+         markdown, json_output, ndjson):
+    """Extract one Item-level section from a 10-K or 10-Q (heuristic)."""
+    client = get_client(use_cache=not ctx.obj["no_cache"],
+                       cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.filing_section(
+        identifier, form=form, section=section, as_of=as_of,
+        db_path=str(db_path) if db_path else None, max_chars=max_chars,
+    )
+    result = _finalize(client, result)
+    _error_exit(result)
+    if ndjson:
+        _ndjson([result.get("section", {})])
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+    s = result.get("section", {})
+    body = "\n".join([
+        f"Filing: {result['filing']['form']} {result['filing']['filed']}",
+        f"Item {s.get('item')}: {s.get('title')}",
+        f"Length: {s.get('length')} chars  Confidence: {s.get('confidence')}",
+        f"Items found in document: {', '.join(s.get('items_found_in_document', []))}",
+        f"Body source: {result.get('body_source', '')}",
+        "",
+        (s.get("text") or "")[:2000] + ("…" if s.get("truncated_to_max_chars") else ""),
+    ])
+    console.print(Panel(body,
+                        title=f"{result.get('name', identifier)} {form} · {section}",
+                        expand=False))
+
+
+@main.command()
+@click.argument("identifier")
+@click.option("--quarter", default=None,
+              help="Quarter (e.g. 2025Q4 or CY2025Q4); defaults to most recent 13F-HR")
+@click.option("--top", "top_n", default=50, show_default=True, type=PositiveInt,
+              help="Top-N positions to return (sorted by value)")
+@output_options
+@click.pass_context
+def holdings(ctx, identifier, quarter, top_n, markdown, json_output, ndjson):
+    """Show one institutional filer's 13F-HR holdings for a quarter."""
+    client = get_client(use_cache=not ctx.obj["no_cache"],
+                       cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.holdings(identifier, quarter=quarter, top_n=top_n)
+    result = _finalize(client, result)
+    _error_exit(result)
+    if ndjson:
+        _ndjson(result.get("top_positions", []))
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+    body = "\n".join([
+        f"Filing: {result['filing']['form']} {result['filing']['filed']} "
+        f"({result['filing']['accession']})",
+        f"Total value: ${_format_value(result.get('total_value_usd'))} "
+        f"({result.get('position_count', 0)} positions)",
+        f"Top-{top_n} concentration: {result.get('top_concentration', 0)*100:.1f}%",
+    ])
+    console.print(Panel(body, title=f"Holdings: {result.get('name', identifier)}", expand=False))
+    rows = []
+    for p in result.get("top_positions", [])[:25]:
+        rows.append([
+            p["name_of_issuer"][:40],
+            p.get("cusip", ""),
+            f"{p['weight']*100:.2f}%",
+            _format_value(p.get("value_usd")),
+            f"{p['shares']:,}",
+            p.get("put_call", ""),
+        ])
+    headers = ["Issuer", "CUSIP", "Weight", "Value", "Shares", "P/C"]
+    if markdown:
+        click.echo(_markdown_table(headers, rows))
+        return
+    console.print(_simple_table("Top positions", headers, rows))
+
+
+@main.command()
+@click.argument("identifier")
+@click.option("--candidates", default="@dow30",
+              help="Tickers/@group of 13F filers to scan (default @dow30 — usually too narrow; pass an institutional list)")
+@click.option("--cusip", default=None,
+              help="Match holdings by CUSIP (more precise than name-substring)")
+@click.option("--quarter", default=None,
+              help="Quarter (e.g. 2025Q4); defaults to each candidate's most recent 13F-HR")
+@click.option("--top", "top_n", default=25, show_default=True, type=PositiveInt)
+@click.option("--max-filers", default=30, show_default=True, type=PositiveInt,
+              help="Hard cap on candidate filers scanned")
+@output_options
+@click.pass_context
+def holders(ctx, identifier, candidates, cusip, quarter, top_n, max_filers,
+            markdown, json_output, ndjson):
+    """Find which institutional filers (from a candidate set) hold an issuer.
+
+    Matches on `nameOfIssuer` substring by default; pass `--cusip` for exact
+    matching. Without a 13F-filer candidate list this is bounded — pass
+    `--candidates @group` or a comma-separated list of CIKs.
+    """
+    client = get_client(use_cache=not ctx.obj["no_cache"],
+                       cache_max_mb=ctx.obj.get("cache_max_mb"))
+    candidate_list = _expand_groups(_split_input_values(candidates), client=client)
+    result = client.holders(identifier, candidates=candidate_list,
+                             quarter=quarter, top_n=top_n, cusip=cusip,
+                             max_filers=max_filers)
+    result = _finalize(client, result)
+    _error_exit(result)
+    if ndjson:
+        _ndjson(result.get("rows", []))
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+    body = "\n".join([
+        f"Issuer: {result.get('issuer_name', '')} (CIK {result.get('issuer_cik', '')})",
+        f"Match: {result.get('match_strategy')} '{result.get('needle')}'",
+        f"Candidates scanned: {result.get('candidates_scanned')} of {result.get('candidates_total')}",
+        f"Filers holding: {result.get('filer_count', 0)}",
+        f"Total shares: {_format_value(result.get('total_shares'))}",
+        f"Total value: ${_format_value(result.get('total_value_usd'))}",
+    ])
+    console.print(Panel(body, title=f"Holders of {identifier}", expand=False))
+    rows = []
+    for f in result.get("filers", [])[:25]:
+        rows.append([
+            f["filer_name"][:40],
+            f.get("filer_cik", ""),
+            f["positions"],
+            _format_value(f.get("shares")),
+            _format_value(f.get("value_usd")),
+        ])
+    headers = ["Filer", "CIK", "#Pos", "Shares", "Value"]
+    if markdown:
+        click.echo(_markdown_table(headers, rows))
+        return
+    console.print(_simple_table("Holders", headers, rows))
+
+
+@main.command()
+@click.argument("identifier")
 @click.option("--since", default=None, callback=_validate_date_option,
               help="Only Form 4 filings on/after YYYY-MM-DD")
 @click.option("--limit", "-n", default=50, show_default=True, type=PositiveInt,

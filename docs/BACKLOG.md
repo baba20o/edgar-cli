@@ -3,7 +3,54 @@
 This tracks test-drive feedback and the next command ideas. Priorities favor
 misleading-output fixes before convenience features.
 
-## Last Shipped — Filing Bodies, Insiders, Per-Share, CSV Export
+## Last Shipped — 13F Holders, Item Extraction, Governance
+
+The remaining "deferred multi-day projects" called out as high-value:
+
+**13F holdings + holders**
+- New `edgar/holders.py`: parses 13F infoTable XML (namespace-agnostic).
+- `edgar holdings IDENTIFIER --quarter 2025Q4 --top N` — single filer's
+  holdings + top concentration. Live: Berkshire Q4 2025 = $274B portfolio,
+  AMEX 20.1% / AAPL 8% / KO 7.2%.
+- `edgar holders TICKER --candidates @group --cusip CCCCCCCCC` — given a
+  candidate institutional list, find which hold the issuer (matches by
+  name-substring, exact CUSIP via flag).
+- Auto-detects 2023 SEC schema change (value reporting moved from
+  thousands→absolute USD) by magnitude heuristic per filing; tags every row
+  with `value_unit_convention`.
+- Locates the right `INFORMATION TABLE` doc by `doc_type` (filename varies
+  per filer, e.g. `infotable.xml` vs `50240.xml`).
+
+**Item-level 10-K/10-Q extraction**
+- New `edgar/items.py`: heuristic Item-header detection in plain-text body.
+- `edgar item TICKER --form 10-K --section "Risk Factors"` — extracts one
+  Item with its full body text.
+- Discriminates real headers from TOC entries and inline cross-references
+  using three signals: (1) gap to next Item marker (TOC entries cluster
+  tightly), (2) inline preceding context (`see ...`, `under ...`, lowercase
+  letters), (3) canonical title following the marker. Picks satisfy
+  monotonic canonical ordering.
+- Live verified: NVDA 10-K Item 1A returns 115K-char Risk Factors section
+  starting at the actual header, not a back-reference.
+- `--db PATH` reads from a previously-mirrored body if present, avoiding
+  the SEC round-trip.
+
+**DEF 14A governance (heuristic, with caveats)**
+- New `edgar/governance.py`: pattern-based extractors for audit fees,
+  board size, shareholder proposals, NEO-title mentions.
+- `edgar governance TICKER --year 2025` returns each field with its
+  `context` (matched sentence) so agents can verify before relying on it.
+- Honest about limits: total executive compensation tables vary too much
+  across filers for a robust default extractor; the `caveat` field says so.
+  Audit-fee patterns work for filers that use the common labeled-row
+  format; tabular formats may need filer-specific extractors.
+
+Tests: 108 passing (was 100, +8 new). Regressions cover infoTable XML
+parsing under both unit conventions, filer aggregation + concentration,
+Item canonical-order detection, inline-cross-reference rejection,
+title-based item resolution, audit-fee + board-size extraction.
+
+## Previously Shipped — Filing Bodies, Insiders, Per-Share, CSV Export
 
 Builds directly on the previous tranche's mirror foundation.
 
@@ -260,10 +307,10 @@ agents on edge cases. Each has a brief note on what would be needed.
 
 ## Filing Text And Ownership
 
-- [ ] Add `edgar item TICKER 10-K --section "Risk Factors" --as-of YYYY-MM-DD` for targeted filing sections. *(Deferred — Item-aware HTML parsing varies per filer; needs a per-form section parser.)*
+- [x] Add `edgar item TICKER --form 10-K --section "Risk Factors"` for Item-level extraction. Heuristic — uses three signals (gap to next marker, inline-context check, title-following) plus canonical-order monotonicity to skip TOC entries and back-references. Optionally reads from a mirrored body via `--db PATH`.
 - [ ] Add `edgar changes TICKER --since YYYY-MM-DD` to diff same-form sections. *(Deferred — depends on item extraction.)*
 - [x] Add `edgar insiders TICKER --since YYYY-MM-DD` to parse Form 4 XML and aggregate by reporting owner + transaction code. Strips SEC's stylesheet wrapper to find raw XML; maps codes to semantic categories.
-- [ ] Add `edgar holders TICKER --quarter 2025Q4` for 13F/13G/SC 13G holder summaries. *(Deferred — 13F XML aggregation across filings is a real project.)*
+- [x] Add `edgar holdings IDENTIFIER --quarter 2025Q4` (single 13F filer's holdings + concentration) and `edgar holders TICKER --candidates @group --cusip ...` (cross-filer search for holders of an issuer). Handles SEC's 2023 value-reporting schema change automatically.
 - [x] Improve earnings narrative extraction so table dumps do not become giant unreadable highlights.
 
 ## Local Research Moat
@@ -297,7 +344,7 @@ agents on edge cases. Each has a brief note on what would be needed.
 
 - [x] Add `edgar dei TICKER` for entity-level metadata (filer status, fiscal year end, addresses, former names).
 - [x] Add `edgar dashboard TICKER` composite envelope (profile + metrics + ratios + events + earnings + quality).
-- [ ] Add `edgar governance TICKER --year 2025` DEF 14A parsing. *(Deferred — proxy parsing is its own project.)*
+- [x] Add `edgar governance TICKER --year 2025` DEF 14A extraction for audit fees, board size, shareholder proposals, NEO titles. Heuristic — every field returns its `context` (matched sentence) for agent verification. Total executive compensation tables explicitly out of scope (filer markup varies too much for a default extractor).
 - [x] Add `edgar verify TICKER --period-type ...` cross-statement consistency checks (EPS↔NI/shares, GP↔Rev−COGS).
 
 ## Composability

@@ -1307,6 +1307,166 @@ def test_form4_aggregate_groups_by_owner_and_code():
 # --- Phase 3: per-share metrics ---
 
 
+def test_holders_parse_infotable_xml_post_2023():
+    """Recent 13F filings report value in absolute USD."""
+    from edgar.holders import parse_infotable_xml
+
+    xml = """<?xml version="1.0"?>
+    <informationTable>
+      <infoTable>
+        <nameOfIssuer>APPLE INC</nameOfIssuer>
+        <titleOfClass>COM</titleOfClass>
+        <cusip>037833100</cusip>
+        <value>21929537965</value>
+        <shrsOrPrnAmt>
+          <sshPrnamt>123456789</sshPrnamt>
+          <sshPrnamtType>SH</sshPrnamtType>
+        </shrsOrPrnAmt>
+        <investmentDiscretion>SOLE</investmentDiscretion>
+        <votingAuthority>
+          <Sole>123456789</Sole><Shared>0</Shared><None>0</None>
+        </votingAuthority>
+      </infoTable>
+      <infoTable>
+        <nameOfIssuer>COCA COLA CO</nameOfIssuer>
+        <titleOfClass>COM</titleOfClass>
+        <cusip>191216100</cusip>
+        <value>19765145984</value>
+        <shrsOrPrnAmt>
+          <sshPrnamt>400000000</sshPrnamt>
+          <sshPrnamtType>SH</sshPrnamtType>
+        </shrsOrPrnAmt>
+      </infoTable>
+    </informationTable>
+    """
+    rows = parse_infotable_xml(xml)
+    assert len(rows) == 2
+    aapl = next(r for r in rows if r["cusip"] == "037833100")
+    # Total > $10B threshold, so values stay as absolute USD.
+    assert aapl["value_usd"] == 21929537965
+    assert aapl["value_unit_convention"] == "absolute"
+    assert aapl["shares"] == 123456789
+
+
+def test_holders_parse_infotable_xml_pre_2023_thousands():
+    """Pre-2023 13F filings reported value in thousands of USD."""
+    from edgar.holders import parse_infotable_xml
+
+    xml = """<?xml version="1.0"?>
+    <informationTable>
+      <infoTable>
+        <nameOfIssuer>SMALL CO</nameOfIssuer>
+        <titleOfClass>COM</titleOfClass>
+        <cusip>000000000</cusip>
+        <value>50000</value>
+        <shrsOrPrnAmt><sshPrnamt>1000</sshPrnamt></shrsOrPrnAmt>
+      </infoTable>
+    </informationTable>
+    """
+    rows = parse_infotable_xml(xml)
+    # Total raw value $50K < $10B threshold -> treated as thousands.
+    assert rows[0]["value_unit_convention"] == "thousands"
+    assert rows[0]["value_usd"] == 50_000_000  # 50,000 thousands
+
+
+def test_holders_aggregate_filer_holdings_concentration():
+    from edgar.holders import aggregate_filer_holdings
+
+    rows = [
+        {"name_of_issuer": "A", "value_usd": 100, "shares": 10},
+        {"name_of_issuer": "B", "value_usd": 50, "shares": 5},
+        {"name_of_issuer": "C", "value_usd": 25, "shares": 2},
+        {"name_of_issuer": "D", "value_usd": 25, "shares": 1},
+    ]
+    out = aggregate_filer_holdings(rows, top_n=2)
+    assert out["total_value_usd"] == 200
+    assert out["position_count"] == 4
+    # Top-2 concentration: 150/200 = 0.75
+    assert abs(out["top_concentration"] - 0.75) < 1e-9
+    assert [p["name_of_issuer"] for p in out["top_positions"]] == ["A", "B"]
+
+
+# --- Phase 2: Item extraction ---
+
+
+def test_items_find_canonical_order_in_simple_doc():
+    from edgar.items import find_items
+
+    body = (
+        "Item 1. Business\n\n"
+        "We make chips. " * 100 +
+        "\n\nItem 1A. Risk Factors\n\n"
+        "Risks include " + ("market volatility, " * 50) + "\n\n"
+        "Item 2. Properties\n\n"
+        "We own facilities. " * 50
+    )
+    items = find_items(body, schema="10-K")
+    assert [i["item"] for i in items] == ["1", "1A", "2"]
+
+
+def test_items_skip_inline_back_references():
+    """`see Item 1A — Risk Factors` should NOT win over the real header."""
+    from edgar.items import find_items, extract_section
+
+    body = (
+        "Item 1. Business\n\n"
+        "Our business has many risks; see Item 1A. Risk Factors of this "
+        "Form 10-K for details. " + ("more business prose. " * 100) +
+        "\n\nItem 1A. Risk Factors\n\n"
+        "Investing in our common stock involves risks. " +
+        ("risk discussion. " * 100) +
+        "\n\nItem 1B. Unresolved Staff Comments\n\nNone."
+    )
+    items = find_items(body, schema="10-K")
+    item_1a = next(i for i in items if i["item"] == "1A")
+    # The chosen 1A offset should be AFTER the back-reference.
+    back_ref_offset = body.index("see Item 1A")
+    assert item_1a["start"] > back_ref_offset
+
+    section = extract_section(body, "1A")
+    assert section["text"].startswith("Item 1A. Risk Factors")
+    assert "Investing in our common stock" in section["text"]
+
+
+def test_items_resolve_by_title():
+    from edgar.items import extract_section
+
+    body = (
+        "Item 1. Business\n\n" + ("biz prose. " * 50) +
+        "\n\nItem 1A. Risk Factors\n\n" + ("risk prose. " * 50) +
+        "\n\nItem 2. Properties\n\nNone."
+    )
+    out = extract_section(body, "Risk Factors")
+    assert out["item"] == "1A"
+
+
+# --- Phase 3: governance ---
+
+
+def test_governance_extract_audit_fees():
+    from edgar.governance import extract_audit_fees
+
+    text = (
+        "The aggregate fees billed to the Company by PwC are summarized below.\n"
+        "Audit Fees      $12,500,000\n"
+        "Audit-Related Fees   $250,000\n"
+        "Tax Fees             $80,000\n"
+        "All Other Fees       $5,000\n"
+    )
+    fees = extract_audit_fees(text)
+    by_label = {f["label"].lower(): f for f in fees}
+    assert by_label["audit fees"]["value_usd"] == 12_500_000
+    assert by_label["tax fees"]["value_usd"] == 80_000
+
+
+def test_governance_extract_board_size_word_form():
+    from edgar.governance import extract_board_size
+
+    text = "Our Board of Directors currently consists of nine directors elected annually."
+    out = extract_board_size(text)
+    assert out["count"] == 9
+
+
 def test_compute_book_value_per_share():
     from edgar.compute import book_value_per_share
 

@@ -328,7 +328,7 @@ def test_filings_json_keeps_envelope(monkeypatch):
 def test_help_includes_new_v2_commands():
     result = CliRunner().invoke(main, ["--help"])
     for cmd in ("mirror", "search", "statements", "quality", "verify", "dashboard",
-                "insiders"):
+                "insiders", "holdings", "holders", "item", "governance"):
         assert cmd in result.output, f"missing {cmd}"
 
 

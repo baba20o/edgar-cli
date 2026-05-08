@@ -34,7 +34,10 @@ from research_cli_base.http_client import retry_wait_seconds
 
 from edgar import __version__ as CLI_VERSION
 from edgar import compute
+from edgar import governance as governance_mod
+from edgar import holders as holders_mod
 from edgar import insiders as insiders_mod
+from edgar import items as items_mod
 from edgar.cache import EdgarCache, ttl_for_url
 from edgar.state import StateStore
 from edgar import mirror as mirror_mod
@@ -1435,6 +1438,330 @@ class EdgarClient(BaseAPIClient):
             }
 
         return out
+
+    def governance(self, identifier: str | int, year: Optional[int] = None,
+                   db_path: Optional[str] = None) -> dict:
+        """Heuristic DEF 14A extraction: audit fees, board size, proposals.
+
+        Picks the latest DEF 14A (filtered by `year` if given), strips the
+        primary doc to text, and runs targeted regex extractors. Each field
+        is returned alongside its matched context so agents can verify
+        before relying on it.
+        """
+        company = self.resolve_company(identifier)
+        if "error" in company:
+            return company
+        cik = company["cik"]
+        result = self.submissions(identifier, form="DEF 14A", limit=10)
+        if "error" in result:
+            return result
+        filings = result.get("filings", [])
+        if not filings:
+            return {"error": f"No DEF 14A filings for {identifier}"}
+        target = filings[0]
+        if year:
+            for f in filings:
+                if str(year) in (f.get("filingDate", "") or ""):
+                    target = f
+                    break
+
+        body_text = ""
+        body_source = "live"
+        if db_path:
+            with mirror_mod.open_db(db_path) as conn:
+                row = conn.execute(
+                    "SELECT body FROM filing_bodies_fts WHERE cik = ? AND accession = ?",
+                    (cik, target["accessionNumber"]),
+                ).fetchone()
+                if row and row[0]:
+                    body_text = row[0]
+                    body_source = "mirror"
+        if not body_text:
+            url = target.get("primary_doc_url", "")
+            if not url:
+                return {"error": "No primary document URL for proxy"}
+            try:
+                html = self._get_text(url)
+            except Exception as exc:
+                return {"error": f"Could not fetch proxy body: {exc}"}
+            body_text = html_to_text(html)
+
+        summary = governance_mod.summarize(body_text)
+        return {
+            "cik": cik,
+            "ticker": company.get("ticker", ""),
+            "name": company.get("name", ""),
+            "filing": {
+                "accession": target.get("accessionNumber", ""),
+                "filed": target.get("filingDate", ""),
+                "form": target.get("form", ""),
+                "filing_url": target.get("filing_url", ""),
+            },
+            "body_source": body_source,
+            "body_length": len(body_text),
+            **summary,
+        }
+
+    def filing_section(self, identifier: str | int, form: str = "10-K",
+                       section: str = "Risk Factors",
+                       as_of: Optional[str] = None,
+                       db_path: Optional[str] = None,
+                       max_chars: int = 50000) -> dict:
+        """Heuristically extract one Item-level section from a filing.
+
+        `form` is one of `10-K`/`10-Q`. `section` accepts either the item code
+        (`1A`) or the title (`Risk Factors`). Strategy:
+        1. If `db_path` is set and the filing's body has been mirrored, read
+           from the mirror (no SEC round-trip).
+        2. Otherwise fetch the primary doc live and strip HTML to text.
+        3. Slice between Item-header regex matches.
+        Returns the section text (truncated to `max_chars`) plus a
+        `confidence` field — `"high"` when bounded by the next Item header,
+        `"low"` when only the target was found.
+        """
+        company = self.resolve_company(identifier)
+        if "error" in company:
+            return company
+        cik = company["cik"]
+        # Pick the latest filing of the requested form.
+        result = self.submissions(identifier, form=form, limit=10,
+                                   end_date=as_of)
+        if "error" in result:
+            return result
+        filings = result.get("filings", [])
+        if not filings:
+            return {"error": f"No {form} filings for {identifier}"}
+        target = filings[0]
+
+        body_text = ""
+        body_source = "live"
+        # Try the mirror first if a DB path was provided and the body is there.
+        if db_path:
+            with mirror_mod.open_db(db_path) as conn:
+                row = conn.execute(
+                    "SELECT body FROM filing_bodies_fts WHERE cik = ? AND accession = ?",
+                    (cik, target["accessionNumber"]),
+                ).fetchone()
+                if row and row[0]:
+                    body_text = row[0]
+                    body_source = "mirror"
+
+        if not body_text:
+            url = target.get("primary_doc_url", "")
+            if not url:
+                return {"error": "No primary document URL for filing"}
+            try:
+                html = self._get_text(url)
+            except Exception as exc:
+                return {"error": f"Could not fetch filing body: {exc}"}
+            body_text = html_to_text(html)
+
+        schema = form.upper()
+        out = items_mod.extract_section(body_text, section, schema=schema)
+        if "error" in out:
+            return {**out, "filing": {
+                "accession": target.get("accessionNumber", ""),
+                "filed": target.get("filingDate", ""),
+                "form": target.get("form", ""),
+                "filing_url": target.get("filing_url", ""),
+            }}
+        truncated_text = out["text"][:max_chars]
+        truncated = len(truncated_text) < len(out["text"])
+        return {
+            "cik": cik,
+            "ticker": company.get("ticker", ""),
+            "name": company.get("name", ""),
+            "filing": {
+                "accession": target.get("accessionNumber", ""),
+                "filed": target.get("filingDate", ""),
+                "form": target.get("form", ""),
+                "filing_url": target.get("filing_url", ""),
+            },
+            "body_source": body_source,
+            "body_length": len(body_text),
+            "section": {
+                "item": out["item"],
+                "title": out["title"],
+                "text": truncated_text,
+                "length": out["length"],
+                "truncated_to_max_chars": truncated,
+                "confidence": out["confidence"],
+                "items_found_in_document": out["items_in_document"],
+            },
+            "caveat": ("Item-level extraction is heuristic. Confidence "
+                       "`high` means the section is bounded by the next Item "
+                       "header; `medium` runs to end-of-document; `low` means "
+                       "only one Item header matched (likely a parsing miss)."),
+        }
+
+    def _fetch_13f_holdings(self, cik: str, accession: str) -> list[dict]:
+        """Fetch and parse the infoTable XML for one 13F-HR accession.
+
+        13F filings ship two related XMLs: `primary_doc.xml` (the cover) and
+        an `INFORMATION TABLE` document with line-item holdings. The
+        information-table filename is filer-specific (often `*infotable.xml`,
+        but sometimes `<accn-suffix>.xml`). Match by document type first,
+        then by filename heuristic, and only consider .xml files.
+        """
+        docs = self.filing_documents(cik, accession)
+        if "error" in docs:
+            return []
+        for doc in docs.get("documents", []):
+            doc_type = (doc.get("type") or "").upper()
+            name = (doc.get("document") or "").lower()
+            url = doc.get("url", "")
+            if not url or not name.endswith(".xml"):
+                continue
+            is_info_table = (
+                "INFORMATION TABLE" in doc_type
+                or name.endswith("infotable.xml")
+                or name.endswith("info_table.xml")
+            )
+            if not is_info_table:
+                continue
+            try:
+                xml = self._get_text(url)
+            except Exception:
+                continue
+            return holders_mod.parse_infotable_xml(xml)
+        return []
+
+    def holdings(self, identifier: str | int, quarter: Optional[str] = None,
+                 top_n: int = 50) -> dict:
+        """Single 13F filer's holdings (most recent quarter unless `quarter` given).
+
+        `quarter` accepts forms like `2025Q4`, `CY2025Q4`, or a date string —
+        the CLI matches against `periodOfReport` / filing date heuristically.
+        """
+        company = self.resolve_company(identifier)
+        if "error" in company:
+            return company
+        cik = company["cik"]
+        result = self.submissions(identifier, form="13F-HR", limit=20)
+        if "error" in result:
+            return result
+        filings = result.get("filings", [])
+        if not filings:
+            return {"error": f"No 13F-HR filings for {identifier}", "rows": []}
+
+        chosen = filings[0]
+        if quarter:
+            qmatch = re.match(r"(?:CY)?(\d{4})Q([1-4])", str(quarter).upper())
+            if qmatch:
+                year, q = int(qmatch.group(1)), int(qmatch.group(2))
+                # Quarter end month (Mar/Jun/Sep/Dec)
+                end_month = {1: "03", 2: "06", 3: "09", 4: "12"}[q]
+                wanted = f"{year}-{end_month}"
+                for f in filings:
+                    if (f.get("primaryDocument", "")
+                            and (f.get("filingDate", "").startswith(f"{year}")
+                                 or wanted in f.get("primaryDocument", ""))):
+                        chosen = f
+                        break
+
+        rows = self._fetch_13f_holdings(cik, chosen.get("accessionNumber", ""))
+        agg = holders_mod.aggregate_filer_holdings(rows, top_n=top_n)
+        return {
+            "cik": cik,
+            "ticker": company.get("ticker", ""),
+            "name": company.get("name", ""),
+            "filing": {
+                "accession": chosen.get("accessionNumber", ""),
+                "form": chosen.get("form", ""),
+                "filed": chosen.get("filingDate", ""),
+                "filing_url": chosen.get("filing_url", ""),
+            },
+            "rows": rows,
+            **agg,
+            "caveat": ("13F-HR reports holdings 45 days after quarter-end and "
+                       "covers only equity securities listed in 13F-HR Section "
+                       "13(f) tables. Short positions are not disclosed."),
+        }
+
+    def holders(self, identifier: str | int, candidates: list[str],
+                quarter: Optional[str] = None, top_n: int = 25,
+                cusip: Optional[str] = None,
+                max_filers: int = 30) -> dict:
+        """Find which institutional filers in a candidate list hold an issuer.
+
+        SEC does not publish a ticker→CUSIP map, so the search matches on
+        `nameOfIssuer` substrings (case-insensitive) and on `cusip` if the
+        caller supplies one. For comprehensive coverage, pass an explicit
+        `cusip`.
+        """
+        company = self.resolve_company(identifier)
+        if "error" in company:
+            return company
+        target_name = (company.get("name") or str(identifier)).strip().upper()
+        # Drop common suffixes for fuzzier substring match.
+        needle = re.sub(r"\b(INC|CORP|CORPORATION|CO|LTD|LLC|PLC|HOLDINGS|GROUP)\b",
+                        "", target_name).strip(", .").strip()
+
+        per_filer_rows = []
+        scanned = 0
+        skipped = 0
+        for cand in candidates[:max_filers]:
+            cand_company = self.resolve_company(cand)
+            if "error" in cand_company:
+                skipped += 1
+                continue
+            cand_cik = cand_company["cik"]
+            # `resolve_company` leaves `name` empty for direct-CIK lookups;
+            # fall back to the submissions JSON so cross-filer rollups carry
+            # readable names.
+            if not cand_company.get("name"):
+                dei = self.dei(cand)
+                if "error" not in dei:
+                    cand_company["name"] = dei.get("name", "")
+                    cand_company["ticker"] = cand_company.get("ticker") or dei.get("ticker", "")
+            holdings_result = self.submissions(cand, form="13F-HR", limit=4)
+            if "error" in holdings_result:
+                skipped += 1
+                continue
+            f13s = holdings_result.get("filings", [])
+            if not f13s:
+                skipped += 1
+                continue
+            chosen = f13s[0]
+            if quarter:
+                qmatch = re.match(r"(?:CY)?(\d{4})Q([1-4])", str(quarter).upper())
+                if qmatch:
+                    year = int(qmatch.group(1))
+                    for f in f13s:
+                        if f.get("filingDate", "").startswith(str(year)):
+                            chosen = f
+                            break
+            scanned += 1
+            rows = self._fetch_13f_holdings(cand_cik, chosen.get("accessionNumber", ""))
+            for r in rows:
+                issuer = (r.get("name_of_issuer") or "").upper()
+                cusip_match = cusip and r.get("cusip", "") == cusip
+                name_match = needle and needle in issuer
+                if cusip_match or name_match:
+                    r2 = dict(r)
+                    r2["filer_cik"] = cand_cik
+                    r2["filer_name"] = cand_company.get("name", "")
+                    r2["filer_ticker"] = cand_company.get("ticker", "")
+                    r2["filing_filed"] = chosen.get("filingDate", "")
+                    r2["filing_accession"] = chosen.get("accessionNumber", "")
+                    per_filer_rows.append(r2)
+
+        agg = holders_mod.aggregate_holders(per_filer_rows)
+        return {
+            "issuer_cik": company["cik"],
+            "issuer_name": company.get("name", ""),
+            "match_strategy": ("cusip" if cusip else "issuer_name_substring"),
+            "needle": cusip or needle,
+            "candidates_total": len(candidates),
+            "candidates_scanned": scanned,
+            "candidates_skipped": skipped,
+            "rows": per_filer_rows[:top_n],
+            **agg,
+            "caveat": ("Without an explicit --cusip, matching is by issuer-name "
+                       "substring against 13F filers' nameOfIssuer field. Some "
+                       "filers report shorter or longer names; cross-check "
+                       "share counts before relying on cross-filer totals."),
+        }
 
     def insiders(self, identifier: str | int, since: Optional[str] = None,
                  limit: int = 50, max_form4_fetches: int = 50) -> dict:
