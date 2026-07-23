@@ -48,7 +48,11 @@ DATA_BASE_URL = "https://data.sec.gov"
 SEC_BASE_URL = "https://www.sec.gov"
 COMPANY_TICKERS_URL = f"{SEC_BASE_URL}/files/company_tickers_exchange.json"
 
-SCHEMA_VERSION = "1.0.0"
+# 1.1.0: filing rows gained snake_case aliases (accession, filed, ...);
+# EFTS search dropped the never-populated `highlight` field and gained
+# file_type/file_description/period_ending + a disclosed default date window;
+# every command now answers `edgar schema` (coarse schemas marked as such).
+SCHEMA_VERSION = "1.1.0"
 
 DEFAULT_CACHE_TTL = 900
 DEFAULT_RATE_LIMIT_INTERVAL = 0.2
@@ -634,6 +638,13 @@ class EdgarClient(BaseAPIClient):
             return companies[0]
         if not companies:
             return {"error": f"No company found for {identifier}"}
+
+        if len({c.get("cik") for c in companies}) == 1:
+            # Multiple share classes of one filer (BRK-A/BRK-B) — same CIK,
+            # so the match is not actually ambiguous.
+            resolved = dict(companies[0])
+            resolved["share_class_tickers"] = [c.get("ticker", "") for c in companies]
+            return resolved
 
         choices = ", ".join(f"{c['ticker']} ({c['cik']})" for c in companies[:5])
         return {"error": f"Ambiguous company identifier {identifier}; matches: {choices}"}
@@ -1373,6 +1384,7 @@ class EdgarClient(BaseAPIClient):
         return {
             "cik": normalize_cik(cik),
             "accessionNumber": accession_number,
+            "accession": accession_number,
             "filing_url": urls["filing_url"],
             "documents": documents,
         }
@@ -1445,7 +1457,7 @@ class EdgarClient(BaseAPIClient):
                     event_types.add(event_type)
                     snippets[event_type] = snippet
             if event_types:
-                events.append({
+                events.append(alias_filing_row({
                     "filingDate": filing.get("filingDate", ""),
                     "form": filing.get("form", ""),
                     "items": filing.get("items", ""),
@@ -1453,7 +1465,7 @@ class EdgarClient(BaseAPIClient):
                     "filing_url": filing.get("filing_url", ""),
                     "event_types": sorted(event_types),
                     "snippets": snippets,
-                })
+                }))
         return {"cik": result["cik"], "name": result["name"], "events": events, "total": len(events)}
 
     def dashboard(self, identifier: str | int) -> dict:
@@ -2422,10 +2434,13 @@ class EdgarClient(BaseAPIClient):
         """
         with mirror_mod.open_db(db_path) as conn:
             try:
+                body_count = conn.execute(
+                    "SELECT COUNT(*) FROM filing_bodies"
+                ).fetchone()[0]
+            except sqlite3.OperationalError:
+                body_count = 0
+            try:
                 if mode == "auto":
-                    body_count = conn.execute(
-                        "SELECT COUNT(*) FROM filing_bodies"
-                    ).fetchone()[0]
                     mode = "bodies" if body_count else "metadata"
                 if mode == "bodies":
                     rows = mirror_mod.search_bodies(conn, query, form=form,
@@ -2435,8 +2450,16 @@ class EdgarClient(BaseAPIClient):
                                                      since=since, ciks=ciks, limit=limit)
             except sqlite3.OperationalError as exc:
                 return {"error": f"FTS query failed: {exc}", "matches": []}
-            return {"query": query, "mode": mode, "matches": rows,
-                    "total": len(rows), "db_path": str(db_path)}
+            out = {"query": query, "mode": mode, "matches": rows,
+                   "total": len(rows), "db_path": str(db_path)}
+            if mode == "metadata" and body_count == 0:
+                out["hint"] = (
+                    "This mirror has no filing bodies ingested — metadata search "
+                    "only covers form/items/description/filename. Re-run "
+                    "`edgar mirror ... --with-bodies-for FORM` to enable "
+                    "full-text body search."
+                )
+            return out
 
     def search_efts(self, query: str, form: Optional[str] = None,
                     since: Optional[str] = None,
@@ -2449,6 +2472,7 @@ class EdgarClient(BaseAPIClient):
         rate. Use the local mirror path for serious corpus work.
         """
         params: dict[str, Any] = {"q": query, "hits": min(limit, 100)}
+        applied_default_since = None
         if form:
             params["forms"] = form
         if since:
@@ -2459,6 +2483,19 @@ class EdgarClient(BaseAPIClient):
             params["dateRange"] = "custom"
             params["startdt"] = "2001-01-01"
             params["enddt"] = until
+        else:
+            # EFTS ranks by relevance only, so an unbounded query surfaces
+            # decades-old filings first. Default to a recent window and
+            # disclose it — override with an explicit --since (e.g. 2001-01-01).
+            today_d = date.today()
+            try:
+                since_d = today_d.replace(year=today_d.year - 5)
+            except ValueError:  # Feb 29
+                since_d = today_d.replace(year=today_d.year - 5, day=28)
+            applied_default_since = since_d.isoformat()
+            params["dateRange"] = "custom"
+            params["startdt"] = applied_default_since
+            params["enddt"] = today_d.isoformat()
         if cik:
             params["ciks"] = cik
         url = "https://efts.sec.gov/LATEST/search-index"
@@ -2473,19 +2510,28 @@ class EdgarClient(BaseAPIClient):
             adsh = src.get("adsh", "")
             ciks = src.get("ciks") or []
             primary_cik = ciks[0] if ciks else ""
+            # EFTS does not return text snippets/highlights for any known
+            # parameter (probed live 2026-07); only _source metadata exists.
             matches.append({
                 "accession": adsh,
                 "filed": src.get("file_date", ""),
                 "form": src.get("form", ""),
+                "file_type": src.get("file_type", ""),
+                "file_description": src.get("file_description", ""),
+                "period_ending": src.get("period_ending", ""),
                 "ciks": ciks,
                 "primary_cik": primary_cik,
                 "display_names": display_names,
-                "highlight": (hit.get("highlight") or {}).get("text") or [],
                 "score": hit.get("_score"),
             })
-        return {"query": query, "matches": matches,
-                "total_available": result.get("hits", {}).get("total", {}).get("value"),
-                "returned": len(matches)}
+        out = {"query": query, "matches": matches,
+               "total_available": result.get("hits", {}).get("total", {}).get("value"),
+               "returned": len(matches)}
+        if applied_default_since:
+            out["applied_default_since"] = applied_default_since
+            out["note"] = ("No --since/--until given; searched the last 5 years. "
+                           "Pass --since to widen (EFTS full-text coverage starts 2001).")
+        return out
 
     def resolve(self, identifiers: list[str]) -> dict:
         """Batch resolve identifiers to CIKs, with ambiguity metadata per row."""
@@ -2691,18 +2737,18 @@ class EdgarClient(BaseAPIClient):
                     if not best or cand.get("filingDate", "") > best.get("filingDate", ""):
                         best = cand
             chains.append({
-                "amendment": {
+                "amendment": alias_filing_row({
                     "filingDate": amd.get("filingDate"),
                     "form": amd.get("form"),
                     "accessionNumber": amd.get("accessionNumber"),
                     "filing_url": amd.get("filing_url"),
-                },
-                "primary": {
+                }),
+                "primary": alias_filing_row({
                     "filingDate": best.get("filingDate"),
                     "form": best.get("form"),
                     "accessionNumber": best.get("accessionNumber"),
                     "filing_url": best.get("filing_url"),
-                } if best else None,
+                }) if best else None,
             })
         chains = chains[:limit]
         return {
@@ -3404,6 +3450,7 @@ class EdgarClient(BaseAPIClient):
             if end_date and filing_date > end_date:
                 continue
             row.update(filing_urls(cik, accession, row.get("primaryDocument", "")))
+            alias_filing_row(row)
             rows.append(row)
             if len(rows) >= limit:
                 break

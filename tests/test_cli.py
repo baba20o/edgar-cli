@@ -394,3 +394,28 @@ def test_metrics_bundle_groups_expand(monkeypatch):
     assert result.exit_code == 0
     assert "revenue" in captured["labels"]
     assert "operating_income" in captured["labels"]
+
+
+def test_output_schemas_cover_every_data_command():
+    from edgar.cli import PRIMARY_ROW_KEYS, _output_schemas
+
+    schemas = _output_schemas()
+    missing = set(PRIMARY_ROW_KEYS) - set(schemas)
+    assert not missing
+    for command, schema in schemas.items():
+        assert "primary_row_key" in schema, command
+        if schema.get("primary_row_key"):
+            assert schema["primary_row_key"] in schema["properties"], command
+    # Hand-written schemas stay detailed, generated ones say so.
+    assert not _output_schemas()["concept"].get("coarse")
+    assert _output_schemas()["holdings"]["coarse"] is True
+
+
+def test_schema_no_arg_lists_primary_row_keys():
+    result = CliRunner().invoke(main, ["schema", "--json-output"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["primary_row_keys"]["concept"] == "facts"
+    assert payload["primary_row_keys"]["holdings"] == "rows"
+    assert payload["primary_row_keys"]["dashboard"] is None

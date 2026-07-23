@@ -85,7 +85,9 @@ def _rows_for_export(result: dict) -> list[dict]:
         return []
     for key in ("facts", "matches", "filings", "concepts", "documents",
                 "events", "rows", "ratios", "metrics", "transactions",
-                "results", "lines", "flags", "checks", "peers", "frames"):
+                "results", "lines", "flags", "checks", "peers", "frames",
+                "companies", "candidates", "highlights", "proposals",
+                "chains", "new_filings", "growth", "archives"):
         rows = result.get(key)
         if isinstance(rows, list) and rows and isinstance(rows[0], dict):
             return rows
@@ -282,7 +284,20 @@ def _markdown_table(headers: list[str], rows: list[list]) -> str:
     return "\n".join(lines)
 
 
+def _export_csv_option_callback(ctx, param, value):
+    # Stored on ctx.obj (not passed to the command function) so the same
+    # flag works both before and after the subcommand.
+    if value is not None:
+        ctx.ensure_object(dict)
+        ctx.obj["export_csv"] = value
+    return value
+
+
 def output_options(fn):
+    fn = click.option("--export-csv", "export_csv",
+                      type=click.Path(dir_okay=False, path_type=Path), default=None,
+                      expose_value=False, callback=_export_csv_option_callback,
+                      help="Also write the primary tabular result to a CSV file")(fn)
     fn = click.option("--ndjson", is_flag=True, help="Stream primary rows as newline-delimited JSON")(fn)
     fn = click.option("--json-output", "-j", is_flag=True, help="Output raw JSON")(fn)
     fn = click.option("--markdown", "-m", is_flag=True, help="Output markdown; best for agents and reports")(fn)
@@ -1184,7 +1199,10 @@ def schema(command_name, markdown, json_output, ndjson):
     """Print a JSON schema describing the output of a command (or list known schemas)."""
     schemas = _output_schemas()
     if not command_name:
-        payload = {"available": sorted(schemas)}
+        payload = {
+            "available": sorted(schemas),
+            "primary_row_keys": {c: PRIMARY_ROW_KEYS[c] for c in sorted(PRIMARY_ROW_KEYS)},
+        }
         if ndjson:
             _ndjson([payload])
             return
@@ -1200,12 +1218,60 @@ def schema(command_name, markdown, json_output, ndjson):
     _json(schemas[command_name])
 
 
+# Primary list-of-rows field per data command, so agents can find the payload
+# without sampling live output. None = composite/scalar envelope.
+PRIMARY_ROW_KEYS: dict = {
+    "search-companies": "companies",
+    "company": "filings",
+    "filings": "filings",
+    "facts": "concepts",
+    "concept": "facts",
+    "frame": "facts",
+    "exhibits": "documents",
+    "earnings": "highlights",
+    "events": "events",
+    "compare": "companies",
+    "metrics": "metrics",
+    "brief": "metrics",
+    "dei": None,
+    "peers": "peers",
+    "concept-info": "candidates",
+    "tags": "matches",
+    "frames": "frames",
+    "ttm": "metrics",
+    "ratios": "ratios",
+    "trend": "facts",
+    "growth": "growth",
+    "reconstruct": None,
+    "resolve": "results",
+    "diff": "rows",
+    "search": "matches",
+    "dashboard": None,
+    "governance": "proposals",
+    "item": None,
+    "holdings": "rows",
+    "holders": "rows",
+    "insiders": "transactions",
+    "quality": "flags",
+    "verify": "checks",
+    "statements": "lines",
+    "audit-trail": "facts",
+    "amendments": "chains",
+    "delta": "new_filings",
+    "pending": "subscriptions",
+    "bulk-urls": "archives",
+}
+
+
 def _output_schemas() -> dict:
-    """Return JSON schemas for the most-used command outputs.
+    """Return JSON schemas for every data command's output.
 
     Schemas are intentionally pragmatic: they describe top-level shape and the
     key fields agents will read. They are not exhaustive — agents should treat
-    them as a contract over named fields, not a closed-world spec.
+    them as a contract over named fields, not a closed-world spec. Commands
+    without a hand-written schema get a coarse envelope schema (marked
+    `"coarse": true`) so `edgar schema CMD` answers for every command. Each
+    schema carries `primary_row_key` naming its main list-of-rows field.
     """
     fact_schema = {
         "type": "object",
@@ -1237,7 +1303,21 @@ def _output_schemas() -> dict:
             },
         },
     }
-    return {
+    filing_row_schema = {
+        "type": "object",
+        "description": ("SEC camelCase passthrough plus snake_case aliases "
+                        "(added in schema_version 1.1.0)"),
+        "properties": {
+            "form": {"type": "string"},
+            "accession": {"type": "string"}, "accessionNumber": {"type": "string"},
+            "filed": {"type": "string"}, "filingDate": {"type": "string"},
+            "report_date": {"type": "string"}, "reportDate": {"type": "string"},
+            "primary_document": {"type": "string"}, "primaryDocument": {"type": "string"},
+            "items": {"type": "string"},
+            "filing_url": {"type": "string"}, "primary_doc_url": {"type": "string"},
+        },
+    }
+    schemas = {
         "concept": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -1302,7 +1382,7 @@ def _output_schemas() -> dict:
             "type": "object",
             "properties": {
                 **envelope_meta,
-                "filings": {"type": "array", "items": {"type": "object"}},
+                "filings": {"type": "array", "items": filing_row_schema},
                 "warning": {"type": "string"},
             },
         },
@@ -1321,6 +1401,21 @@ def _output_schemas() -> dict:
             },
         },
     }
+    for command, row_key in PRIMARY_ROW_KEYS.items():
+        if command in schemas:
+            schemas[command]["primary_row_key"] = row_key
+            continue
+        properties = dict(envelope_meta)
+        if row_key:
+            items = filing_row_schema if row_key == "filings" else {"type": "object"}
+            properties[row_key] = {"type": "array", "items": items}
+        schemas[command] = {
+            "type": "object",
+            "properties": properties,
+            "primary_row_key": row_key,
+            "coarse": True,
+        }
+    return schemas
 
 
 @main.command()
@@ -2093,7 +2188,9 @@ def cache_stats(ctx, markdown, json_output, ndjson):
     if _wants_json(json_output, markdown, ndjson):
         _json(stats)
         return
-    rows = [[k, str(v)] for k, v in stats.items()]
+    rows = [[k, str(v)] for k, v in stats.items() if k != "endpoint_ttls"]
+    for entry in stats.get("endpoint_ttls", []):
+        rows.append([f"ttl {entry['pattern']}", f"{entry['ttl_seconds']}s"])
     if markdown:
         click.echo(_markdown_table(["Field", "Value"], rows))
         return

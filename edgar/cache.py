@@ -237,8 +237,16 @@ class EdgarCache:
 
     def stats(self) -> dict:
         base = self._inner.stats()
-        base["max_bytes"] = self.max_bytes
+        # The inner FileCache reports one flat ttl, but per-endpoint policies
+        # override it — present it as the default plus the policy table.
+        base.pop("ttl", None)
+        base["default_ttl"] = self.default_ttl
         base["negative_ttl"] = self.negative_ttl
+        base["max_bytes"] = self.max_bytes
+        base["endpoint_ttls"] = [
+            {"pattern": pattern.pattern, "ttl_seconds": ttl}
+            for pattern, ttl in ENDPOINT_TTLS
+        ]
         return base
 
     def warm(self, urls: list[str], fetcher) -> dict:

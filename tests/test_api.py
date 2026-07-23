@@ -1713,3 +1713,87 @@ def test_growth_qoq_uses_quarterly_facts_even_for_annual_period_type():
     assert blocks["qoq"]["rates"][0]["period_end"] == "2025-10-26"
     assert "note" in blocks["qoq"]
     assert blocks["yoy"]["rates"][0]["period_end"] == "2026-01-25"
+
+
+def test_governance_proposal_title_tolerates_corporate_suffix_periods():
+    from edgar.governance import extract_proposals
+
+    text = ("To vote on Proposal 4 — Approval of the Apple Inc. Amended "
+            "Employee Stock Plan. Proposal 5 — Ratification of Auditors.")
+    props = {p["number"]: p["title"] for p in extract_proposals(text)}
+    assert props[4] == "Approval of the Apple Inc. Amended Employee Stock Plan"
+    assert props[5] == "Ratification of Auditors"
+
+
+def test_recent_filings_rows_carry_snake_case_aliases():
+    data = {
+        "cik": "320193",
+        "filings": {"recent": {
+            "accessionNumber": ["0000320193-26-000013"],
+            "filingDate": ["2026-05-01"],
+            "reportDate": ["2026-03-28"],
+            "form": ["10-Q"],
+            "primaryDocument": ["aapl-20260328.htm"],
+        }},
+    }
+    rows = EdgarClient._recent_filings(data, limit=5)
+    row = rows[0]
+    assert row["accession"] == row["accessionNumber"] == "0000320193-26-000013"
+    assert row["filed"] == row["filingDate"] == "2026-05-01"
+    assert row["report_date"] == "2026-03-28"
+    assert row["primary_document"] == "aapl-20260328.htm"
+
+
+def test_search_efts_applies_default_window_and_drops_highlight():
+    client = EdgarClient(cache=None, rate_limiter=None, use_cache=False)
+    captured = {}
+
+    def fake_get(path, params=None, skip_cache=False):
+        captured.update(params or {})
+        return {"hits": {"total": {"value": 1}, "hits": [{
+            "_score": 12.3,
+            "_source": {"adsh": "0000000000-26-000001", "file_date": "2026-01-05",
+                        "form": "10-K", "ciks": ["0000320193"],
+                        "display_names": ["Apple Inc. (AAPL)"],
+                        "file_type": "10-K", "file_description": "Annual report",
+                        "period_ending": "2025-09-27"},
+        }]}}
+
+    client._get = fake_get
+    out = client.search_efts("supply chain")
+    # No --since/--until: a 5-year window is applied and disclosed.
+    assert captured["dateRange"] == "custom"
+    assert captured["startdt"] == out["applied_default_since"]
+    assert "note" in out
+    match = out["matches"][0]
+    # EFTS never returns highlights (probed live) — the field is gone, and
+    # the _source metadata that does exist is surfaced instead.
+    assert "highlight" not in match
+    assert match["file_type"] == "10-K"
+    assert match["period_ending"] == "2025-09-27"
+    # An explicit since suppresses the default window.
+    captured.clear()
+    out2 = client.search_efts("supply chain", since="2001-01-01")
+    assert captured["startdt"] == "2001-01-01"
+    assert "applied_default_since" not in out2
+
+
+def test_search_mirror_hints_when_no_bodies_ingested(tmp_path):
+    from edgar.mirror import open_db, ingest_submissions
+
+    db_path = tmp_path / "m.sqlite"
+    submissions = {
+        "cik": "320193", "name": "Apple Inc.",
+        "filings": {"recent": {
+            "accessionNumber": ["0000320193-26-000013"],
+            "filingDate": ["2026-05-01"],
+            "form": ["10-Q"],
+            "primaryDocument": ["aapl-20260328.htm"],
+        }},
+    }
+    with open_db(db_path) as conn:
+        ingest_submissions(conn, "0000320193", submissions)
+    client = EdgarClient(cache=None, rate_limiter=None, use_cache=False)
+    out = client.search_mirror(str(db_path), "10-Q")
+    assert out["mode"] == "metadata"
+    assert "hint" in out and "--with-bodies-for" in out["hint"]

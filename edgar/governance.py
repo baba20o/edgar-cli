@@ -53,11 +53,48 @@ _BOARD_SIZE_PATTERNS = [
 ]
 
 
-# Shareholder proposals — count occurrences of "Proposal X" or "Item X" sections
+# Shareholder proposals — count occurrences of "Proposal X" or "Item X"
+# sections. The title capture must not run into the next proposal marker.
 _PROPOSAL_PATTERN = re.compile(
-    r"\b(?:Proposal|Item|PROPOSAL)\s+(?:No\.?\s+)?(\d+)[\s—\-:.]*([^\n]{1,80}?)(?=[\.\?\n])",
+    r"\b(?:Proposal|Item|PROPOSAL)\s+(?:No\.?\s+)?(\d+)[\s—\-:.]*"
+    r"((?:(?!\b(?:Proposal|Item)\s+(?:No\.?\s+)?\d)[^\n]){1,120})",
     re.IGNORECASE,
 )
+
+# HTML-stripped proxies lose the line break between a heading and its body,
+# so a capitalized sentence opener — or a subject+verb phrase like
+# "Apple has been advised" — marks where the title ends.
+_TITLE_BODY_BOUNDARY = re.compile(
+    r"\s(?=(?:The|We|In|This|Our|At|As|If|Under|Pursuant|Shareholders|Stockholders)\b"
+    r"|[A-Z][A-Za-z]*\s+(?:has|have|had|is|are|was|were|will|would|believes|recommends)\b)"
+)
+
+# Periods inside these tokens are abbreviations, not sentence ends.
+_TITLE_ABBREVIATIONS = {
+    "inc", "corp", "co", "ltd", "llc", "plc", "lp", "na", "sa", "us", "no",
+    "mr", "ms", "dr", "jr", "sr", "st",
+}
+
+
+def _trim_proposal_title(segment: str) -> str:
+    """Cut at the first sentence-ending punctuation, tolerating periods in
+    corporate suffixes ("Apple Inc. Amended ... Plan") and initials, then at
+    the first heading→body transition."""
+    out = segment
+    for m in re.finditer(r"[.?]", segment):
+        if m.group() == "?":
+            out = segment[:m.start()]
+            break
+        word = re.search(r"([A-Za-z.]+)$", segment[:m.start()])
+        token = word.group(1).replace(".", "").lower() if word else ""
+        if token in _TITLE_ABBREVIATIONS or len(token) == 1:
+            continue
+        out = segment[:m.start()]
+        break
+    boundary = _TITLE_BODY_BOUNDARY.search(out)
+    if boundary:
+        out = out[:boundary.start()]
+    return out
 
 
 # Executive comp — match common SCT (Summary Compensation Table) row labels.
@@ -142,11 +179,13 @@ def extract_proposals(text: str, max_proposals: int = 12) -> list[dict]:
             continue
         if num < 1 or num > 20:
             continue
-        title = m.group(2).strip().rstrip(":.,—–-")
+        title = _trim_proposal_title(m.group(2)).strip().rstrip(":.,—–-")
         if not title or len(title) < 4:
             continue
-        # Lowercase mid-sentence references look like noise.
-        if title[0].islower() and " " in title and len(title.split()) <= 3:
+        # Lowercase openers are mid-sentence references to the proposal
+        # ("Proposal 5 was submitted by..."), not its heading — skip so a
+        # later real heading can claim the number.
+        if title[0].islower():
             continue
         if num not in seen:
             seen[num] = {"number": num, "title": title, "offset": m.start()}
