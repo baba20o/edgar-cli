@@ -1571,3 +1571,145 @@ def test_extract_earnings_highlights_skips_table_dumps():
     texts = [h["text"] for h in out]
     assert any("posted quarterly revenue" in t for t in texts)
     assert not any("Three Months Ended Six Months" in t for t in texts)
+
+
+# --- regressions for live test-drive findings (docs/FINDINGS.md) ---
+
+
+def test_facts_for_alias_dedupes_reported_periods():
+    """Comparative re-reports of the same period must collapse to latest-filed."""
+    client = EdgarClient(cache=None, rate_limiter=None, use_cache=False)
+
+    def fake_alias(identifier, alias, **kwargs):
+        return {
+            "tag": "Revenues",
+            "facts": [
+                {"start": "2023-01-30", "end": "2024-01-28", "val": 60922, "filed": "2024-02-21"},
+                {"start": "2023-01-30", "end": "2024-01-28", "val": 60922, "filed": "2025-02-26"},
+                {"start": "2023-01-30", "end": "2024-01-28", "val": 60922, "filed": "2026-02-25"},
+                {"start": "2024-01-29", "end": "2025-01-26", "val": 130497, "filed": "2025-02-26"},
+            ],
+        }
+
+    client.company_concept_alias = fake_alias
+    facts = client._facts_for_alias("NVDA", "revenue", period_type="annual", limit=8)
+    assert [f["end"] for f in facts] == ["2025-01-26", "2024-01-28"]
+    assert facts[1]["filed"] == "2026-02-25"
+
+
+def test_ttm_stub_accepts_q1_quarter_as_current_ytd():
+    """A Q1 10-Q fact (classified quarterly, not ytd) must trigger stub TTM."""
+    client = EdgarClient(cache=None, rate_limiter=None, use_cache=False)
+    annual = {"val": 215938, "start": "2025-01-27", "end": "2026-01-25", "filed": "2026-02-25"}
+    q1_cur = {"val": 81615, "start": "2026-01-26", "end": "2026-04-26", "filed": "2026-05-20"}
+    q1_prior = {"val": 44062, "start": "2025-01-27", "end": "2025-04-27", "filed": "2026-05-20"}
+
+    def fake_facts(cik, alias, period_type=None, as_of=None, limit=24):
+        return {"annual": [annual], "ytd": [], "quarterly": [q1_cur, q1_prior]}.get(period_type, [])
+
+    client._facts_for_alias = fake_facts
+    out = client._ttm_stub_period("0001045810", "revenue", as_of=None)
+    assert out["value"] == 215938 + 81615 - 44062
+    assert "no interim filings" not in out["formula"]
+
+
+def test_ttm_stub_fy_only_message_requires_truly_no_interim():
+    client = EdgarClient(cache=None, rate_limiter=None, use_cache=False)
+    annual = {"val": 215938, "start": "2025-01-27", "end": "2026-01-25", "filed": "2026-02-25"}
+
+    def fake_facts(cik, alias, period_type=None, as_of=None, limit=24):
+        return [annual] if period_type == "annual" else []
+
+    client._facts_for_alias = fake_facts
+    out = client._ttm_stub_period("0001045810", "revenue", as_of=None)
+    assert out["value"] == 215938
+    assert "no interim filings" in out["formula"]
+
+
+def test_build_fiscal_grid_prefers_earliest_filed_fy_row():
+    from edgar.api import build_fiscal_grid
+
+    rows = [
+        # FY2025 primary in its own 10-K...
+        {"fp": "FY", "fy": 2025, "start": "2024-01-29", "end": "2025-01-26", "filed": "2025-02-26"},
+        # ...re-reported as a comparative in the FY2026 10-K with the filing's fy.
+        {"fp": "FY", "fy": 2026, "start": "2024-01-29", "end": "2025-01-26", "filed": "2026-02-25"},
+        {"fp": "FY", "fy": 2026, "start": "2025-01-27", "end": "2026-01-25", "filed": "2026-02-25"},
+        # Quarterly rows never enter the grid.
+        {"fp": "Q1", "fy": 2026, "start": "2025-01-27", "end": "2025-04-27", "filed": "2025-05-28"},
+    ]
+    grid = build_fiscal_grid(rows)
+    assert [(str(s), str(e), fy) for s, e, fy in grid] == [
+        ("2024-01-29", "2025-01-26", 2025),
+        ("2025-01-27", "2026-01-25", 2026),
+    ]
+
+
+def test_fiscal_period_from_dates_labels_comparatives_and_extrapolates():
+    from edgar.api import build_fiscal_grid, fiscal_period_from_dates
+
+    grid = build_fiscal_grid([
+        {"fp": "FY", "fy": 2025, "start": "2024-01-29", "end": "2025-01-26", "filed": "2025-02-26"},
+        {"fp": "FY", "fy": 2026, "start": "2025-01-27", "end": "2026-01-25", "filed": "2026-02-25"},
+    ])
+    # Comparative quarter inside a known span: labeled by its own dates,
+    # not by the Q1-FY2027 filing it appeared in.
+    comparative = {"start": "2025-01-27", "end": "2025-04-27", "fy": 2027, "fp": "Q1",
+                   "period_type": "quarterly", "period_length_days": 90}
+    assert fiscal_period_from_dates(comparative, grid) == "Q1-FY2026"
+    # Primary quarter beyond the newest span extrapolates one quarter slot.
+    primary = {"start": "2026-01-26", "end": "2026-04-26", "fy": 2027, "fp": "Q1",
+               "period_type": "quarterly", "period_length_days": 90}
+    assert fiscal_period_from_dates(primary, grid) == "Q1-FY2027"
+    # Annual comparative keeps its own year.
+    annual_cmp = {"start": "2024-01-29", "end": "2025-01-26", "fy": 2026, "fp": "FY",
+                  "period_type": "annual", "period_length_days": 363}
+    assert fiscal_period_from_dates(annual_cmp, grid) == "FY2025"
+    # FY-end balance instant re-reported in a later 10-Q stays the FY balance.
+    instant = {"end": "2026-01-25", "fy": 2027, "fp": "Q1", "period_type": "instant",
+               "period_length_days": 0}
+    assert fiscal_period_from_dates(instant, grid) == "FY2026"
+
+
+def test_paired_growth_rates_does_not_bridge_missing_quarters():
+    from edgar.compute import paired_growth_rates
+
+    quarters = [
+        {"val": 46743, "end": "2025-07-27"},
+        {"val": 57006, "end": "2025-10-26"},
+        # Q4 FY2026 never tagged standalone — 182-day hole before Q1 FY2027.
+        {"val": 81615, "end": "2026-04-26"},
+    ]
+    rates = paired_growth_rates(quarters, 80, 110)
+    assert [r["period_end"] for r in rates] == ["2025-10-26"]
+    assert rates[0]["gap_days"] == 91
+    # YoY pairing over the same series finds only the ~365-day partner.
+    yoy = paired_growth_rates(
+        quarters + [{"val": 44062, "end": "2025-04-27"}], 350, 380)
+    assert [r["period_end"] for r in yoy] == ["2026-04-26"]
+    assert yoy[0]["prior_period_end"] == "2025-04-27"
+
+
+def test_growth_qoq_uses_quarterly_facts_even_for_annual_period_type():
+    client = EdgarClient(cache=None, rate_limiter=None, use_cache=False)
+    client.resolve_company = lambda identifier: {"cik": "0001045810", "name": "NVIDIA CORP",
+                                                 "ticker": "NVDA"}
+    annuals = [
+        {"val": 130497, "start": "2024-01-29", "end": "2025-01-26"},
+        {"val": 215938, "start": "2025-01-27", "end": "2026-01-25"},
+    ]
+    quarters = [
+        {"val": 46743, "start": "2025-04-28", "end": "2025-07-27"},
+        {"val": 57006, "start": "2025-07-28", "end": "2025-10-26"},
+    ]
+
+    def fake_facts(cik, alias, period_type=None, as_of=None, limit=24):
+        return quarters if period_type == "quarterly" else annuals
+
+    client._facts_for_alias = fake_facts
+    out = client.growth("NVDA", "revenue", basis=["yoy", "qoq"], period_type="annual")
+    blocks = {b["basis"]: b for b in out["growth"]}
+    assert blocks["qoq"]["period_basis"] == "quarterly"
+    assert blocks["qoq"]["rates"][0]["period_end"] == "2025-10-26"
+    assert "note" in blocks["qoq"]
+    assert blocks["yoy"]["rates"][0]["period_end"] == "2026-01-25"

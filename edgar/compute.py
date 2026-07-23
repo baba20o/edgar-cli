@@ -666,19 +666,53 @@ def trend_summary(facts: list[dict]) -> dict:
     }
 
 
-def growth_rates(facts: list[dict]) -> list[dict]:
-    """Per-period YoY-style change between adjacent facts in chronological order."""
-    sorted_facts = sorted(facts, key=lambda f: f.get("end", ""))
+def paired_growth_rates(facts: list[dict], min_gap_days: int,
+                        max_gap_days: int) -> list[dict]:
+    """Growth between each fact and the nearest earlier fact whose end-to-end
+    gap falls inside `[min_gap_days, max_gap_days]`.
+
+    Adjacent-row math silently bridges series holes (filers that never tag a
+    standalone Q4 leave a two-quarter gap labeled as one), so pairing is by
+    date distance: ~365 days for YoY, ~91 for QoQ. Facts without a partner
+    are omitted; each row carries `prior_period_end` and `gap_days` so the
+    pairing is auditable.
+    """
+    from datetime import datetime
+
+    def _end(f):
+        try:
+            return datetime.strptime(f.get("end", "") or "", "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            return None
+
+    dated = [(e, f) for f in facts if (e := _end(f)) is not None]
+    dated.sort(key=lambda pair: pair[0])
     out = []
-    for i in range(1, len(sorted_facts)):
-        prev = _value_or_none(sorted_facts[i - 1])
-        cur = _value_or_none(sorted_facts[i])
-        if prev in (None, 0) or cur is None:
+    for i, (cur_end, cur_fact) in enumerate(dated):
+        cur = _value_or_none(cur_fact)
+        if cur is None:
+            continue
+        partner = None
+        partner_end = None
+        for j in range(i - 1, -1, -1):
+            prev_end, prev_fact = dated[j]
+            gap = (cur_end - prev_end).days
+            if gap > max_gap_days:
+                break
+            if gap >= min_gap_days:
+                partner, partner_end = prev_fact, prev_end
+                break
+        if partner is None:
+            continue
+        prev = _value_or_none(partner)
+        if prev in (None, 0):
             continue
         out.append({
-            "period_end": sorted_facts[i].get("end", ""),
+            "period_end": cur_fact.get("end", ""),
             "value": cur,
             "prior_value": prev,
+            "prior_period_end": partner.get("end", ""),
+            "gap_days": (cur_end - partner_end).days,
             "growth": (cur - prev) / abs(prev),
         })
     return out

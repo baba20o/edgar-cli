@@ -396,6 +396,7 @@ class EdgarClient(BaseAPIClient):
         self.edgar_cache = edgar_cache
         self.use_cache = bool(use_cache_flag and edgar_cache is not None)
         self._cache_calls: list[dict] = []
+        self._fiscal_grids: dict[str, list[tuple]] = {}
 
     def _build_headers(self) -> dict[str, str]:
         return {
@@ -814,6 +815,46 @@ class EdgarClient(BaseAPIClient):
             latest["prior_values"] = distinct_vals
         return facts
 
+    def _fiscal_grid_for_cik(self, cik: str) -> list[tuple]:
+        """Best-known fiscal grid for a filer.
+
+        Prefers a grid remembered from a duration-tag query in this process;
+        falls back to a synthetic grid built from submissions'
+        `fiscalYearEnd` (MMDD). Synthetic span boundaries wobble a few days
+        for 52/53-week calendars — `fiscal_period_from_dates` absorbs that
+        with its ±6-day instant tolerance.
+        """
+        cached = self._fiscal_grids.get(cik)
+        if cached:
+            return cached
+        raw = self._get(f"/submissions/CIK{cik}.json")
+        if "error" in raw:
+            return []
+        fye = str(raw.get("fiscalYearEnd") or "")
+        if len(fye) != 4 or not fye.isdigit():
+            return []
+        month, day = int(fye[:2]), int(fye[2:])
+        if not 1 <= month <= 12:
+            return []
+
+        def _fy_end(year: int) -> date:
+            probe = min(day, 28) if month == 2 else day
+            while True:
+                try:
+                    return date(year, month, probe)
+                except ValueError:
+                    probe -= 1
+
+        this_year = date.today().year
+        grid = []
+        prev_end = _fy_end(this_year - 31)
+        for year in range(this_year - 30, this_year + 2):
+            end = _fy_end(year)
+            grid.append((prev_end + timedelta(days=1), end, year))
+            prev_end = end
+        self._fiscal_grids[cik] = grid
+        return grid
+
     def company_concept(self, identifier: str | int, taxonomy: str, tag: str,
                         unit: Optional[str] = None, limit: int = 20,
                         suggest_on_404: bool = True,
@@ -839,6 +880,15 @@ class EdgarClient(BaseAPIClient):
                 result["suggestions"] = self.suggest_concepts(company["cik"], taxonomy, tag)
             return result
 
+        # Fiscal grid from ALL rows (before unit/period filters) so comparative
+        # facts get labeled by their own dates, not the filing's fy/fp.
+        all_rows = [row for rows in result.get("units", {}).values() for row in rows]
+        fiscal_grid = build_fiscal_grid(all_rows)
+        if fiscal_grid:
+            self._fiscal_grids[company["cik"]] = fiscal_grid
+        elif all_rows:
+            # Instant-only tags (balance sheet) have no annual duration rows.
+            fiscal_grid = self._fiscal_grid_for_cik(company["cik"])
         facts = []
         for unit_name, rows in result.get("units", {}).items():
             if unit and unit_name != unit:
@@ -847,7 +897,7 @@ class EdgarClient(BaseAPIClient):
                 item = dict(row)
                 item["unit"] = unit_name
                 item.update(filing_urls(company["cik"], item.get("accn", ""), ""))
-                enrich_fact_metadata(item, company["cik"])
+                enrich_fact_metadata(item, company["cik"], fiscal_grid=fiscal_grid)
                 if period_type and item.get("period_type") != period_type:
                     continue
                 if as_of and item.get("filed", "") > as_of:
@@ -2723,15 +2773,30 @@ class EdgarClient(BaseAPIClient):
                          period_type: Optional[str] = None,
                          as_of: Optional[str] = None,
                          limit: int = 24) -> list[dict]:
+        """Return up to `limit` facts with one row per distinct period.
+
+        Comparatives re-report the same period across successive filings, so
+        the raw window is over-fetched and collapsed to the latest-filed fact
+        per `(start, end)` before trimming.
+        """
         result = self.company_concept_alias(
-            identifier, alias, limit=limit, period_type=period_type, as_of=as_of,
+            identifier, alias, limit=limit * 3, period_type=period_type, as_of=as_of,
         )
         if "error" in result:
             return []
         facts = result.get("facts", [])
         for f in facts:
             f.setdefault("tag", result.get("tag", ""))
-        return facts
+        best_by_period: dict[tuple[str, str], dict] = {}
+        for f in facts:
+            key = (f.get("start", "") or "", f.get("end", "") or "")
+            prev = best_by_period.get(key)
+            if prev is None or f.get("filed", "") > prev.get("filed", ""):
+                best_by_period[key] = f
+        deduped = sorted(best_by_period.values(),
+                         key=lambda f: (f.get("end", ""), f.get("filed", "")),
+                         reverse=True)
+        return deduped[:limit]
 
     def _instant_fact_at_period_end(self, identifier: str | int, alias: str,
                                     target_end: str,
@@ -2818,21 +2883,45 @@ class EdgarClient(BaseAPIClient):
         return out
 
     def _ttm_stub_period(self, cik: str, alias: str, as_of: Optional[str]) -> Optional[dict]:
-        """Build TTM from FY + current_YTD - prior_year_same_YTD."""
+        """Build TTM from FY + current_stub - prior_year_same_stub.
+
+        The current stub is the latest cumulative-since-FY-end duration fact.
+        A Q1 fact (90 days, classified `quarterly`) is exactly the 3-month
+        YTD, so both the `ytd` and `quarterly` pools are stub candidates —
+        restricting to `ytd` would miss the quarter right after FY end.
+        """
+        from datetime import datetime
+
+        def _parse(value: str):
+            try:
+                return datetime.strptime(value or "", "%Y-%m-%d").date()
+            except (ValueError, TypeError):
+                return None
+
         annual_facts = self._facts_for_alias(cik, alias, period_type="annual",
                                              as_of=as_of, limit=4)
-        ytd_facts = self._facts_for_alias(cik, alias, period_type="ytd",
-                                          as_of=as_of, limit=20)
-        if not annual_facts or not ytd_facts:
+        if not annual_facts:
             return None
+        stub_pool = self._facts_for_alias(cik, alias, period_type="ytd",
+                                          as_of=as_of, limit=20)
+        stub_pool += self._facts_for_alias(cik, alias, period_type="quarterly",
+                                           as_of=as_of, limit=20)
         # Latest annual fact (highest end).
         annual = max(annual_facts, key=lambda f: f.get("end", ""))
         annual_end = annual.get("end", "")
-        if not annual_end:
+        annual_end_date = _parse(annual_end)
+        if annual_end_date is None:
             return None
-        # Current YTD: most recent YTD whose end is AFTER the latest FY end.
-        future_ytd = [f for f in ytd_facts if f.get("end", "") > annual_end]
-        if not future_ytd:
+        # Current stub: ends after the latest FY end and starts within a week
+        # of it (i.e. cumulative from the start of the new fiscal year).
+        interim = [f for f in stub_pool
+                   if (_parse(f.get("end", "")) or annual_end_date) > annual_end_date]
+        current_candidates = [
+            f for f in interim
+            if (start := _parse(f.get("start", ""))) is not None
+            and 0 <= (start - annual_end_date).days <= 7
+        ]
+        if not interim:
             # No interim filings since FY end — TTM equals the most recent FY.
             return {
                 "metric": "ttm",
@@ -2842,22 +2931,28 @@ class EdgarClient(BaseAPIClient):
                 "caveats": ["TTM resolves to the latest annual fact because no interim YTD filings have been made since."],
                 "period_end": annual_end,
             }
-        current_ytd = max(future_ytd, key=lambda f: f.get("end", ""))
-        # Period length of the current YTD (e.g. 3, 6, 9 months).
-        try:
-            from datetime import datetime
-            cur_start = datetime.strptime(current_ytd.get("start", ""), "%Y-%m-%d").date()
-            cur_end = datetime.strptime(current_ytd.get("end", ""), "%Y-%m-%d").date()
-            cur_length = (cur_end - cur_start).days
-        except (ValueError, TypeError):
+        if not current_candidates:
+            return {
+                "metric": "ttm",
+                "value": compute._value_or_none(annual),
+                "formula": "AnnualFY (interim facts exist but none is cumulative from the FY end; TTM approximated by latest FY)",
+                "inputs": [compute._input_record("AnnualFY", annual)],
+                "caveats": ["Interim facts were found after the FY end, but none starts at the new fiscal year, so the stub reconstruction could not run."],
+                "period_end": annual_end,
+            }
+        current_ytd = max(current_candidates, key=lambda f: f.get("end", ""))
+        cur_start = _parse(current_ytd.get("start", ""))
+        cur_end = _parse(current_ytd.get("end", ""))
+        if cur_start is None or cur_end is None:
             return None
-        # Prior-year matching YTD: same approximate length, end date roughly 365 days earlier.
+        cur_length = (cur_end - cur_start).days
+        # Prior-year matching stub: same approximate length, end date roughly
+        # 365 days earlier, drawn from the same merged pool.
         prior_ytd = None
-        for f in ytd_facts:
-            try:
-                f_start = datetime.strptime(f.get("start", ""), "%Y-%m-%d").date()
-                f_end = datetime.strptime(f.get("end", ""), "%Y-%m-%d").date()
-            except (ValueError, TypeError):
+        for f in stub_pool:
+            f_start = _parse(f.get("start", ""))
+            f_end = _parse(f.get("end", ""))
+            if f_start is None or f_end is None:
                 continue
             length = (f_end - f_start).days
             year_offset = (cur_end - f_end).days
@@ -2995,15 +3090,40 @@ class EdgarClient(BaseAPIClient):
                "name": company.get("name", ""), "metric": metric, "period_type": period_type,
                "as_of": as_of, "facts": sorted_facts, "growth": []}
 
-        per_period = compute.growth_rates(sorted_facts)
         for entry in basis:
             entry = entry.strip().lower()
             if entry == "yoy" or entry == "qoq":
-                out["growth"].append({
-                    "basis": entry,
-                    "rates": per_period,
-                    "latest": per_period[-1]["growth"] if per_period else None,
-                })
+                if entry == "qoq":
+                    # QoQ is only meaningful over quarterly facts, whatever
+                    # --period-type loaded for the main series.
+                    if period_type == "quarterly":
+                        basis_facts = sorted_facts
+                    else:
+                        basis_facts = sorted(
+                            self._facts_for_alias(company["cik"], metric,
+                                                  period_type="quarterly",
+                                                  as_of=as_of, limit=periods),
+                            key=lambda f: f.get("end", ""),
+                        )
+                    rates = compute.paired_growth_rates(basis_facts, 80, 110)
+                    block = {"basis": "qoq", "period_basis": "quarterly",
+                             "rates": rates,
+                             "latest": rates[-1]["growth"] if rates else None}
+                    if period_type != "quarterly":
+                        block["note"] = ("qoq always uses quarterly facts; "
+                                         "--period-type does not apply to this basis")
+                    if not basis_facts:
+                        block["caveat"] = "No quarterly facts available for this metric."
+                else:
+                    basis_facts = sorted_facts
+                    rates = compute.paired_growth_rates(basis_facts, 350, 380)
+                    block = {"basis": "yoy", "period_basis": period_type,
+                             "rates": rates,
+                             "latest": rates[-1]["growth"] if rates else None}
+                eligible = sum(1 for f in basis_facts
+                               if compute._value_or_none(f) is not None)
+                block["skipped_unpaired"] = max(0, eligible - len(rates) - 1)
+                out["growth"].append(block)
             elif entry.startswith("cagr"):
                 try:
                     yrs = int(entry[4:])
@@ -3344,8 +3464,39 @@ def _number_or_zero(value: Any) -> float:
         return 0.0
 
 
-def enrich_fact_metadata(fact: dict, cik: str | int) -> dict:
-    """Add provenance and normalized period metadata to a fact row."""
+_FILING_ROW_ALIASES = {
+    "accessionNumber": "accession",
+    "filingDate": "filed",
+    "reportDate": "report_date",
+    "acceptanceDateTime": "acceptance_datetime",
+    "primaryDocument": "primary_document",
+    "primaryDocDescription": "primary_doc_description",
+    "fileNumber": "file_number",
+    "filmNumber": "film_number",
+}
+
+
+def alias_filing_row(row: dict) -> dict:
+    """Add snake_case aliases next to SEC's camelCase passthrough keys.
+
+    Enriched facts already speak snake_case (`accession`, `filed`); filing
+    rows kept SEC's raw names, forcing consumers to learn two conventions.
+    Aliases are additive — the camelCase originals stay for compatibility.
+    """
+    for camel, snake in _FILING_ROW_ALIASES.items():
+        if camel in row and snake not in row:
+            row[snake] = row[camel]
+    return row
+
+
+def enrich_fact_metadata(fact: dict, cik: str | int,
+                         fiscal_grid: Optional[list[tuple]] = None) -> dict:
+    """Add provenance and normalized period metadata to a fact row.
+
+    `fiscal_grid` (from `build_fiscal_grid`) makes `fiscal_period` a function
+    of the fact's own dates. Without it the label falls back to the row's
+    `fy`/`fp`, which describe the *filing* — wrong for comparative facts.
+    """
     accession = fact.get("accn") or fact.get("accession") or ""
     if accession:
         fact["accession"] = accession
@@ -3372,7 +3523,10 @@ def enrich_fact_metadata(fact: dict, cik: str | int) -> dict:
 
     fact["period_type"] = period_type
     fact["period_length_days"] = period_length_days
-    fact["fiscal_period"] = fiscal_period_label(fact)
+    if fiscal_grid:
+        fact["fiscal_period"] = fiscal_period_from_dates(fact, fiscal_grid)
+    else:
+        fact["fiscal_period"] = fiscal_period_label(fact)
     fact["calendar_period"] = fact.get("frame") or calendar_period_label(fact)
     fact["is_restated"] = False
     fact["is_cumulative"] = is_cumulative_fact(fact)
@@ -3400,6 +3554,88 @@ def fiscal_period_label(fact: dict) -> str:
     if fp == "FY":
         return f"FY{fy}"
     return f"{fp}-FY{fy}" if fp else f"FY{fy}"
+
+
+_QUARTER_DAYS = 365.25 / 4
+
+
+def build_fiscal_grid(rows: list[dict]) -> list[tuple]:
+    """Map fiscal years to their actual date spans using annual FY rows.
+
+    Comparative re-reports carry the *filing's* `fy`, so for each distinct
+    annual period the earliest-filed row wins — that row comes from the
+    period's own 10-K, whose `fy` is the period's true fiscal year. Returns
+    `[(start_date, end_date, fy), ...]` sorted by end date.
+    """
+    best: dict[tuple[str, str], dict] = {}
+    for row in rows:
+        if str(row.get("fp") or "").upper() != "FY" or not row.get("fy"):
+            continue
+        start = parse_date(row.get("start", ""))
+        end = parse_date(row.get("end", ""))
+        if not start or not end or not (300 <= (end - start).days <= 380):
+            continue
+        key = (row.get("start", ""), row.get("end", ""))
+        prev = best.get(key)
+        if prev is None or row.get("filed", "") < prev.get("filed", ""):
+            best[key] = row
+    grid = []
+    for row in best.values():
+        try:
+            fy = int(row["fy"])
+        except (TypeError, ValueError):
+            continue
+        grid.append((parse_date(row["start"]), parse_date(row["end"]), fy))
+    grid.sort(key=lambda item: item[1])
+    return grid
+
+
+def fiscal_period_from_dates(fact: dict, grid: list[tuple]) -> str:
+    """Fiscal label derived from the fact's own period dates.
+
+    Places the fact's `end` on the filer's fiscal-year grid; facts beyond
+    either edge extrapolate in ~91-day quarter slots. Falls back to the
+    fy/fp-based label when the grid cannot place the fact.
+    """
+    end = parse_date(fact.get("end", ""))
+    if not end or not grid:
+        return fiscal_period_label(fact)
+    days = fact.get("period_length_days")
+    is_annual_duration = isinstance(days, int) and 300 <= days <= 380
+    is_instant = fact.get("period_type") == "instant"
+
+    if is_instant:
+        # A balance date within a few days of a fiscal-year end IS that
+        # year-end balance — synthetic grids wobble on 52/53-week calendars.
+        for _, span_end, fy in grid:
+            if abs((end - span_end).days) <= 6:
+                return f"FY{fy}"
+
+    span = next(((s, e, fy) for s, e, fy in grid if s <= end <= e), None)
+    if span is not None:
+        span_start, span_end, fy = span
+        if is_annual_duration:
+            return f"FY{fy}"
+        offset = (end - span_start).days
+        quarter = min(4, max(1, round((offset + 1) / _QUARTER_DAYS)))
+        return f"Q{quarter}-FY{fy}"
+
+    first_start, _, first_fy = grid[0]
+    _, last_end, last_fy = grid[-1]
+    if end > last_end:
+        slot = max(1, round((end - last_end).days / _QUARTER_DAYS))
+        fy = last_fy + (slot - 1) // 4 + 1
+        quarter = (slot - 1) % 4 + 1
+    elif end < first_start:
+        slot = max(1, round((first_start - end).days / _QUARTER_DAYS))
+        fy = first_fy - ((slot + 3) // 4)
+        quarter = (-slot) % 4 + 1
+    else:
+        # End falls in a gap between known spans (fiscal calendar change).
+        return fiscal_period_label(fact)
+    if is_annual_duration:
+        return f"FY{fy}"
+    return f"Q{quarter}-FY{fy}"
 
 
 def calendar_period_label(fact: dict) -> str:
