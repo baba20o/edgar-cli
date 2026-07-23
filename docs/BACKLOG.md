@@ -3,7 +3,51 @@
 This tracks test-drive feedback and the next command ideas. Priorities favor
 misleading-output fixes before convenience features.
 
-## Last Shipped — 13F Holders, Item Extraction, Governance
+## Last Shipped — Live Test-Drive Fixes
+
+A full live test drive (~25 commands against SEC) produced
+[FINDINGS.md](FINDINGS.md): 4 misleading-output bugs and 8 UX friction
+items, each with evidence and a fix plan. Shipped in this pass:
+
+- **TTM stub reconstruction** now accepts quarterly facts as stub
+  candidates (a Q1 fact *is* the 3-month YTD), fixing a ~37B understatement
+  for NVDA and the false "no interim filings" formula.
+- **`fiscal_period` is date-derived** via a per-filer fiscal grid built
+  from each annual period's earliest-filed FY row; instant-only tags fall
+  back to a synthetic grid from `submissions.fiscalYearEnd`. Comparative
+  facts and `--cite` citations now carry the fact's own period.
+- **`growth` pairs by date gap** (`paired_growth_rates`): qoq uses
+  quarterly facts with an 80–110-day window, yoy a 350–380-day window;
+  unpaired facts are omitted and counted instead of bridged.
+- **Series dedup** in `_facts_for_alias`: one row per distinct period,
+  latest-filed wins.
+- UX: same-CIK share classes auto-resolve (`share_class_tickers`),
+  `--export-csv` accepted after the subcommand, `cache stats` shows the
+  endpoint TTL policy table, governance proposal titles survive
+  corporate-suffix periods and heading→body run-ons.
+
+Second pass closed the rest of FINDINGS.md (schema_version 1.0.0 → 1.1.0):
+
+- **Filing rows speak snake_case** — `alias_filing_row` adds `accession`,
+  `filed`, `report_date`, `primary_document`, … next to SEC's camelCase at
+  the `_recent_filings` zip point (covers filings/company/events/earnings/
+  pending/amendments/delta) plus the exhibits envelope.
+- **`edgar schema` answers for all 39 data commands** — coarse envelope
+  schemas are generated for commands without hand-written ones, every
+  schema carries `primary_row_key`, and the no-arg call returns the full
+  command → primary-row-key map.
+- **EFTS search honesty** — probed live: EFTS has no highlight support, so
+  the always-empty `highlight` field is gone; `file_type` /
+  `file_description` / `period_ending` surfaced instead. Queries without
+  `--since`/`--until` default to a disclosed 5-year window
+  (`applied_default_since` + `note`) so relevance ranking stops surfacing
+  2001 filings first.
+- **Mirror search hint** — metadata-mode searches against a bodies-free
+  mirror now say so and name the `--with-bodies-for` remedy.
+
+Tests: 123 passing (was 110, +13 regressions).
+
+## Previously Shipped — 13F Holders, Item Extraction, Governance
 
 The remaining "deferred multi-day projects" called out as high-value:
 

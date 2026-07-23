@@ -63,7 +63,7 @@ edgar pending --ndjson    # streams new filings since last drain
 
 ```json
 {
-  "schema_version": "1.0.0",
+  "schema_version": "1.1.0",
   "cli_version": "0.1.0",
   "cache": {"calls": 10, "hits": 7, "misses": 3, "ttl_min_remaining": 52867,
             "last_key": "...", "last_hit": false, "last_etag": null},
@@ -72,7 +72,13 @@ edgar pending --ndjson    # streams new filings since last drain
 ```
 
 `edgar schema [COMMAND]` returns the JSON Schema for any command output, so
-agents can validate without sampling live SEC data.
+agents can validate without sampling live SEC data. Every schema names its
+`primary_row_key` (the main list-of-rows field), and `edgar schema` with no
+argument returns the full command → primary-row-key map.
+
+Filing rows carry both SEC's raw camelCase (`accessionNumber`, `filingDate`)
+and snake_case aliases (`accession`, `filed`, `report_date`,
+`primary_document`) as of schema_version 1.1.0.
 
 ### Per-fact provenance + period metadata
 
@@ -191,6 +197,24 @@ Add `--as-of YYYY-MM-DD` to `concept`, `compare`, `diff`, `ttm`, `ratios`,
 `trend`, `growth`, `reconstruct`, or `delta` to filter to facts filed on or
 before that date — eliminates look-ahead bias.
 
+### Search / mirror
+
+```bash
+edgar search "supply chain constraints" --form 10-K   # live EFTS full-text
+edgar mirror NVDA --to ./edgar.sqlite --with-bodies-for 10-K --bodies-limit 5
+edgar search "supply chain" --db ./edgar.sqlite       # local FTS5 over bodies
+edgar item NVDA --form 10-K --section "Risk Factors"  # one Item's body text
+edgar insiders NVDA --since 2026-01-01                # Form 4 aggregation
+edgar holdings BRK-A --top 10                         # 13F portfolio
+edgar governance AAPL                                 # DEF 14A extraction
+```
+
+Live EFTS searches default to the last 5 years (disclosed via
+`applied_default_since`; override with `--since 2001-01-01`) and return
+filing metadata only — EFTS provides no text snippets. Mirror searches use
+FTS5 over ingested filing bodies, falling back to metadata with a `hint`
+when no bodies exist.
+
 ### Subscribe / drain
 
 ```bash
@@ -222,7 +246,10 @@ The cache is endpoint-aware (ticker map 7d, companyfacts/concept 1d, frames
 edgar bulk-urls                                     # nightly bulk archive URLs
 edgar schema concept                                # JSON Schema for an output
 edgar --webhook https://hooks.example.com/edgar metrics AAPL  # POST result
+edgar concept NVDA revenue --export-csv rev.csv     # CSV alongside JSON
 ```
+
+`--export-csv` works both before and after the subcommand.
 
 ## Output formats
 
@@ -270,9 +297,9 @@ python -m edgar --help
 - `concept` suggests similar issuer-specific tags when SEC returns 404.
 - `concept --deltas` skips adjacent rows with mismatched period lengths.
 - Exhibit downloads use the same User-Agent and shared rate limiter.
-- Multi-day items (full-text search, mirror SQLite, governance proxy
-  parsing, item-level 10-K extraction, insider/holder aggregation) are
-  tracked in [docs/BACKLOG.md](docs/BACKLOG.md).
+- Shipped-feature history and open ideas live in
+  [docs/BACKLOG.md](docs/BACKLOG.md); live test-drive findings and their
+  fixes in [docs/FINDINGS.md](docs/FINDINGS.md).
 
 ## License
 
