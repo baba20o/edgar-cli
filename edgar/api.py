@@ -39,6 +39,7 @@ from edgar import holders as holders_mod
 from edgar import insiders as insiders_mod
 from edgar import items as items_mod
 from edgar.cache import EdgarCache, ttl_for_url
+from edgar.documents import normalize_sec_document_url, sec_document_name
 from edgar.state import StateStore
 from edgar import mirror as mirror_mod
 
@@ -1367,19 +1368,15 @@ class EdgarClient(BaseAPIClient):
         parser = FilingIndexParser()
         parser.feed(html)
         documents = []
-        base = urls["filing_url"].rsplit("/", 1)[0]
         for row in parser.rows:
             if not row.get("document"):
                 continue
             href = row.get("href", "") or row.get("document", "")
-            if href.startswith("http"):
-                row["url"] = href
-            elif href.startswith("/"):
-                row["url"] = f"{SEC_BASE_URL}{href}"
-            elif href.startswith("Archives/"):
-                row["url"] = f"{SEC_BASE_URL}/{href}"
-            else:
-                row["url"] = f"{base}/{href}"
+            try:
+                row["url"] = normalize_sec_document_url(href, urls["filing_url"])
+            except ValueError as exc:
+                return {"error": f"Invalid filing document link: {exc}", "documents": []}
+            row["document"] = sec_document_name(row["url"])
             documents.append(row)
         return {
             "cik": normalize_cik(cik),
@@ -1612,11 +1609,11 @@ class EdgarClient(BaseAPIClient):
         (`1A`) or the title (`Risk Factors`). Strategy:
         1. If `db_path` is set and the filing's body has been mirrored, read
            from the mirror (no SEC round-trip).
-        2. Otherwise fetch the primary doc live and strip HTML to text.
-        3. Slice between Item-header regex matches.
+        2. Otherwise fetch the primary doc and preserve HTML block boundaries.
+        3. Slice between title-confirmed Part/Item headings.
         Returns the section text (truncated to `max_chars`) plus a
-        `confidence` field — `"high"` when bounded by the next Item header,
-        `"low"` when only the target was found.
+        `confidence` field; high requires a structural, title-confirmed target
+        and immediate successor. Flattened mirror text is low confidence.
         """
         company = self.resolve_company(identifier)
         if "error" in company:
@@ -1653,7 +1650,7 @@ class EdgarClient(BaseAPIClient):
                 html = self._get_text(url)
             except Exception as exc:
                 return {"error": f"Could not fetch filing body: {exc}"}
-            body_text = html_to_text(html)
+            body_text = items_mod.html_to_section_text(html)
 
         schema = form.upper()
         out = items_mod.extract_section(body_text, section, schema=schema)
@@ -1680,17 +1677,21 @@ class EdgarClient(BaseAPIClient):
             "body_length": len(body_text),
             "section": {
                 "item": out["item"],
+                "part": out["part"],
                 "title": out["title"],
                 "text": truncated_text,
                 "length": out["length"],
                 "truncated_to_max_chars": truncated,
                 "confidence": out["confidence"],
+                "confidence_reason": out["confidence_reason"],
                 "items_found_in_document": out["items_in_document"],
+                "item_identities_in_document": out["item_identities_in_document"],
             },
             "caveat": ("Item-level extraction is heuristic. Confidence "
-                       "`high` means the section is bounded by the next Item "
-                       "header; `medium` runs to end-of-document; `low` means "
-                       "only one Item header matched (likely a parsing miss)."),
+                       "`high` requires title-confirmed structural headings for "
+                       "the target and its immediate successor; `medium` means "
+                       "the successor boundary is uncertain; `low` means target "
+                       "identity or structure is weak, including flattened text."),
         }
 
     def _fetch_13f_holdings(self, cik: str, accession: str) -> list[dict]:
@@ -3793,6 +3794,8 @@ class FilingIndexParser(HTMLParser):
         self._cells: list[dict] = []
         self._current_text: list[str] = []
         self._current_href = ""
+        self._link_text: list[str] = []
+        self._in_link = False
 
     def handle_starttag(self, tag, attrs):
         attrs_dict = dict(attrs)
@@ -3803,24 +3806,34 @@ class FilingIndexParser(HTMLParser):
             self._in_td = True
             self._current_text = []
             self._current_href = ""
+            self._link_text = []
+            self._in_link = False
         elif self._in_td and tag == "a":
-            self._current_href = attrs_dict.get("href", "")
+            if not self._current_href:
+                self._current_href = attrs_dict.get("href", "")
+                self._in_link = True
 
     def handle_data(self, data):
         if self._in_td:
             self._current_text.append(data)
+            if self._in_link:
+                self._link_text.append(data)
 
     def handle_endtag(self, tag):
-        if tag == "td" and self._in_td:
+        if tag == "a":
+            self._in_link = False
+        elif tag == "td" and self._in_td:
             text = clean_text(" ".join(self._current_text))
-            self._cells.append({"text": text, "href": self._current_href})
+            self._cells.append({"text": text, "href": self._current_href,
+                                "link_text": clean_text(" ".join(self._link_text))})
             self._in_td = False
         elif tag == "tr" and self._in_tr:
             if len(self._cells) >= 4:
                 self.rows.append({
                     "sequence": self._cells[0]["text"],
                     "description": self._cells[1]["text"],
-                    "document": self._cells[2]["text"],
+                    "document": re.sub(r"\s+iXBRL$", "", self._cells[2]["link_text"]
+                                       or self._cells[2]["text"], flags=re.I),
                     "href": self._cells[2]["href"],
                     "type": self._cells[3]["text"],
                     "size": self._cells[4]["text"] if len(self._cells) > 4 else "",

@@ -15,6 +15,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from edgar.api import BULK_ARCHIVES, get_client
+from edgar.documents import normalize_sec_document_url, sec_document_name, validate_document_content
 from edgar.state import StateStore
 
 console = Console()
@@ -2870,16 +2871,23 @@ def _download_documents(client, result: dict, directory: Path) -> dict:
         return {"error": f"Could not create download directory {directory}: {exc}", "documents": result.get("documents", [])}
 
     for doc in result.get("documents", []):
-        url = doc.get("url", "")
-        if not url:
-            continue
-        target = directory / Path(doc.get("document") or "document").name
+        doc.pop("downloaded_to", None)
         try:
-            target.write_bytes(client._get_bytes(url))
+            url = normalize_sec_document_url(doc.get("url", ""))
+        except ValueError as exc:
+            return {"error": f"Invalid document download URL: {exc}", "documents": result.get("documents", [])}
+        doc["url"] = url
+        doc["document"] = sec_document_name(url)
+        target = directory / doc["document"]
+        try:
+            content = client._get_bytes(url)
+            validate_document_content(content)
+        except (OSError, ValueError) as exc:
+            return {"error": f"Could not download {url}: {exc}", "documents": result.get("documents", [])}
+        try:
+            target.write_bytes(content)
         except OSError as exc:
             return {"error": f"Could not write {target}: {exc}", "documents": result.get("documents", [])}
-        except Exception as exc:
-            return {"error": f"Could not download {url}: {exc}", "documents": result.get("documents", [])}
         doc["downloaded_to"] = str(target)
     return result
 
