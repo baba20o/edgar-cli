@@ -16,8 +16,7 @@ Without formula + provenance the CLI would hide the math from agents.
 
 from __future__ import annotations
 
-import math
-from typing import Any, Optional
+from typing import Optional
 
 
 def _value_or_none(fact: Optional[dict]) -> Optional[float]:
@@ -103,7 +102,7 @@ def ttm_from_quarters(quarter_facts: list[dict]) -> dict:
     apart (allowing for 13-week fiscal calendars). Non-contiguous sets return
     a null value with a caveat naming the gap.
     """
-    from datetime import datetime, timedelta
+    from datetime import datetime
 
     def parse_end(f):
         try:

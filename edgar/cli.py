@@ -128,7 +128,6 @@ def _validate_date_option(ctx, param, value):
 
 
 PositiveInt = click.IntRange(min=1)
-PositiveOrZeroInt = click.IntRange(min=0)
 
 
 def _format_citation(row: dict, ticker: str = "", name: str = "") -> str:
