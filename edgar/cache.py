@@ -11,7 +11,6 @@ Adds:
 
 from __future__ import annotations
 
-import errno
 import fcntl
 import fnmatch
 import hashlib
