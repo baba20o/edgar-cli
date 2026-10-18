@@ -54,6 +54,7 @@ edgar pending --ndjson    # streams new filings since last drain
 | Code | Meaning |
 |------|---------|
 | 0    | Success |
+| 1    | Other / unclassified error |
 | 2    | No data found (well-formed query, empty result, 404) |
 | 3    | Rate-limited |
 | 4    | SEC outage / 403 / unavailable service |
@@ -194,8 +195,9 @@ edgar delta NVDA --use-state                              # new + restated since
 ```
 
 Add `--as-of YYYY-MM-DD` to `concept`, `compare`, `diff`, `ttm`, `ratios`,
-`trend`, `growth`, `reconstruct`, or `delta` to filter to facts filed on or
-before that date — eliminates look-ahead bias.
+`trend`, `growth`, or `reconstruct` to filter to facts filed on or before
+that date — eliminates look-ahead bias. `delta` has no `--as-of`; scope it
+with `--since YYYY-MM-DD` or `--use-state`.
 
 ### Search / mirror
 
