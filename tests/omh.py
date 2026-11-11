@@ -35,7 +35,11 @@ def offline_client(extra_documents: dict[str, str] | None = None,
     by a URL substring given in `extra_documents`.
     """
     client = EdgarClient(cache=None, rate_limiter=None, use_cache=False)
-    routes = {f"/submissions/CIK{CIK}.json": fixture_json("submissions.json")}
+    company_facts = fixture_json("companyfacts.json")
+    routes = {
+        f"/submissions/CIK{CIK}.json": fixture_json("submissions.json"),
+        f"/api/xbrl/companyfacts/CIK{CIK}.json": company_facts,
+    }
     routes.update(json_routes or {})
     client.requested: list[str] = []
 
@@ -44,6 +48,14 @@ def offline_client(extra_documents: dict[str, str] | None = None,
         for needle, payload in routes.items():
             if needle in path:
                 return payload
+        # companyconcept is one tag of companyfacts: serve it from that fixture.
+        concept = re.search(rf"/companyconcept/CIK{CIK}/([\w-]+)/(\w+)\.json", path)
+        if concept:
+            taxonomy, tag = concept.groups()
+            found = company_facts["facts"].get(taxonomy, {}).get(tag)
+            if found:
+                return {"cik": int(CIK), "taxonomy": taxonomy, "tag": tag,
+                        "entityName": company_facts["entityName"], **found}
         return {"error": f"404 Not Found: {path}"}
 
     def fake_get_text(url):

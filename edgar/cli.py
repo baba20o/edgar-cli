@@ -237,6 +237,19 @@ def _error_exit(result: dict) -> None:
         raise exc
 
 
+def _echo_warnings(result: dict, json_output: bool, markdown: bool, ndjson: bool) -> None:
+    """Show envelope `warnings` on stderr when the output is not the JSON envelope.
+
+    JSON output already carries them; tables, markdown and NDJSON rows do not.
+    """
+    if not isinstance(result, dict) or (_wants_json(json_output, markdown, ndjson) and not ndjson):
+        return
+    for warning in result.get("warnings") or []:
+        message = warning.get("message") if isinstance(warning, dict) else str(warning)
+        if message:
+            click.echo(f"Warning: {message}", err=True)
+
+
 def _exit_if_no_data(result: dict, *row_keys: str) -> None:
     """Exit 2 (no data) when every named row list is empty.
 
@@ -518,6 +531,7 @@ def facts(ctx, identifier, limit, taxonomy, tag_filter, markdown, json_output, n
         identifier, taxonomy=taxonomy, tag_filter=tag_filter, limit=limit,
     )
     result = _finalize(client, result)
+    _echo_warnings(result, json_output, markdown, ndjson)
     _output_concepts(result, json_output, markdown, ndjson)
 
 
@@ -582,7 +596,14 @@ def concept(ctx, args, unit, limit, deltas, annual, quarterly, ytd, instant,
             )
         results.append(result)
     if len(results) == 1 and not batch_mode:
+        # Point-in-time queries (--as-of) leave newer filings out on purpose.
+        coverage_check = getattr(client, "xbrl_coverage_warning", None)
+        if coverage_check and not as_of and "error" not in results[0] and results[0].get("cik"):
+            coverage = coverage_check(results[0]["cik"], results[0].get("facts", []))
+            if coverage:
+                results[0].setdefault("warnings", []).append(coverage)
         single = _finalize(client, results[0], cite=cite)
+        _echo_warnings(single, json_output, markdown, ndjson)
         _output_concept_facts(single, json_output, markdown, ndjson, deltas=deltas)
     else:
         wrapped = _finalize_batch(client, results, key="results", cite=cite)
@@ -757,6 +778,7 @@ def metrics(ctx, identifier, bundle, tickers, input_file, batch, cite, markdown,
         results.append(result)
     if len(results) == 1 and not (tickers or input_file or batch):
         single = _finalize(client, results[0], cite=cite)
+        _echo_warnings(single, json_output, markdown, ndjson)
         _output_metrics(single, json_output, markdown, ndjson)
     else:
         wrapped = _finalize_batch(client, results, key="results", cite=cite)
@@ -1332,6 +1354,19 @@ def _output_schemas() -> dict:
             },
         },
     }
+    warnings_schema = {
+        "type": "array",
+        "description": "Present only when something the caller should know was detected",
+        "items": {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "enum": ["xbrl_filing_missing_from_sec_api"]},
+                "message": {"type": "string"},
+                "filing": {"type": "object"},
+                "newest_fact_filed": {"type": "string"},
+            },
+        },
+    }
     filing_row_schema = {
         "type": "object",
         "description": ("SEC camelCase passthrough plus snake_case aliases "
@@ -1360,6 +1395,7 @@ def _output_schemas() -> dict:
                 "total": {"type": "integer"},
                 "alias": {"type": ["string", "null"]},
                 "candidate_tags": {"type": "array", "items": {"type": "string"}},
+                "warnings": warnings_schema,
             },
             "required": ["cik", "facts"],
         },
@@ -1370,6 +1406,11 @@ def _output_schemas() -> dict:
                 **envelope_meta,
                 "cik": {"type": "string"}, "ticker": {"type": "string"},
                 "name": {"type": "string"}, "reference_date": {"type": "string"},
+                "latest_periodic_report": {
+                    "type": ["object", "null"],
+                    "description": "The periodic report covering the latest period "
+                                   "(10-K/10-Q/20-F/40-F, or a 6-K with XBRL financials)",
+                },
                 "metrics": {
                     "type": "array",
                     "items": {
@@ -1377,10 +1418,18 @@ def _output_schemas() -> dict:
                         "properties": {
                             "metric": {"type": "string"}, "tag": {"type": "string"},
                             "fact": fact_schema, "age_days": {"type": ["integer", "null"]},
-                            "stale": {"type": "boolean"}, "error": {"type": "string"},
+                            "stale": {
+                                "type": "boolean",
+                                "description": "True when the latest periodic report covers a "
+                                               "later period than this fact, or the fact's period "
+                                               "ended more than 548 days before reference_date",
+                            },
+                            "stale_reason": {"type": "string"},
+                            "error": {"type": "string"},
                         },
                     },
                 },
+                "warnings": warnings_schema,
             },
         },
         "ratios": {

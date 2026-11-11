@@ -161,6 +161,9 @@ COMMON_CONCEPT_CANDIDATES = {
     "revenue": [
         ("us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax", "USD"),
         ("us-gaap", "Revenues", "USD"),
+        # Filers that present revenue gross of sales taxes (common among
+        # foreign private issuers) use the IncludingAssessedTax element.
+        ("us-gaap", "RevenueFromContractWithCustomerIncludingAssessedTax", "USD"),
         ("us-gaap", "SalesRevenueNet", "USD"),
         ("us-gaap", "SalesRevenueGoodsNet", "USD"),
         ("us-gaap", "SalesRevenueServicesNet", "USD"),
@@ -274,6 +277,18 @@ DEFAULT_METRIC_BUNDLE = [
     "shares",
 ]
 STALE_METRIC_DAYS = 548
+# A fact is superseded when a periodic report covers a period ending more than
+# this many days after the fact's own period end (absorbs 52/53-week drift).
+STALE_PERIOD_TOLERANCE_DAYS = 7
+
+# Reports that carry a full set of financial statements for a period.
+PERIODIC_REPORT_FORMS = {
+    "10-K", "10-K/A", "10-KT", "10-KT/A", "10-Q", "10-Q/A", "10-QT", "10-QT/A",
+    "20-F", "20-F/A", "40-F", "40-F/A",
+}
+# A 6-K is a periodic report only when it carries XBRL financial statements
+# (a foreign private issuer's half-year or quarterly accounts).
+INTERIM_REPORT_FORMS = {"6-K", "6-K/A"}
 
 # 6-K exhibit fallback in `events`: skip exhibits larger than this, and
 # classify only the opening of the exhibit (a release leads with its news).
@@ -754,7 +769,13 @@ class EdgarClient(BaseAPIClient):
                 cik, form, top.get("accessionNumber", ""), top.get("filingDate", ""),
             )
 
+        # Where the filer's reporting stands, whatever the filters above asked
+        # for: used to judge whether a fact is stale and whether SEC's XBRL
+        # API has caught up with the filing list.
+        all_recent = self._recent_filings(result, limit=100000)
         return {
+            "latest_periodic_report": latest_periodic_report(all_recent),
+            "newest_xbrl_filing": newest_xbrl_filing(all_recent),
             "cik": cik,
             "ticker": company.get("ticker", ""),
             "name": result.get("name") or company.get("name", ""),
@@ -786,12 +807,16 @@ class EdgarClient(BaseAPIClient):
             return result
 
         concepts = self._summarize_concepts(result.get("facts", {}), taxonomy, tag_filter)
-        return {
+        out = {
             "cik": normalize_cik(result.get("cik", company["cik"])),
             "name": result.get("entityName", company.get("name", "")),
             "concepts": concepts[:limit],
             "total": len(concepts),
         }
+        coverage = self.xbrl_coverage_warning(company["cik"], [], company_facts=result)
+        if coverage:
+            out["warnings"] = [coverage]
+        return out
 
     @staticmethod
     def _populate_restatement_state(facts: list[dict]) -> list[dict]:
@@ -3685,6 +3710,7 @@ class EdgarClient(BaseAPIClient):
             return profile
 
         reference_date = latest_filing_date(profile)
+        latest_report = profile.get("latest_periodic_report")
         metrics = []
         for label in bundle or DEFAULT_METRIC_BUNDLE:
             if concept_alias_key(label) not in COMMON_CONCEPT_CANDIDATES:
@@ -3694,18 +3720,88 @@ class EdgarClient(BaseAPIClient):
                     "known_aliases": sorted(COMMON_CONCEPT_CANDIDATES),
                 })
                 continue
-            metric = self._best_metric(label, profile["cik"], reference_date)
+            metric = self._best_metric(label, profile["cik"], reference_date, latest_report)
             if metric:
                 metrics.append(metric)
             else:
                 metrics.append({"metric": label, "error": "No facts found"})
 
-        return {
+        out = {
             "cik": profile.get("cik", ""),
             "ticker": profile.get("ticker", ""),
             "name": profile.get("name", ""),
             "reference_date": reference_date,
+            "latest_periodic_report": latest_report,
             "metrics": metrics,
+        }
+        facts = [m["fact"] for m in metrics if isinstance(m.get("fact"), dict)]
+        coverage = self.xbrl_coverage_warning(
+            profile.get("cik", ""), facts, profile.get("newest_xbrl_filing"),
+            lookup_filings=False,
+        )
+        if coverage:
+            out["warnings"] = [coverage]
+        return out
+
+    def xbrl_coverage_warning(self, cik: str, facts: list[dict],
+                              newest_filing: Optional[dict] = None,
+                              company_facts: Optional[dict] = None,
+                              lookup_filings: bool = True) -> Optional[dict]:
+        """Warn when the filing list has a newer XBRL report than SEC's facts.
+
+        SEC's XBRL APIs (companyfacts, companyconcept, frames) can lag or omit
+        a filing that carries XBRL financial statements. When the newest such
+        report in the filing list is newer than every fact in hand, the
+        filer's companyfacts payload is checked for its accession number; if
+        it is absent there too, the figures this CLI returns predate that
+        report and the caller is told so.
+
+        `facts` are the facts already fetched (the cheap first check);
+        `newest_filing` comes from `submissions()["newest_xbrl_filing"]` and is
+        looked up when not given (unless `lookup_filings` is false);
+        `company_facts` is the raw companyfacts payload when the caller
+        already has it.
+        """
+        if not cik:
+            return None
+        if newest_filing is None and lookup_filings:
+            raw = self._get(f"/submissions/CIK{cik}.json")
+            if not isinstance(raw, dict) or "error" in raw or "filings" not in raw:
+                return None
+            newest_filing = newest_xbrl_filing(self._recent_filings(raw, limit=100000))
+        if not newest_filing or not newest_filing.get("accession"):
+            return None
+
+        accession = newest_filing["accession"]
+        in_hand = {f.get("accn") or f.get("accession") for f in facts}
+        newest_in_hand = max((f.get("filed", "") for f in facts), default="")
+        if accession in in_hand or newest_filing.get("filed", "") <= newest_in_hand:
+            return None
+
+        if company_facts is None:
+            company_facts = self._get(f"/api/xbrl/companyfacts/CIK{cik}.json")
+        if not isinstance(company_facts, dict) or "error" in company_facts:
+            return None
+        newest_fact_filed = ""
+        for tags in company_facts.get("facts", {}).values():
+            for concept in tags.values():
+                for rows in concept.get("units", {}).values():
+                    for row in rows:
+                        if row.get("accn") == accession:
+                            return None
+                        newest_fact_filed = max(newest_fact_filed, row.get("filed", ""))
+        return {
+            "code": "xbrl_filing_missing_from_sec_api",
+            "message": (
+                f"SEC's XBRL API has no facts from {newest_filing.get('form', '')} {accession} "
+                f"(filed {newest_filing.get('filed', '')}, period ending "
+                f"{newest_filing.get('report_date', '')}), although the filing list marks it as "
+                f"carrying XBRL financial data. The newest fact SEC serves for this filer was filed "
+                f"{newest_fact_filed or 'never'}, so figures here predate that report. Read it "
+                f"directly: `edgar text {accession} --cik {int(cik)} --exhibit EX-99`."
+            ),
+            "filing": newest_filing,
+            "newest_fact_filed": newest_fact_filed,
         }
 
     def brief(self, identifier: str | int) -> dict:
@@ -3717,7 +3813,8 @@ class EdgarClient(BaseAPIClient):
         reference_date = latest_filing_date(profile)
         metrics = []
         for label in BRIEF_METRICS:
-            metric = self._best_metric(label, profile["cik"], reference_date)
+            metric = self._best_metric(label, profile["cik"], reference_date,
+                                       profile.get("latest_periodic_report"))
             if not metric:
                 continue
             metrics.append(metric)
@@ -3775,13 +3872,20 @@ class EdgarClient(BaseAPIClient):
             "facts": [],
         }
 
-    def _best_metric(self, label: str, cik: str, reference_date: str) -> Optional[dict]:
+    def _best_metric(self, label: str, cik: str, reference_date: str,
+                     latest_report: Optional[dict] = None) -> Optional[dict]:
+        """Latest value of one metric: the freshest period across its alias tags.
+
+        `stale` follows `metric_staleness`: true when the filer's latest
+        periodic report (`latest_report`) covers a later period than this
+        fact, or when the fact is simply old; `stale_reason` says which.
+        """
         best = None
         for taxonomy, tag, unit in concept_alias_candidates(label):
             result = self.company_concept(cik, taxonomy, tag, unit=unit, limit=24, suggest_on_404=False)
             if "error" in result:
                 continue
-            fact = latest_distinct_fact(result.get("facts", []))
+            fact = freshest_fact(result.get("facts", []))
             if not fact:
                 continue
             candidate = {
@@ -3795,9 +3899,10 @@ class EdgarClient(BaseAPIClient):
                 best = candidate
 
         if best:
-            age_days = fact_age_days(best["fact"], reference_date)
-            best["age_days"] = age_days
-            best["stale"] = bool(age_days is not None and age_days > STALE_METRIC_DAYS)
+            best["age_days"] = fact_age_days(best["fact"], reference_date)
+            best["stale"], reason = metric_staleness(best["fact"], reference_date, latest_report)
+            if reason:
+                best["stale_reason"] = reason
         return best
 
     @staticmethod
@@ -4331,6 +4436,102 @@ def pick_comparable_facts(facts: list[dict], periods: int) -> list[dict]:
     return out
 
 
+def freshest_fact(facts: list[dict]) -> Optional[dict]:
+    """The fact that covers the latest period.
+
+    Order: latest period `end`; for one end date a framed fact (SEC's
+    calendar-aligned, comparable one) before an unframed one; then the longer
+    period; then the latest filing (so a restatement wins). A newer unframed
+    fact is never passed over for an older framed one.
+
+    A fact "filed" before its own period ended cannot be a reported actual (it
+    is a mis-dated context) and is ignored when any other fact exists.
+    """
+    pool = [f for f in facts
+            if not (f.get("filed") and f.get("end") and f["end"] > f["filed"])] or list(facts)
+    if not pool:
+        return None
+
+    def _length(fact: dict) -> int:
+        start, end = parse_date(fact.get("start", "")), parse_date(fact.get("end", ""))
+        return (end - start).days if start and end else 0
+
+    return max(pool, key=lambda f: (f.get("end", ""), bool(f.get("frame")), _length(f),
+                                    f.get("filed", "")))
+
+
 def latest_distinct_fact(facts: list[dict]) -> Optional[dict]:
-    picked = pick_comparable_facts(facts, 1)
-    return picked[0] if picked else None
+    return freshest_fact(facts)
+
+
+def _is_xbrl_financial_row(row: dict) -> bool:
+    """True when a filing-list row is a report carrying XBRL financial data."""
+    form = str(row.get("form", "")).upper()
+    numeric = row.get("isXBRLNumeric")
+    if numeric is not None:
+        tagged = bool(numeric)
+    else:  # older rows have no isXBRLNumeric flag
+        tagged = bool(row.get("isXBRL") or row.get("isInlineXBRL"))
+    return tagged and (form in PERIODIC_REPORT_FORMS or form in INTERIM_REPORT_FORMS)
+
+
+def _report_summary(row: dict) -> dict:
+    return {
+        "form": row.get("form", ""),
+        "accession": row.get("accessionNumber", ""),
+        "filed": row.get("filingDate", ""),
+        "report_date": row.get("reportDate", ""),
+    }
+
+
+def latest_periodic_report(rows: list[dict]) -> Optional[dict]:
+    """The periodic report covering the latest period, from filing-list rows.
+
+    Annual and quarterly reports always count; a 6-K counts only when it
+    carries XBRL financial statements.
+    """
+    reports = [
+        row for row in rows
+        if row.get("reportDate") and (
+            str(row.get("form", "")).upper() in PERIODIC_REPORT_FORMS
+            or _is_xbrl_financial_row(row)
+        )
+    ]
+    if not reports:
+        return None
+    return _report_summary(max(reports, key=lambda r: (r.get("reportDate", ""),
+                                                       r.get("filingDate", ""))))
+
+
+def newest_xbrl_filing(rows: list[dict]) -> Optional[dict]:
+    """The most recently filed report that carries XBRL financial data."""
+    tagged = [row for row in rows if _is_xbrl_financial_row(row)]
+    if not tagged:
+        return None
+    return _report_summary(max(tagged, key=lambda r: (r.get("filingDate", ""),
+                                                      r.get("accessionNumber", ""))))
+
+
+def metric_staleness(fact: dict, reference_date: str,
+                     latest_report: Optional[dict] = None) -> tuple[bool, str]:
+    """Decide whether a metric's fact is stale, and say why.
+
+    1. Superseded: the filer's latest periodic report covers a period ending
+       more than STALE_PERIOD_TOLERANCE_DAYS after the fact's period end, so a
+       newer figure has been reported and this is not it.
+    2. Old: no such report is known, but the fact's period ended more than
+       STALE_METRIC_DAYS before the reference date.
+    """
+    end = parse_date(fact.get("end", ""))
+    report_end = parse_date((latest_report or {}).get("report_date", ""))
+    if end and report_end and (report_end - end).days > STALE_PERIOD_TOLERANCE_DAYS:
+        return True, (
+            f"Superseded: {latest_report.get('form', '')} {latest_report.get('accession', '')} "
+            f"(filed {latest_report.get('filed', '')}) reports the period ending "
+            f"{latest_report.get('report_date', '')}; this fact ends {fact.get('end', '')}."
+        )
+    age_days = fact_age_days(fact, reference_date)
+    if age_days is not None and age_days > STALE_METRIC_DAYS:
+        return True, (f"Old: the period ended {age_days} days before the reference date "
+                      f"{reference_date} (limit {STALE_METRIC_DAYS}).")
+    return False, ""
