@@ -31,7 +31,8 @@ dependencies = [
     "python-dotenv>=1.0",
     "requests>=2.31",
     "rich>=13.0",
-    "research-cli-base>=0.1.0",
+    # Not on PyPI: installed straight from its public GitHub repository.
+    "research-cli-base @ git+https://github.com/baba20o/research-cli-base",
 ]
 
 [project.optional-dependencies]

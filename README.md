@@ -9,8 +9,24 @@ primary surface and the docs lead with them.
 
 ## Install
 
+Python 3.10+ on Linux, macOS, WSL or Windows. `git` must be on `PATH`: the
+shared [`research-cli-base`](https://github.com/baba20o/research-cli-base)
+package is not on PyPI, so pip installs it from GitHub (declared as a direct
+reference in `pyproject.toml`).
+
 ```bash
+git clone https://github.com/baba20o/edgar-cli
+cd edgar-cli
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -e .
+edgar --help
+```
+
+Without an editable checkout:
+
+```bash
+pip install git+https://github.com/baba20o/edgar-cli
 ```
 
 ## Setup
