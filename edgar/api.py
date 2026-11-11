@@ -34,6 +34,8 @@ from research_cli_base.http_client import retry_wait_seconds
 
 from edgar import __version__ as CLI_VERSION
 from edgar import compute
+from edgar import filing_text
+from edgar import sixk
 from edgar import governance as governance_mod
 from edgar import holders as holders_mod
 from edgar import insiders as insiders_mod
@@ -272,6 +274,11 @@ DEFAULT_METRIC_BUNDLE = [
     "shares",
 ]
 STALE_METRIC_DAYS = 548
+
+# 6-K exhibit fallback in `events`: skip exhibits larger than this, and
+# classify only the opening of the exhibit (a release leads with its news).
+MAX_EVENT_EXHIBIT_BYTES = 1_500_000
+EVENT_EXHIBIT_LEAD_CHARS = 6000
 
 EVENT_KEYWORDS = {
     "reverse_split": ["reverse stock split"],
@@ -1432,16 +1439,44 @@ class EdgarClient(BaseAPIClient):
 
     def events(self, identifier: str | int, limit: int = 20,
                since_last_fetch: bool = False,
-               state_store: Optional["StateStore"] = None) -> dict:
-        """Detect notable recent filing events from 8-K metadata and document text."""
-        result = self.submissions(
-            identifier, form="8-K", limit=limit,
-            since_last_fetch=since_last_fetch, state_store=state_store,
-        )
-        if "error" in result:
-            return result
+               state_store: Optional["StateStore"] = None,
+               read_exhibits: bool = True) -> dict:
+        """Detect notable recent events from current reports: 8-K and 6-K.
+
+        Domestic filers report events on Form 8-K, classified from the item
+        numbers plus keywords in the document. Foreign private issuers report
+        on Form 6-K, which has no item numbers, so each 6-K is classified from
+        its own text (`edgar.sixk`) and returned with the sentence each type
+        was classified from. Every 6-K examined is returned; one that matches
+        no rule has `event_types: ["other"]` and its lead sentence. When a
+        6-K's own text classifies nothing and `read_exhibits` is true, its
+        first EX-99 exhibit is read instead (two extra requests).
+
+        An empty result carries a `hint` naming the forms the filer does file.
+        """
+        filings: list[dict] = []
+        result: dict = {}
+        examined_forms = ("8-K", "6-K")
+        for form in examined_forms:
+            result = self.submissions(
+                identifier, form=form, limit=limit,
+                since_last_fetch=since_last_fetch, state_store=state_store,
+            )
+            if "error" in result:
+                return result
+            filings.extend(result.get("filings", []))
+        filings.sort(key=lambda f: (f.get("acceptanceDateTime") or f.get("filingDate", ""),
+                                    f.get("accessionNumber", "")), reverse=True)
+        filings = filings[:limit]
+
         events = []
-        for filing in result.get("filings", []):
+        examined: dict[str, int] = {}
+        for filing in filings:
+            form = filing.get("form", "")
+            examined[form] = examined.get(form, 0) + 1
+            if form.upper().startswith("6-K"):
+                events.append(self._classify_6k_filing(result["cik"], filing, read_exhibits))
+                continue
             event_types = event_types_from_items(filing.get("items", ""))
             snippets = {}
             try:
@@ -1456,14 +1491,115 @@ class EdgarClient(BaseAPIClient):
             if event_types:
                 events.append(alias_filing_row({
                     "filingDate": filing.get("filingDate", ""),
-                    "form": filing.get("form", ""),
+                    "acceptanceDateTime": filing.get("acceptanceDateTime", ""),
+                    "form": form,
                     "items": filing.get("items", ""),
                     "accessionNumber": filing.get("accessionNumber", ""),
                     "filing_url": filing.get("filing_url", ""),
                     "event_types": sorted(event_types),
                     "snippets": snippets,
                 }))
-        return {"cik": result["cik"], "name": result["name"], "events": events, "total": len(events)}
+        out = {
+            "cik": result["cik"], "name": result["name"],
+            "events": events, "total": len(events),
+            "forms_examined": examined,
+            "filings_examined": len(filings),
+        }
+        if not events:
+            out["hint"] = self._empty_events_hint(result["cik"], identifier, examined,
+                                                  since_last_fetch)
+            out["forms_filed"] = self._form_counts(result["cik"])
+        return out
+
+    def _classify_6k_filing(self, cik: str, filing: dict, read_exhibits: bool = True) -> dict:
+        """Classify one 6-K from its text; fall back to its first EX-99 exhibit."""
+        row = {
+            "filingDate": filing.get("filingDate", ""),
+            "acceptanceDateTime": filing.get("acceptanceDateTime", ""),
+            "form": filing.get("form", ""),
+            "items": filing.get("items", ""),
+            "accessionNumber": filing.get("accessionNumber", ""),
+            "filing_url": filing.get("filing_url", ""),
+            "primary_doc_url": filing.get("primary_doc_url", ""),
+        }
+        document = filing.get("primaryDocument", "")
+        document_type = filing.get("form", "")
+        try:
+            text = filing_text.document_to_text(self._get_text(filing.get("primary_doc_url", "")))
+            parsed = sixk.classify_6k(text)
+        except Exception as exc:
+            parsed = sixk.classify_6k("")
+            row["fetch_error"] = str(exc)
+
+        if read_exhibits and "fetch_error" not in row and parsed["classified_from"] != "body":
+            docs = self.filing_documents(cik, filing.get("accessionNumber", ""))
+            for doc in docs.get("documents", []):
+                name = doc.get("document", "")
+                if not doc.get("type", "").upper().startswith("EX-99"):
+                    continue
+                if not name.lower().endswith((".htm", ".html", ".txt")):
+                    continue
+                if _number_or_zero(doc.get("size")) > MAX_EVENT_EXHIBIT_BYTES:
+                    continue
+                try:
+                    exhibit_text = filing_text.document_to_text(self._get_text(doc["url"]))
+                except Exception:
+                    break
+                # A release leads with its news: classify the opening only, so
+                # boilerplate deep in a long exhibit cannot set the type.
+                from_exhibit = sixk.classify_6k(exhibit_text[:EVENT_EXHIBIT_LEAD_CHARS])
+                if from_exhibit["event_types"]:
+                    from_exhibit["exhibit_index"] = parsed["exhibit_index"]
+                    from_exhibit["classified_from"] = "exhibit"
+                    parsed = from_exhibit
+                    document, document_type = name, doc.get("type", "")
+                break
+
+        row.update({
+            "event_types": parsed["event_types"] or ["other"],
+            "snippets": parsed["snippets"],
+            "heading": parsed["heading"],
+            "lead": parsed["lead"],
+            "classified_from": parsed["classified_from"],
+            "evidence_document": document,
+            "evidence_document_type": document_type,
+        })
+        if parsed["background_types"]:
+            row["background_types"] = parsed["background_types"]
+        return alias_filing_row(row)
+
+    def _form_counts(self, cik: str, since: Optional[str] = None,
+                     forms: Optional[set[str]] = None) -> dict[str, int]:
+        """Count the forms in a filer's recent filing set (cached submissions)."""
+        raw = self._get(f"/submissions/CIK{cik}.json")
+        if "error" in raw:
+            return {}
+        recent = raw.get("filings", {}).get("recent", {})
+        counts: dict[str, int] = {}
+        for form, filed in zip(recent.get("form", []), recent.get("filingDate", [])):
+            if since and filed < since:
+                continue
+            if forms and form.upper() not in forms:
+                continue
+            counts[form] = counts.get(form, 0) + 1
+        return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+
+    def _empty_events_hint(self, cik: str, identifier: str | int, examined: dict[str, int],
+                           since_last_fetch: bool) -> str:
+        if since_last_fetch:
+            return "No new 8-K or 6-K filings since the last fetch."
+        if examined:
+            seen = ", ".join(f"{count} {form}" for form, count in examined.items())
+            return (f"Examined {seen}; none carried a recognized event. "
+                    f"List them with `edgar filings {identifier} --form 8-K`.")
+        counts = self._form_counts(cik)
+        if not counts:
+            return "This filer has no filings in SEC's recent filing set."
+        top = ", ".join(f"{form} ({count})" for form, count in list(counts.items())[:8])
+        return ("`events` reads current reports (8-K, and 6-K for foreign private issuers) "
+                f"and this filer has none in its recent filing set. It files: {top}. "
+                f"Use `edgar filings {identifier} --form FORM` to list one form and "
+                "`edgar text` to read a filing.")
 
     def dashboard(self, identifier: str | int) -> dict:
         """One-call composite: profile + key metrics + recent events + earnings + quality.
@@ -1888,67 +2024,119 @@ class EdgarClient(BaseAPIClient):
 
     def insiders(self, identifier: str | int, since: Optional[str] = None,
                  limit: int = 50, max_form4_fetches: int = 50) -> dict:
-        """Aggregate Form 4 transactions for a filer.
+        """Aggregate insider ownership filings (Forms 4, 5 and 3) for a filer.
 
-        Walks recent Form 4 filings, fetches the primary XML for each, and
-        aggregates by reporting owner + transaction code. `since` filters to
-        filings on or after that date; `limit` caps how many Form 4s are
-        fetched (default 50, hard ceiling 200).
+        Walks recent Form 4 and Form 5 filings, fetches the primary XML for
+        each, and aggregates transactions by reporting owner + transaction
+        code. Form 3 filings (initial statements, no transactions) are
+        returned as `initial_statements` with the holdings they declare.
+        `since` filters to filings on or after that date; `max_form4_fetches`
+        caps how many ownership documents are fetched in total (default 50,
+        hard ceiling 200).
+
+        When there are no transactions the result says why in `hint`, and
+        `forms_found` counts the insider forms in the window.
         """
         company = self.resolve_company(identifier)
         if "error" in company:
             return company
         cik = company["cik"]
-        max_form4_fetches = min(max_form4_fetches, 200)
-        result = self.submissions(identifier, form="4", limit=max_form4_fetches,
-                                  start_date=since)
-        if "error" in result:
-            return result
+        budget = min(max_form4_fetches, 200)
 
         transactions: list[dict] = []
+        initial_statements: list[dict] = []
         fetched = 0
         failed = 0
-        for filing in result.get("filings", []):
-            url = filing.get("primary_doc_url") or ""
-            if not url:
-                continue
-            # SEC's `primaryDocument` for Form 4 points at the styled XML
-            # (e.g. `xslF345X06/wk-form4_*.xml`). The raw schema-conformant XML
-            # lives at the same filename without the stylesheet directory.
-            raw_url = re.sub(r"/xslF345X[0-9]+/", "/", url)
-            try:
-                xml = self._get_text(raw_url)
-            except Exception:
-                failed += 1
-                continue
-            parsed = insiders_mod.parse_form4_xml(xml)
-            if "error" in parsed:
-                failed += 1
-                continue
-            fetched += 1
-            owner = parsed.get("reporting_owner", {})
-            for tx in (parsed.get("non_derivative_transactions", [])
-                       + parsed.get("derivative_transactions", [])):
-                tx2 = dict(tx)
-                tx2["owner_name"] = owner.get("name", "")
-                tx2["owner_cik"] = owner.get("cik", "")
-                tx2["officer_title"] = owner.get("officer_title", "")
-                tx2["is_director"] = owner.get("is_director", False)
-                tx2["is_officer"] = owner.get("is_officer", False)
-                tx2["filed"] = filing.get("filingDate", "")
-                tx2["accession"] = filing.get("accessionNumber", "")
-                transactions.append(tx2)
+        for form in ("4", "5", "3"):
+            if budget <= 0:
+                break
+            result = self.submissions(identifier, form=form, limit=budget,
+                                      start_date=since)
+            if "error" in result:
+                return result
+            for filing in result.get("filings", []):
+                url = filing.get("primary_doc_url") or ""
+                if not url:
+                    continue
+                budget -= 1
+                # SEC's `primaryDocument` for ownership forms points at the
+                # styled XML (e.g. `xslF345X06/wk-form4_*.xml`). The raw
+                # schema-conformant XML lives at the same filename without
+                # the stylesheet directory.
+                raw_url = re.sub(r"/xslF345X[0-9]+/", "/", url)
+                try:
+                    xml = self._get_text(raw_url)
+                except Exception:
+                    failed += 1
+                    continue
+                parsed = insiders_mod.parse_ownership_xml(xml)
+                if "error" in parsed:
+                    failed += 1
+                    continue
+                fetched += 1
+                owner = parsed.get("reporting_owner", {})
+                identity = {
+                    "owner_name": owner.get("name", ""),
+                    "owner_cik": owner.get("cik", ""),
+                    "officer_title": owner.get("officer_title", ""),
+                    "is_director": owner.get("is_director", False),
+                    "is_officer": owner.get("is_officer", False),
+                    "filed": filing.get("filingDate", ""),
+                    "accession": filing.get("accessionNumber", ""),
+                }
+                if form == "3":
+                    initial_statements.append({
+                        **identity,
+                        "form": filing.get("form", "3"),
+                        "is_ten_percent_owner": owner.get("is_ten_percent_owner", False),
+                        "period_of_report": parsed.get("periodOfReport", ""),
+                        "no_securities_owned": parsed.get("no_securities_owned", False),
+                        "holdings": (parsed.get("non_derivative_holdings", [])
+                                     + parsed.get("derivative_holdings", [])),
+                    })
+                    continue
+                for tx in (parsed.get("non_derivative_transactions", [])
+                           + parsed.get("derivative_transactions", [])):
+                    transactions.append({**tx, **identity, "form": filing.get("form", form)})
 
+        transactions.sort(key=lambda tx: (tx.get("filed", ""), tx.get("transaction_date") or ""),
+                          reverse=True)
         agg = insiders_mod.aggregate(transactions)
-        return {
+        forms_found = self._form_counts(cik, since=since, forms=FORM_CLASSES["insider"])
+        out = {
             "cik": cik, "ticker": company.get("ticker", ""),
             "name": company.get("name", ""),
             "since": since,
             "form4s_fetched": fetched, "form4s_failed": failed,
+            "forms_found": forms_found,
             "transactions": transactions[:limit],
             "transactions_total": len(transactions),
+            "initial_statements": initial_statements,
             **agg,
         }
+        if not transactions:
+            out["hint"] = self._empty_insiders_hint(cik, identifier, since, forms_found,
+                                                    initial_statements)
+        return out
+
+    def _empty_insiders_hint(self, cik: str, identifier: str | int, since: Optional[str],
+                             forms_found: dict[str, int],
+                             initial_statements: list[dict]) -> str:
+        window = f" on or after {since}" if since else " in the recent filing set"
+        if initial_statements:
+            empty = sum(1 for row in initial_statements if row.get("no_securities_owned"))
+            note = f" ({empty} declare no securities owned)" if empty else ""
+            return (f"No Form 4 or Form 5 transactions{window}. "
+                    f"{len(initial_statements)} Form 3 initial ownership statement(s){note} "
+                    "are listed in `initial_statements`.")
+        if forms_found:
+            found = ", ".join(f"{form} ({count})" for form, count in forms_found.items())
+            return (f"No Form 3, 4 or 5 could be read{window}; insider forms found: {found}. "
+                    f"List them with `edgar filings {identifier} --insider`.")
+        counts = self._form_counts(cik)
+        top = ", ".join(f"{form} ({count})" for form, count in list(counts.items())[:8])
+        return (f"No insider ownership forms (3, 4, 5, 144){window}. "
+                + (f"This filer files: {top}." if top else "This filer has no recent filings."))
 
     def quality(self, identifier: str | int, period_type: str = "annual",
                 as_of: Optional[str] = None) -> dict:

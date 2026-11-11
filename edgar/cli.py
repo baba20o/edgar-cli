@@ -237,6 +237,20 @@ def _error_exit(result: dict) -> None:
         raise exc
 
 
+def _exit_if_no_data(result: dict, *row_keys: str) -> None:
+    """Exit 2 (no data) when every named row list is empty.
+
+    Call it after the envelope has been written: stdout still carries the
+    full JSON (with its `hint`), stderr carries the reason, and the exit code
+    tells a script the answer was empty.
+    """
+    if any(result.get(key) for key in row_keys):
+        return
+    hint = result.get("hint") or "No data found."
+    click.echo(f"No data: {hint}", err=True)
+    raise click.exceptions.Exit(2)
+
+
 def _exit_code_for_error(error: str) -> int:
     text = error.lower()
     if "429" in text or "rate limit" in text or "rate-limited" in text:
@@ -651,21 +665,33 @@ def earnings(ctx, identifier, cite, markdown, json_output, ndjson):
 
 @main.command()
 @click.argument("identifier")
-@click.option("--limit", "-n", default=20, show_default=True, type=PositiveInt, help="Recent 8-Ks to inspect")
+@click.option("--limit", "-n", default=20, show_default=True, type=PositiveInt,
+              help="Recent current reports (8-K and 6-K) to inspect")
+@click.option("--no-exhibits", is_flag=True,
+              help="Never read a 6-K's EX-99 exhibit when its own text classifies nothing")
 @cite_option
 @since_last_fetch_option
 @output_options
 @click.pass_context
-def events(ctx, identifier, limit, cite, since_last_fetch, markdown, json_output, ndjson):
-    """Detect notable recent 8-K events."""
+def events(ctx, identifier, limit, no_exhibits, cite, since_last_fetch, markdown, json_output, ndjson):
+    """Detect notable recent events from 8-K and 6-K current reports.
+
+    8-Ks are classified from their item numbers and keywords. 6-Ks (foreign
+    private issuers) have no item numbers, so each is classified from its own
+    text and returned with the sentence every type was classified from. An
+    empty result explains itself in `hint` and exits 2 (no data).
+    """
     client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
     state_store = StateStore() if since_last_fetch else None
     result = client.events(
         identifier, limit=limit,
         since_last_fetch=since_last_fetch, state_store=state_store,
+        read_exhibits=not no_exhibits,
     )
     result = _finalize(client, result, cite=cite)
     _output_events(result, json_output, markdown, ndjson)
+    if not since_last_fetch:
+        _exit_if_no_data(result, "events")
 
 
 @main.command()
@@ -1773,31 +1799,44 @@ def holders(ctx, identifier, candidates, cusip, quarter, top_n, max_filers,
 @main.command()
 @click.argument("identifier")
 @click.option("--since", default=None, callback=_validate_date_option,
-              help="Only Form 4 filings on/after YYYY-MM-DD")
+              help="Only insider filings on/after YYYY-MM-DD")
 @click.option("--limit", "-n", default=50, show_default=True, type=PositiveInt,
               help="Max transactions to return after aggregation")
 @click.option("--max-fetch", default=50, show_default=True, type=PositiveInt,
-              help="Max Form 4 filings to download (hard ceiling 200)")
+              help="Max Form 3/4/5 filings to download (hard ceiling 200)")
 @output_options
 @click.pass_context
 def insiders(ctx, identifier, since, limit, max_fetch, markdown, json_output, ndjson):
-    """Aggregate Form 4 insider transactions for a filer."""
+    """Aggregate insider ownership filings: Form 4/5 transactions, Form 3 holdings.
+
+    With no transactions the result explains itself in `hint` and lists any
+    Form 3 initial statements. With no insider filings at all it exits 2.
+    """
     client = get_client(use_cache=not ctx.obj["no_cache"],
                        cache_max_mb=ctx.obj.get("cache_max_mb"))
     result = client.insiders(identifier, since=since, limit=limit,
                               max_form4_fetches=max_fetch)
     result = _finalize(client, result)
     _error_exit(result)
+    _output_insiders(result, identifier, json_output, markdown, ndjson)
+    _exit_if_no_data(result, "transactions", "initial_statements")
+
+
+def _output_insiders(result: dict, identifier: str, json_output: bool, markdown: bool,
+                     ndjson: bool = False) -> None:
     if ndjson:
-        _ndjson(result.get("transactions", []))
+        _ndjson(result.get("transactions", []) or result.get("initial_statements", []))
         return
     if _wants_json(json_output, markdown, ndjson):
         _json(result)
         return
     s = result.get("summary", {})
-    body = "\n".join([
-        f"Form 4 filings parsed: {result.get('form4s_fetched', 0)}"
+    statements = result.get("initial_statements", [])
+    body = "\n".join(line for line in [
+        f"Ownership filings parsed: {result.get('form4s_fetched', 0)}"
         f"  failed: {result.get('form4s_failed', 0)}",
+        f"Form 3 initial statements: {len(statements)}",
+        result.get("hint", ""),
         f"Transactions: {result.get('transactions_total', 0)}",
         f"Acquired: {_format_value(s.get('acquired_shares'))} shares "
         f"(${_format_value(s.get('acquired_value'))})",
@@ -1805,8 +1844,26 @@ def insiders(ctx, identifier, since, limit, max_fetch, markdown, json_output, nd
         f"(${_format_value(s.get('disposed_value'))})",
         f"Net: {_format_value(s.get('net_shares'))} shares "
         f"(${_format_value(s.get('net_value'))})",
-    ])
-    console.print(Panel(body, title=f"Insiders: {result.get('name', identifier)}", expand=False))
+    ] if line)
+    statement_rows = [
+        [
+            row.get("filed", ""), row.get("owner_name", ""), row.get("officer_title", ""),
+            "D" if row.get("is_director") else "", "O" if row.get("is_officer") else "",
+            "none owned" if row.get("no_securities_owned") else len(row.get("holdings", [])),
+            row.get("accession", ""),
+        ]
+        for row in statements
+    ]
+    statement_headers = ["Filed", "Insider", "Title", "Dir", "Off", "Holdings", "Accession"]
+    if markdown:
+        click.echo(body + "\n")
+        if statement_rows:
+            click.echo(_markdown_table(statement_headers, statement_rows) + "\n")
+    else:
+        console.print(Panel(body, title=f"Insiders: {result.get('name', identifier)}", expand=False))
+        if statement_rows:
+            console.print(_simple_table("Form 3 initial statements", statement_headers,
+                                        statement_rows))
     rows = []
     for ins in result.get("insiders", [])[:10]:
         rows.append([
@@ -2598,25 +2655,32 @@ def _output_events(result: dict, json_output: bool, markdown: bool, ndjson: bool
     rows = [
         [
             event.get("filingDate", ""),
+            event.get("form", ""),
             ", ".join(event.get("event_types", [])),
             event.get("items", ""),
             event.get("accessionNumber", ""),
-            next(iter(event.get("snippets", {}).values()), ""),
+            next(iter(event.get("snippets", {}).values()), "") or event.get("lead", ""),
         ]
         for event in result.get("events", [])
     ]
+    headers = ["Filed", "Form", "Events", "Items", "Accession", "Snippet"]
     if markdown:
-        click.echo(_markdown_table(["Filed", "Events", "Items", "Accession", "Snippet"], rows))
+        if result.get("hint"):
+            click.echo(f"> {result['hint']}\n")
+        click.echo(_markdown_table(headers, rows))
         return
 
     table = Table(title=f"Events: {result.get('name', '')}")
     table.add_column("Filed", style="green", no_wrap=True)
+    table.add_column("Form", style="cyan", no_wrap=True)
     table.add_column("Events")
     table.add_column("Items", no_wrap=True)
     table.add_column("Accession", style="magenta", no_wrap=True)
     table.add_column("Snippet", overflow="fold")
     for row in rows:
         table.add_row(*[str(cell) for cell in row])
+    if result.get("hint"):
+        table.caption = result["hint"]
     console.print(table)
 
 
