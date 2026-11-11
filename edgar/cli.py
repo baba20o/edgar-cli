@@ -1490,7 +1490,45 @@ def _output_schemas() -> dict:
         },
         "events": {
             "type": "object",
-            "properties": {**envelope_meta, "events": {"type": "array"}},
+            "properties": {
+                **envelope_meta,
+                "cik": {"type": "string"}, "name": {"type": "string"},
+                "events": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "description": "One current report: an 8-K with a recognized event, "
+                                       "or any 6-K examined",
+                        "properties": {
+                            "form": {"type": "string"},
+                            "accession": {"type": "string"}, "filed": {"type": "string"},
+                            "acceptance_datetime": {"type": "string", "description": "UTC"},
+                            "items": {"type": "string", "description": "8-K item numbers"},
+                            "event_types": {"type": "array", "items": {"type": "string"}},
+                            "snippets": {
+                                "type": "object",
+                                "description": "event type -> the text it was classified from "
+                                               "(for a 6-K: one sentence of the report)",
+                            },
+                            "background_types": {
+                                "type": "array",
+                                "description": "6-K types supported only by an "
+                                               "'As previously disclosed' recap",
+                            },
+                            "heading": {"type": "string"}, "lead": {"type": "string"},
+                            "classified_from": {"type": ["string", "null"],
+                                                "enum": ["body", "exhibit_index", "exhibit", None]},
+                            "evidence_document": {"type": "string"},
+                            "evidence_document_type": {"type": "string"},
+                            "filing_url": {"type": "string"}, "primary_doc_url": {"type": "string"},
+                        },
+                    },
+                },
+                "forms_examined": {"type": "object"},
+                "filings_examined": {"type": "integer"},
+                "hint": {"type": "string", "description": "Present when events is empty"},
+                "forms_filed": {"type": "object", "description": "Present when events is empty"},
+            },
         },
         "delta": {
             "type": "object",

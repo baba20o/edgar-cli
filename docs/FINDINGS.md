@@ -247,3 +247,174 @@ are reproducible.
 
 Status: all 12 items fixed (4 bugs + 8 UX), 13 regression tests added
 (123 passing), each fix verified against live SEC data.
+
+# Foreign-Filer Test-Drive Findings — 2026-11-11
+
+First use of the CLI on a foreign private issuer: OMH (Ohmyhome Ltd, since
+renamed Ohmyswift Limited; CIK 0001944902), a Singapore company that files
+6-K, 20-F, F-3 and 424B5 rather than 8-K, 10-K and S-3. `filings`,
+`company`, `resolve`, `exhibits --download`, `search` and `concept` with an
+explicit tag worked. The items below did not. Same conventions as above:
+checked off when fixed, evidence kept so regressions are reproducible. The
+regression fixtures are under `tests/fixtures/omh/`; no test calls SEC.
+
+## Bugs (misleading output)
+
+- [x] **`metrics` returned a superseded figure and called it fresh**
+  - *Fixed:* the `revenue` alias gained
+    `RevenueFromContractWithCustomerIncludingAssessedTax`; `freshest_fact`
+    picks the latest period end across all alias tags (then a framed fact,
+    then the longer period, then the latest filing) and ignores a fact
+    "filed" before its own period ended; `metric_staleness` makes `stale`
+    true when the filer's latest periodic report covers a later period than
+    the fact, or the fact ended more than 548 days before the reference
+    date, with a `stale_reason`. Rule written down in
+    [definitions.md](definitions.md). Live: `edgar metrics OMH --bundle
+    revenue` → FY2025, 9,519,777 USD, 20-F `0001213900-26-048586`,
+    `stale: true` ("Superseded: 6-K 0001213900-26-098819 ... period ending
+    2026-06-30").
+  - Evidence: `edgar metrics OMH --bundle revenue` → tag `Revenues`,
+    2025-01-01..2025-06-30, 5,216,078 USD, from a 6-K filed 2025-12-02, with
+    `age_days: 497` and `stale: false`. Full-year 2025 revenue, 9,519,777
+    USD, was in the 20-F filed 2026-04-28 under
+    `RevenueFromContractWithCustomerIncludingAssessedTax`. `edgar concept
+    OMH revenue --canonical` also returned only the half-year fact.
+  - Root cause: (1) that tag was not among the alias candidates; (2)
+    `latest_distinct_fact` → `pick_comparable_facts` discarded every
+    unframed fact whenever any framed fact existed, so "freshest" meant
+    "freshest calendar-aligned"; (3) `stale` was only `age_days > 548`
+    against the filer's latest filing date, so a half-year figure stayed
+    "fresh" for 18 months regardless of what was filed after it.
+  - Also found: the same 6-K tags a `2025-07-01..2025-12-31` context with
+    the first-half value (5,216,078), filed 2025-12-02, before that period
+    ended. It is a filer tagging error that SEC serves as-is; without the
+    guard it ties with the real FY2025 fact on period end.
+
+- [x] **`events` returned nothing for a 6-K filer, with exit 0**
+  - *Fixed:* `events` reads 6-K as well as 8-K. A 6-K has no item numbers,
+    so `edgar/sixk.py` classifies it from its own text (cover page, exhibit
+    index and signature block removed) into 15 event types, each returned
+    with the sentence it was classified from, plus accession and acceptance
+    time. Every 6-K examined is returned (`event_types: ["other"]` and a
+    `lead` sentence when nothing matches). When the 6-K itself says nothing
+    its first EX-99 exhibit is read. An empty result now carries `hint` and
+    `forms_filed` and exits 2. Live: `edgar events OMH` returns the 20 most
+    recent 6-Ks, each classified; all 23 of the filer's 2026 6-Ks classify
+    from saved copies.
+  - Evidence: `edgar events OMH` → `events: []`, exit 0. The filer had 23
+    6-Ks in 2026: a standby equity purchase agreement, two private
+    placements, a registered direct offering, a 50-for-1 share
+    consolidation, a Nasdaq bid-price deficiency and its cure, a divestiture,
+    a name change and redomiciliation.
+  - Root cause: `EdgarClient.events` asked `submissions` for `form="8-K"`
+    only and derived event types from 8-K item numbers.
+  - Classifier rules worth knowing: a sentence opening "As previously
+    disclosed" is a recap — its type is dropped when the report also makes a
+    fresh statement, and flagged in `background_types` when the recap is all
+    there is; a reverse split mentioned as a possible cure ("including by
+    effecting a reverse stock split, if necessary") is not an event;
+    "entered into an agreement" is not reported separately when the same
+    sentence is already a financing or divestiture.
+
+- [x] **`insiders` returned zero for a filer with Form 3s, with exit 0**
+  - *Fixed:* `insiders` reads Forms 4, 5 and 3. Form 3 initial statements
+    come back in `initial_statements` with holdings or `no_securities_owned`;
+    `forms_found` counts the insider forms in the window; with no
+    transactions a `hint` says what was found; with no insider forms at all
+    the command exits 2 and names the forms the filer does file.
+  - Evidence: `edgar insiders OMH --since 2026-01-01` → zero transactions,
+    exit 0, although five Form 3s were filed in 2026. (They declare no
+    securities owned, so zero transactions is the right number — but the
+    answer did not say that the forms exist.)
+  - Root cause: only `form="4"` was fetched and an empty list was returned
+    without explanation.
+
+## Gaps (missing capability)
+
+- [x] **Does not start on Windows; does not install on a clean machine**
+  - *Fixed:* `edgar/cache.py` locks with `flock` on POSIX and
+    `msvcrt.locking` on Windows (no-op when neither exists) and writes
+    entries with `os.replace`; `pyproject.toml` depends on
+    `research-cli-base @ git+https://github.com/baba20o/research-cli-base`.
+    Verified: fresh venv, `pip install -e ".[dev]"`, `edgar --help` and the
+    full suite on Windows (Python 3.12) and WSL Ubuntu (Python 3.10).
+  - Evidence: `import fcntl` at module import → `ModuleNotFoundError` on
+    Windows. `pip install -e .` → "No matching distribution found for
+    research-cli-base" (the package is not on PyPI).
+  - Second Windows defect behind the first: `tmp.rename(path)` raises
+    `FileExistsError` on Windows when the cache entry already exists, so
+    every cache refresh would have failed.
+  - `research-cli-base` was checked for the same problems: it has no
+    `fcntl`, but `FileCache.set` uses the same `Path.rename`. `edgar` never
+    calls it (it writes through `EdgarCache`), so nothing was changed there;
+    other CLIs built on the base package will hit it on Windows.
+
+- [x] **Nothing returned a filing's text except `item` (10-K/10-Q only)**
+  - *Fixed:* `edgar text` returns the main document of any filing, and
+    exhibits by type on request, as clean text with a size cap
+    (`--max-chars`, `--offset` / `next_offset`) and `--grep` to pull only
+    the sentences matching a pattern (`--context N` for neighbours).
+    `edgar/filing_text.py` does the conversion and sentence splitting and is
+    shared with the 6-K classifier and the dilution view.
+  - Evidence: reading a 6-K meant `exhibits --download` and stripping HTML
+    by hand.
+
+- [x] **No dilution view**
+  - *Fixed:* `edgar dilution` gathers, for one filer, the latest stated
+    shares outstanding, shelf registrations with effectiveness and takedowns,
+    prospectus supplements, offerings, equity lines and at-the-market
+    programs, warrants (count, exercise price, price floor, multiple-share
+    exchange features), reverse splits and going-concern language. Each
+    statement is a sentence of a named filing; each figure carries the text
+    it was parsed from; nothing is combined, converted across a split, or
+    inferred.
+  - Traps found in the source documents and handled: a 424B5 bundles the
+    base prospectus after a bare `PROSPECTUS` heading, with its own, older
+    "shares issued and outstanding" sentence (only the shelf size is read
+    from that part); a public-float paragraph can quote a pre-split share
+    count with its own "as of" date (statements are ordered by that date,
+    else the filing date); a par value is not a price; the XBRL cover count
+    can predate a reverse split (flagged in `xbrl_shares_outstanding.note`).
+
+## SEC-side behaviour (documented, warned about)
+
+- [x] **SEC's XBRL API omits a filing that carries XBRL financial
+  statements**
+  - Finding: it is SEC's side, not the CLI's. The 6-K filed 2026-09-10
+    (accession `0001213900-26-098819`, period 2026-06-30) is flagged
+    `isXBRL: 1`, `isInlineXBRL: 1`, `isXBRLNumeric: 1` in the filing list,
+    and its extracted instance document (`ea0304832-6k_ohmyhome_htm.xml`)
+    holds 608 numeric facts, 294 of them dimensionless in `us-gaap/2026` —
+    for example first-half 2026 revenue of 1,915,166 USD
+    (`RevenueFromContractWithCustomerIncludingAssessedTax`, 2026-01-01 to
+    2026-06-30) and total assets of 3,191,309 USD at 2026-06-30. Yet the raw
+    `companyfacts` payload for the CIK, fetched cold on 2026-11-11, contains
+    no fact filed after 2026-04-28. The CLI passes through everything SEC
+    serves. The year-earlier 6-K (`0001213900-25-117227`, `us-gaap/2025`)
+    is in the API, so this is not a blanket 6-K exclusion; the cause on
+    SEC's side was not established.
+  - *Fixed (warning):* `metrics`, `concept` and `facts` add a `warnings`
+    entry, code `xbrl_filing_missing_from_sec_api`, when the newest report
+    with XBRL financial data in the filing list is newer than every fact in
+    hand and its accession is absent from `companyfacts` (fetched only when
+    the cheap check trips). `metrics` also marks the affected facts `stale`,
+    because that 6-K counts as the latest periodic report. `--as-of` queries
+    do not warn: they exclude later filings on purpose.
+  - Not done: reading the figures from the filing's own instance document.
+    See the follow-up in [BACKLOG.md](BACKLOG.md).
+
+## UX friction
+
+- [x] **`company` and `brief` carry every filing field twice**
+  - *Fixed:* `--compact` on `company`, `filings` and `brief` drops each
+    camelCase key that has a snake_case alias on the row, and empty values,
+    from JSON and NDJSON output (`company OMH`: 12.8 KB → 8.9 KB). Opt-in;
+    the default keeps the shape published in schema_version 1.1.0.
+
+- [x] **`acceptanceDateTime` has no stated time zone**
+  - Checked: the filing list's value is UTC (`2026-11-09T22:00:10.000Z`
+    for a filing the index page shows as accepted `2026-11-09 17:00:10`
+    Eastern). `events` passes it through as `acceptance_datetime`.
+
+Status: 9 items closed, 77 tests added (259 passing on Windows and WSL),
+each fix verified against live SEC data on 2026-11-11.

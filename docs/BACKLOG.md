@@ -3,7 +3,65 @@
 This tracks test-drive feedback and the next command ideas. Priorities favor
 misleading-output fixes before convenience features.
 
-## Last Shipped — Live Test-Drive Fixes
+## Last Shipped — Foreign Filers, Filing Text, Dilution
+
+First real use on a foreign micro-cap (OMH, a 6-K / 20-F / F-3 filer)
+produced the second half of [FINDINGS.md](FINDINGS.md): six gaps, all
+closed (schema_version 1.1.0 → 1.2.0, additive):
+
+- **Runs on Windows, installs on a clean machine** — portable cache lock
+  (`flock` / `msvcrt`), `os.replace` for cache writes, and
+  `research-cli-base` declared as a direct GitHub reference.
+- **`events` reads 6-Ks** — classified from the report's own text
+  (`edgar/sixk.py`, 15 event types), each type with its source sentence,
+  accession and acceptance time; EX-99 fallback; an empty result explains
+  itself and exits 2.
+- **`insiders` reads Forms 3 and 5** — Form 3 initial statements returned
+  with holdings; `hint` / `forms_found` when there are no transactions.
+- **`edgar text`** — any filing's main document (and exhibits by type) as
+  clean text, with a size cap, offset paging and sentence `--grep`.
+- **`metrics` freshness** — revenue alias covers
+  `RevenueFromContractWithCustomerIncludingAssessedTax`; the freshest
+  period across alias tags wins; `stale` now means "a later periodic report
+  exists, or the fact is old" with a `stale_reason`.
+- **XBRL coverage warning** — `metrics`, `concept` and `facts` warn when the
+  filing list has a newer XBRL report than any fact SEC's API serves.
+- **`edgar dilution`** — shares outstanding, shelves, supplements,
+  offerings, equity lines / ATMs, warrants, reverse splits and going-concern
+  language, every figure with its accession, date and source sentence.
+- **`--compact`** on `company` / `filings` / `brief`.
+
+Tests: 259 passing on Windows and WSL (was 182), all offline against saved
+OMH fixtures.
+
+Open follow-ups from this pass:
+
+- **Read XBRL from the filing itself** when SEC's API lacks it: the 6-K's
+  extracted instance document (`*_htm.xml`) carries the facts. A
+  `--from-filing ACCESSION` path for `facts` / `concept` would close the
+  gap the coverage warning only reports.
+- **`dilution` does not open the registration statement or the annual
+  report**: shelf size comes from what supplements say about it, and
+  going-concern language from supplements and current reports only. An
+  opt-in `--include-annual` / `--include-shelf` read would cover a filer
+  with a shelf but no takedown yet.
+- **`dilution` and the 6-K classifier are tuned on one filer's filings.**
+  At-the-market programs, convertible notes, underwritten offerings and the
+  8-K path are covered by patterns but were not exercised against live
+  filings. Add fixtures from two or three more filers (one domestic 8-K
+  filer with an ATM, one ADS issuer) before trusting recall.
+- **`events` on 8-Ks is still keyword snippets**, not sentences; moving it
+  to the sentence classifier would give domestic filers the same evidence.
+- **`research-cli-base`**: `FileCache.set` renames its temp file with
+  `Path.rename`, which fails on Windows when the entry already exists.
+  `edgar` does not call it (it has its own cache writes), but any other CLI
+  built on the base package will hit it on Windows.
+- **Period mixing in a metric bundle** is only partly addressed: the
+  freshest fact now wins and `stale` flags a superseded one, but a bundle
+  can still pair a standalone quarter with a year-to-date figure without a
+  bundle-level alignment warning, and `metrics` has no period selector.
+
+## Previously Shipped — Live Test-Drive Fixes
 
 A full live test drive (~25 commands against SEC) produced
 [FINDINGS.md](FINDINGS.md): 4 misleading-output bugs and 8 UX friction

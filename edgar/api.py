@@ -56,7 +56,15 @@ COMPANY_TICKERS_URL = f"{SEC_BASE_URL}/files/company_tickers_exchange.json"
 # EFTS search dropped the never-populated `highlight` field and gained
 # file_type/file_description/period_ending + a disclosed default date window;
 # every command now answers `edgar schema` (coarse schemas marked as such).
-SCHEMA_VERSION = "1.1.0"
+# 1.2.0 (additive): `events` reads 6-K as well as 8-K (rows gain
+# acceptance_datetime, heading, lead, classified_from, evidence_document) and
+# explains an empty result (hint, forms_filed); `insiders` gains
+# initial_statements, forms_found, hint; `metrics` gains stale_reason,
+# latest_periodic_report and warnings; `concept`/`facts` gain warnings;
+# submissions gain latest_periodic_report and newest_xbrl_filing; new
+# commands `text` and `dilution`; `--compact` on company/filings/brief.
+# `events` and `insiders` now exit 2 when they have nothing to return.
+SCHEMA_VERSION = "1.2.0"
 
 DEFAULT_CACHE_TTL = 900
 DEFAULT_RATE_LIMIT_INTERVAL = 0.2
