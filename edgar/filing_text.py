@@ -41,13 +41,15 @@ _PAGE_FURNITURE_RE = re.compile(
 )
 
 # A period after one of these does not end a sentence.
+# Kept short on purpose: every entry also stops a split when the word really
+# does end a sentence, so words that often close one ("SEC.", "etc.") are out.
 _ABBREVIATIONS = {
-    "inc", "ltd", "corp", "co", "llc", "lp", "plc", "pte", "pty", "sa", "nv",
-    "ag", "gmbh", "no", "nos", "mr", "mrs", "ms", "dr", "prof", "sr", "jr",
-    "st", "vs", "etc", "approx", "est", "dept", "fig", "sec", "art", "para",
+    "inc", "ltd", "corp", "co", "llc", "lp", "plc", "pte", "pty", "gmbh",
+    "no", "nos", "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "vs",
+    "approx", "dept", "fig", "para", "messrs",
     "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct",
     "nov", "dec", "u.s", "u.k", "e.g", "i.e", "a.m", "p.m", "u.s.c", "l.p",
-    "n.a", "s.a", "cf", "ex", "reg", "rev", "esq", "hon", "messrs", "viz",
+    "n.a", "s.a",
 }
 
 _SENTENCE_END_RE = re.compile(r"([.!?])([\"')\]]*)\s+(?=[\"'(\[]*[A-Z0-9$])")

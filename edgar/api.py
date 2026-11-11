@@ -280,6 +280,11 @@ STALE_METRIC_DAYS = 548
 MAX_EVENT_EXHIBIT_BYTES = 1_500_000
 EVENT_EXHIBIT_LEAD_CHARS = 6000
 
+# `edgar text`: documents that can be turned into text, and the longest
+# sentence returned by --grep before it is clipped around the match.
+TEXT_DOCUMENT_SUFFIXES = (".htm", ".html", ".txt", ".xml", ".xsd")
+TEXT_MATCH_SENTENCE_CHARS = 1000
+
 EVENT_KEYWORDS = {
     "reverse_split": ["reverse stock split"],
     "ceo_change": [
@@ -1828,6 +1833,187 @@ class EdgarClient(BaseAPIClient):
                        "the target and its immediate successor; `medium` means "
                        "the successor boundary is uncertain; `low` means target "
                        "identity or structure is weak, including flattened text."),
+        }
+
+    def filing_text(self, identifier: Optional[str | int] = None,
+                    accession_or_url: Optional[str] = None,
+                    cik: Optional[str] = None, form: Optional[str] = None,
+                    as_of: Optional[str] = None,
+                    exhibits: Optional[list[str]] = None,
+                    exhibits_only: bool = False,
+                    max_chars: int = 50000, offset: int = 0,
+                    pattern: Optional[str] = None, context: int = 0,
+                    limit: int = 50) -> dict:
+        """Return the text of any filing: main document and, on request, exhibits.
+
+        The filing is named by accession number or SEC URL, or picked as the
+        latest filing (optionally of one `form`, on or before `as_of`) of
+        `identifier`. `exhibits` is a list of exhibit type prefixes
+        (`EX-99`, `EX-10.1`, or `all`); `exhibits_only` drops the main
+        document.
+
+        Each document comes back as clean text capped at `max_chars`
+        (`offset` pages through a long one; `next_offset` says where to
+        resume). With `pattern` (a case-insensitive regular expression) only
+        the matching sentences are returned, each with `context` neighbours.
+        """
+        try:
+            regex = filing_text.compile_pattern(pattern) if pattern else None
+        except ValueError as exc:
+            return {"error": str(exc), "documents": []}
+
+        target = self._resolve_filing(identifier, accession_or_url, cik, form, as_of)
+        if "error" in target:
+            return target
+        resolved_cik = target["cik"]
+        accession = target["accession"]
+        wanted = [e.strip().upper() for e in (exhibits or []) if e and e.strip()]
+
+        selected: list[dict] = []
+        if wanted or not target.get("primary_doc_url"):
+            index = self.filing_documents(resolved_cik, accession)
+            if "error" in index:
+                return index
+            rows = [row for row in index.get("documents", []) if row.get("sequence")]
+            main = rows[0] if rows else None
+            if main and not target.get("form"):
+                target["form"] = main.get("type", "")
+            if main and not exhibits_only:
+                selected.append({**main, "role": "main"})
+            for row in rows[1:]:
+                doc_type = row.get("type", "").upper()
+                if not doc_type.startswith("EX-") or doc_type.startswith("EX-101"):
+                    continue
+                if "ALL" in wanted or any(doc_type.startswith(prefix) for prefix in wanted):
+                    selected.append({**row, "role": "exhibit"})
+        elif not exhibits_only:
+            selected.append({
+                "document": target.get("primary_document", ""),
+                "type": target.get("form", ""),
+                "description": target.get("primary_doc_description", ""),
+                "url": target["primary_doc_url"],
+                "role": "main",
+            })
+
+        documents = []
+        for row in selected:
+            name = row.get("document", "")
+            entry = {
+                "document": name, "type": row.get("type", ""), "role": row["role"],
+                "description": row.get("description", ""), "url": row.get("url", ""),
+            }
+            if not name.lower().endswith(TEXT_DOCUMENT_SUFFIXES):
+                entry["skipped"] = "not a text document"
+                documents.append(entry)
+                continue
+            try:
+                text = filing_text.document_to_text(self._get_text(row["url"]))
+            except Exception as exc:
+                entry["error"] = f"Could not fetch document: {exc}"
+                documents.append(entry)
+                continue
+            entry["length"] = len(text)
+            if regex is not None:
+                sentences = filing_text.split_sentences(text)
+                matches = filing_text.match_sentences(
+                    sentences, regex, context=context,
+                    max_sentence_chars=TEXT_MATCH_SENTENCE_CHARS, limit=limit + 1,
+                )
+                entry["sentences"] = len(sentences)
+                entry["matches_truncated"] = len(matches) > limit
+                entry["matches"] = matches[:limit]
+            else:
+                start = min(max(offset, 0), len(text))
+                chunk = text[start:start + max_chars]
+                entry["offset"] = start
+                entry["text"] = chunk
+                entry["truncated"] = start + len(chunk) < len(text)
+                entry["next_offset"] = start + len(chunk) if entry["truncated"] else None
+            documents.append(entry)
+
+        out = {
+            "cik": resolved_cik,
+            "name": target.get("name", ""),
+            "filing": {
+                "accession": accession,
+                "form": target.get("form", ""),
+                "filed": target.get("filed", ""),
+                "acceptance_datetime": target.get("acceptance_datetime", ""),
+                "report_date": target.get("report_date", ""),
+                "filing_url": target.get("filing_url", ""),
+            },
+            "pattern": pattern,
+            "documents": documents,
+            "total": len(documents),
+        }
+        if not documents:
+            out["hint"] = ("No document matched. List this filing's documents with "
+                           f"`edgar exhibits {accession} --cik {int(resolved_cik)}`.")
+        return out
+
+    def _resolve_filing(self, identifier: Optional[str | int], accession_or_url: Optional[str],
+                        cik: Optional[str], form: Optional[str], as_of: Optional[str]) -> dict:
+        """Find one filing: by accession/URL, or the latest matching one of a filer."""
+        accession = extract_accession(accession_or_url or "")
+        if accession_or_url and not accession:
+            return {"error": f"Could not find accession number in {accession_or_url}", "documents": []}
+
+        resolved_cik = ""
+        name = ""
+        try:
+            if cik:
+                resolved_cik = normalize_cik(cik)
+            elif accession_or_url:
+                resolved_cik = extract_cik_from_url(accession_or_url)
+        except ValueError as exc:
+            return {"error": str(exc), "documents": []}
+        if not resolved_cik and identifier is not None:
+            company = self.resolve_company(identifier)
+            if "error" in company:
+                return company
+            resolved_cik, name = company["cik"], company.get("name", "")
+        if not resolved_cik:
+            return {"error": "A ticker, CIK or SEC URL is required to locate the filing "
+                             "(the accession number alone does not name the filer)",
+                    "documents": []}
+
+        raw = self._get(f"/submissions/CIK{resolved_cik}.json")
+        rows: list[dict] = []
+        if "error" not in raw:
+            name = raw.get("name") or name
+            rows = self._recent_filings(raw, limit=100000, form=None if accession else form,
+                                        end_date=None if accession else as_of)
+        elif not accession:
+            return raw
+
+        if accession:
+            match = next((row for row in rows if row.get("accessionNumber") == accession), None)
+            if match is None:
+                # Older than SEC's recent filing set (or the list is unavailable):
+                # the filing index still resolves from CIK + accession.
+                return {"cik": resolved_cik, "name": name, "accession": accession,
+                        **filing_urls(resolved_cik, accession)}
+        else:
+            if not rows:
+                label = f" {form}" if form else ""
+                when = f" on or before {as_of}" if as_of else ""
+                counts = self._form_counts(resolved_cik)
+                top = ", ".join(f"{f} ({c})" for f, c in list(counts.items())[:8])
+                return {"error": f"No matching{label} filing found{when} in the recent filing set."
+                                 + (f" This filer files: {top}." if top else ""),
+                        "documents": []}
+            match = rows[0]
+        return {
+            "cik": resolved_cik, "name": name,
+            "accession": match.get("accessionNumber", ""),
+            "form": match.get("form", ""),
+            "filed": match.get("filingDate", ""),
+            "acceptance_datetime": match.get("acceptanceDateTime", ""),
+            "report_date": match.get("reportDate", ""),
+            "primary_document": match.get("primaryDocument", ""),
+            "primary_doc_description": match.get("primaryDocDescription", ""),
+            "primary_doc_url": match.get("primary_doc_url", ""),
+            "filing_url": match.get("filing_url", ""),
         }
 
     def _fetch_13f_holdings(self, cik: str, accession: str) -> list[dict]:

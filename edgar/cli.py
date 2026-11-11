@@ -266,6 +266,7 @@ def _exit_code_for_error(error: str) -> int:
         return 2
     if (
         "not a cik" in text
+        or "invalid pattern" in text
         or "required" in text
         or "blank" in text
         or "ambiguous" in text
@@ -1276,6 +1277,7 @@ PRIMARY_ROW_KEYS: dict = {
     "dashboard": None,
     "governance": "proposals",
     "item": None,
+    "text": "documents",
     "holdings": "rows",
     "holders": "rows",
     "insiders": "transactions",
@@ -1688,6 +1690,116 @@ def item(ctx, identifier, form, section, as_of, db_path, max_chars,
     console.print(Panel(body,
                         title=f"{result.get('name', identifier)} {form} · {section}",
                         expand=False))
+
+
+@main.command()
+@click.argument("target", nargs=-1, required=True)
+@click.option("--cik", default=None,
+              help="Filer CIK, when only an accession number is given")
+@click.option("--form", "form_type", default=None,
+              help="Read the latest filing of this form (e.g. 6-K, 424B5, 20-F)")
+@click.option("--as-of", "as_of", default=None, callback=_validate_date_option,
+              help="Use the latest filing on/before YYYY-MM-DD")
+@click.option("--exhibit", "-e", "exhibits", multiple=True,
+              help="Also read exhibits whose type starts with this (EX-99, EX-10.1, all); repeatable")
+@click.option("--exhibits-only", is_flag=True, help="Leave out the main document")
+@click.option("--grep", "-g", "pattern", default=None,
+              help="Return only sentences matching this regular expression (case-insensitive)")
+@click.option("--context", "-C", default=0, show_default=True, type=PositiveOrZeroInt,
+              help="With --grep: sentences of context before and after each match")
+@click.option("--limit", "-n", default=50, show_default=True, type=PositiveInt,
+              help="With --grep: maximum matches per document")
+@click.option("--max-chars", default=50000, show_default=True, type=PositiveInt,
+              help="Return at most this many characters of each document")
+@click.option("--offset", default=0, show_default=True, type=PositiveOrZeroInt,
+              help="Start this many characters into each document (see next_offset)")
+@output_options
+@click.pass_context
+def text(ctx, target, cik, form_type, as_of, exhibits, exhibits_only, pattern, context,
+         limit, max_chars, offset, markdown, json_output, ndjson):
+    """Read any filing as clean text: main document, exhibits, or matching sentences.
+
+    TARGET is a ticker or CIK (reads its latest filing; narrow with --form),
+    a ticker or CIK plus an accession number, an accession number with
+    --cik, or an SEC filing URL.
+
+    \b
+      edgar text OMH --form 6-K
+      edgar text OMH 0001213900-26-107603 --exhibit EX-10
+      edgar text OMH 0001213900-26-107501 --grep "going concern|outstanding"
+    """
+    if len(target) > 2:
+        raise click.UsageError("Give a ticker/CIK, an accession number or URL, or both")
+    named = [value for value in target if _looks_like_filing_ref(value)]
+    others = [value for value in target if not _looks_like_filing_ref(value)]
+    if len(named) > 1 or len(others) > 1:
+        raise click.UsageError("Give one ticker/CIK and at most one accession number or URL")
+    client = get_client(use_cache=not ctx.obj["no_cache"],
+                       cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.filing_text(
+        identifier=others[0] if others else None,
+        accession_or_url=named[0] if named else None,
+        cik=cik, form=form_type, as_of=as_of,
+        exhibits=_split_input_values(",".join(exhibits)) if exhibits else None,
+        exhibits_only=exhibits_only, max_chars=max_chars, offset=offset,
+        pattern=pattern, context=context, limit=limit,
+    )
+    result = _finalize(client, result)
+    _error_exit(result)
+    _output_text(result, json_output, markdown, ndjson)
+    _exit_if_no_data(result, "documents")
+
+
+def _looks_like_filing_ref(value: str) -> bool:
+    """True for an accession number (dashed) or an SEC URL."""
+    import re
+    return bool(re.search(r"\d{10}-\d{2}-\d{6}", value) or "sec.gov/" in value.lower())
+
+
+def _output_text(result: dict, json_output: bool, markdown: bool, ndjson: bool = False) -> None:
+    documents = result.get("documents", [])
+    if ndjson:
+        rows = []
+        for doc in documents:
+            if "matches" in doc:
+                rows.extend({"document": doc["document"], "type": doc["type"],
+                             "accession": result["filing"]["accession"], **match}
+                            for match in doc["matches"])
+            else:
+                rows.append({"accession": result["filing"]["accession"], **doc})
+        _ndjson(rows)
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+    filing = result.get("filing", {})
+    header = (f"{result.get('name', '')} · {filing.get('form', '')} · "
+              f"{filing.get('accession', '')} · filed {filing.get('filed', '')}")
+    click.echo(f"# {header}\n" if markdown else header)
+    for doc in documents:
+        title = f"{doc.get('type', '')} {doc.get('document', '')}".strip()
+        click.echo(f"\n## {title}\n" if markdown else f"\n=== {title} ===")
+        if doc.get("skipped") or doc.get("error"):
+            click.echo(doc.get("skipped") or doc.get("error"))
+            continue
+        if "matches" in doc:
+            for match in doc["matches"]:
+                for line in match.get("before", []):
+                    click.echo(f"  {line}")
+                click.echo(f"- [{match['index']}] {match['sentence']}")
+                for line in match.get("after", []):
+                    click.echo(f"  {line}")
+            if doc.get("matches_truncated"):
+                click.echo(f"(more matches; raise --limit above {len(doc['matches'])})")
+            if not doc["matches"]:
+                click.echo(f"(no sentence matches {result.get('pattern')!r})")
+            continue
+        click.echo(doc.get("text", ""))
+        if doc.get("truncated"):
+            click.echo(f"\n[truncated: {doc['length']} characters in total; "
+                       f"continue with --offset {doc['next_offset']}]")
+    if result.get("hint"):
+        click.echo(f"\n{result['hint']}")
 
 
 @main.command()
