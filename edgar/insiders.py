@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import re
 import xml.etree.ElementTree as ET
-from typing import Optional
 
 # https://www.sec.gov/about/forms/form4data.pdf
 TRANSACTION_CODES: dict[str, dict] = {

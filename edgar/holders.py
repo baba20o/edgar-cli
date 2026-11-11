@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import re
 import xml.etree.ElementTree as ET
-from typing import Optional
 
 
 def _strip_ns(tag: str) -> str:

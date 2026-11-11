@@ -19,7 +19,6 @@ up as duplicate `(cik, tag, start, end)` rows with different `accession`/`val`.
 
 from __future__ import annotations
 
-import json
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -231,7 +230,7 @@ def ingest_submissions(conn: sqlite3.Connection, cik: str, submissions: dict,
 
 def ingest_companyfacts(conn: sqlite3.Connection, cik: str, facts_doc: dict) -> dict:
     """Insert/update facts from a companyfacts JSON. Returns counts."""
-    from edgar.api import normalize_cik, period_type_from_days
+    from edgar.api import normalize_cik
     from datetime import datetime
 
     cik_n = normalize_cik(cik)

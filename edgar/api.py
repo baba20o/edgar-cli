@@ -29,7 +29,7 @@ from dotenv import load_dotenv
 
 import requests
 
-from research_cli_base import BaseAPIClient, FileCache, SharedRateLimiter
+from research_cli_base import BaseAPIClient, SharedRateLimiter
 from research_cli_base.http_client import retry_wait_seconds
 
 from edgar import __version__ as CLI_VERSION
@@ -2234,7 +2234,7 @@ class EdgarClient(BaseAPIClient):
         # tolerance for fiscal-year drift). Lines that don't align are marked
         # `missing` with `period_misaligned` set, so coverage drops to reflect
         # the real same-period state instead of stitching across years.
-        from datetime import datetime, timedelta
+        from datetime import datetime
 
         def _align_ok(fact_end: str, anchor: str, kind: str) -> bool:
             if not fact_end or not anchor:
@@ -3019,8 +3019,6 @@ class EdgarClient(BaseAPIClient):
         cik = company["cik"]
 
         flow_pt = period_type if period_type in ("annual", "quarterly", "ytd") else "annual"
-        instant_pt = "instant"
-
         revenue = self._latest_fact_for_alias(cik, "revenue", period_type=flow_pt, as_of=as_of)
         net_income = self._latest_fact_for_alias(cik, "net_income", period_type=flow_pt, as_of=as_of)
         operating_income = self._latest_fact_for_alias(cik, "operating_income", period_type=flow_pt, as_of=as_of)
