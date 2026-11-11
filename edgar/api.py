@@ -4210,6 +4210,54 @@ def alias_filing_row(row: dict) -> dict:
     return row
 
 
+def compact_filing_row(row: dict) -> dict:
+    """A filing row without its duplicate and empty fields.
+
+    Drops each SEC camelCase key that has a snake_case alias on the row
+    (`accessionNumber` when `accession` is there, ...) and every empty value.
+    Nothing is renamed, so a consumer of the snake_case names reads a compact
+    row exactly as it reads a full one.
+    """
+    return {
+        key: value for key, value in row.items()
+        if value not in ("", None, [], {})
+        and not (key in _FILING_ROW_ALIASES and _FILING_ROW_ALIASES[key] in row)
+    }
+
+
+def compact_result(result: dict) -> dict:
+    """Compact every filing row in a `company` / `filings` / `brief` result.
+
+    The envelope gains `"compact": true`. Opt-in (`--compact`): the default
+    output keeps both spellings of every filing field, as published in
+    schema_version 1.1.0.
+    """
+    if not isinstance(result, dict) or "error" in result:
+        return result
+    out = dict(result)
+    for key in ("filings", "events"):
+        if isinstance(out.get(key), list):
+            out[key] = [compact_filing_row(row) if isinstance(row, dict) else row
+                        for row in out[key]]
+    for key in ("profile",):
+        if isinstance(out.get(key), dict):
+            out[key] = compact_result(out[key])
+            out[key].pop("compact", None)
+    earnings = out.get("earnings")
+    if isinstance(earnings, dict) and isinstance(earnings.get("filing"), dict):
+        out["earnings"] = {**earnings, "filing": compact_filing_row(earnings["filing"])}
+    if isinstance(out.get("results"), list):
+        out["results"] = [compact_result(item) for item in out["results"]]
+        for item in out["results"]:
+            if isinstance(item, dict):
+                item.pop("compact", None)
+    # `files` lists SEC's historical chunk files: bulk an agent rarely needs.
+    if not out.get("files"):
+        out.pop("files", None)
+    out["compact"] = True
+    return out
+
+
 def enrich_fact_metadata(fact: dict, cik: str | int,
                          fiscal_grid: Optional[list[tuple]] = None) -> dict:
     """Add provenance and normalized period metadata to a fact row.

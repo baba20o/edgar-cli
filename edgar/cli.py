@@ -213,6 +213,26 @@ def cite_option(fn):
     )(fn)
 
 
+def compact_option(fn):
+    return click.option(
+        "--compact", is_flag=True,
+        help="Drop duplicate camelCase filing fields and empty values (keeps snake_case)",
+    )(fn)
+
+
+def _machine_output(json_output: bool, markdown: bool, ndjson: bool) -> bool:
+    """True when the result goes out as JSON or NDJSON rather than a table."""
+    return ndjson or _wants_json(json_output, markdown, ndjson)
+
+
+def _compact(result, compact: bool):
+    """Compact a result for machine output; tables read the full rows."""
+    if not compact:
+        return result
+    from edgar.api import compact_result
+    return compact_result(result)
+
+
 def since_last_fetch_option(fn):
     return click.option(
         "--since-last-fetch", "since_last_fetch", is_flag=True,
@@ -466,11 +486,12 @@ def search_companies(ctx, query, limit, markdown, json_output, ndjson):
 @click.option("--institutional", "form_class_flag", flag_value="institutional",
               help="Only institutional forms (SC 13D/G, 13F)")
 @cite_option
+@compact_option
 @since_last_fetch_option
 @output_options
 @click.pass_context
 def company(ctx, identifier, limit, form_type, start_date, end_date, all_history, show_urls,
-            form_class_flag, cite, since_last_fetch, markdown, json_output, ndjson):
+            form_class_flag, cite, compact, since_last_fetch, markdown, json_output, ndjson):
     """Show company profile and recent filings for a ticker or CIK."""
     client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
     state_store = StateStore() if since_last_fetch else None
@@ -480,7 +501,7 @@ def company(ctx, identifier, limit, form_type, start_date, end_date, all_history
         since_last_fetch=since_last_fetch, state_store=state_store,
         form_class=form_class_flag,
     )
-    result = _finalize(client, result, cite=cite)
+    result = _compact(_finalize(client, result, cite=cite), compact and _machine_output(json_output, markdown, ndjson))
     _output_company(result, json_output, markdown, ndjson, show_urls=show_urls)
 
 
@@ -499,11 +520,12 @@ def company(ctx, identifier, limit, form_type, start_date, end_date, all_history
 @click.option("--institutional", "form_class_flag", flag_value="institutional",
               help="Only institutional forms (SC 13D/G, 13F)")
 @cite_option
+@compact_option
 @since_last_fetch_option
 @output_options
 @click.pass_context
 def filings(ctx, identifier, limit, form_type, start_date, end_date, all_history, show_urls,
-            form_class_flag, cite, since_last_fetch, markdown, json_output, ndjson):
+            form_class_flag, cite, compact, since_last_fetch, markdown, json_output, ndjson):
     """Show recent filings for a ticker or CIK."""
     client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
     state_store = StateStore() if since_last_fetch else None
@@ -513,7 +535,7 @@ def filings(ctx, identifier, limit, form_type, start_date, end_date, all_history
         since_last_fetch=since_last_fetch, state_store=state_store,
         form_class=form_class_flag,
     )
-    result = _finalize(client, result, cite=cite)
+    result = _compact(_finalize(client, result, cite=cite), compact and _machine_output(json_output, markdown, ndjson))
     _output_filings(result, f"Recent Filings: {identifier}", json_output, markdown, ndjson, show_urls=show_urls)
 
 
@@ -789,9 +811,10 @@ def metrics(ctx, identifier, bundle, tickers, input_file, batch, cite, markdown,
 @click.argument("identifier", required=False)
 @batch_options
 @cite_option
+@compact_option
 @output_options
 @click.pass_context
-def brief(ctx, identifier, tickers, input_file, batch, cite, markdown, json_output, ndjson):
+def brief(ctx, identifier, tickers, input_file, batch, cite, compact, markdown, json_output, ndjson):
     """Build a compact company brief."""
     identifiers = _collect_identifiers(identifier, tickers, input_file, batch)
     client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
@@ -801,10 +824,10 @@ def brief(ctx, identifier, tickers, input_file, batch, cite, markdown, json_outp
         result.setdefault("identifier", value)
         results.append(result)
     if len(results) == 1 and not (tickers or input_file or batch):
-        single = _finalize(client, results[0], cite=cite)
+        single = _compact(_finalize(client, results[0], cite=cite), compact and _machine_output(json_output, markdown, ndjson))
         _output_brief(single, json_output, markdown, ndjson)
     else:
-        wrapped = _finalize_batch(client, results, key="results", cite=cite)
+        wrapped = _compact(_finalize_batch(client, results, key="results", cite=cite), compact and _machine_output(json_output, markdown, ndjson))
         _output_brief_batch(wrapped["results"], json_output, markdown, ndjson, envelope=wrapped)
 
 
