@@ -34,6 +34,7 @@ from research_cli_base.http_client import retry_wait_seconds
 
 from edgar import __version__ as CLI_VERSION
 from edgar import compute
+from edgar import dilution as dilution_mod
 from edgar import filing_text
 from edgar import sixk
 from edgar import governance as governance_mod
@@ -294,6 +295,11 @@ INTERIM_REPORT_FORMS = {"6-K", "6-K/A"}
 # classify only the opening of the exhibit (a release leads with its news).
 MAX_EVENT_EXHIBIT_BYTES = 1_500_000
 EVENT_EXHIBIT_LEAD_CHARS = 6000
+
+# `edgar dilution`: the forms it reads and the registrations it lists.
+CURRENT_REPORT_FORMS = {"6-K", "6-K/A", "8-K", "8-K/A"}
+SHELF_FORMS = {"F-3", "S-3", "F-3ASR", "S-3ASR"}
+REGISTRATION_FORMS = SHELF_FORMS | {"F-1", "S-1", "F-1MEF", "S-1MEF", "F-3MEF", "S-3MEF"}
 
 # `edgar text`: documents that can be turned into text, and the longest
 # sentence returned by --grep before it is clipped around the match.
@@ -1975,6 +1981,194 @@ class EdgarClient(BaseAPIClient):
             out["hint"] = ("No document matched. List this filing's documents with "
                            f"`edgar exhibits {accession} --cik {int(resolved_cik)}`.")
         return out
+
+    def dilution(self, identifier: str | int, since: Optional[str] = None,
+                 max_filings: int = 25, max_supplements: int = 3) -> dict:
+        """Gather what bears on one filer's share supply, each figure sourced.
+
+        Reads the filer's current reports (6-K / 8-K) and prospectus
+        supplements (424B*) filed on or after `since` (default: one year
+        before its latest filing) and returns, by section: stated shares
+        outstanding, shelf registrations with effectiveness and takedowns,
+        prospectus supplements, offerings, equity lines and at-the-market
+        programs, warrants, reverse splits and going-concern language.
+
+        Every statement is a sentence of a filing with its accession, form and
+        filing date, and every figure carries the text it was parsed from
+        (`edgar.dilution`). Text heuristics: a section can be incomplete, but
+        nothing in it is inferred.
+        """
+        company = self.resolve_company(identifier)
+        if "error" in company:
+            return company
+        cik = company["cik"]
+        raw = self._get(f"/submissions/CIK{cik}.json")
+        if "error" in raw:
+            return raw
+        rows = self._recent_filings(raw, limit=100000)
+        latest_filed = max((row.get("filingDate", "") for row in rows), default="")
+        if not since:
+            latest = parse_date(latest_filed)
+            since = (latest - timedelta(days=365)).isoformat() if latest else ""
+
+        def _newest_first(items: list[dict]) -> list[dict]:
+            return sorted(items, key=lambda r: (r.get("acceptanceDateTime") or r.get("filingDate", ""),
+                                                r.get("accessionNumber", "")), reverse=True)
+
+        in_window = [row for row in rows if row.get("filingDate", "") >= since]
+        supplements = _newest_first([r for r in in_window
+                                     if r.get("form", "").upper().startswith("424B")])
+        current = _newest_first([r for r in in_window
+                                 if r.get("form", "").upper() in CURRENT_REPORT_FORMS])
+        to_read = _newest_first(supplements[:max_supplements] + current[:max_filings])
+
+        statements: list[dict] = []
+        filings_read: list[dict] = []
+        for row in to_read:
+            form = row.get("form", "")
+            prospectus = form.upper().startswith("424B")
+            entry = {"accession": row.get("accessionNumber", ""), "form": form,
+                     "filed": row.get("filingDate", ""),
+                     "document": row.get("primaryDocument", "")}
+            try:
+                text = filing_text.document_to_text(self._get_text(row.get("primary_doc_url", "")))
+            except Exception as exc:
+                entry["error"] = f"Could not fetch document: {exc}"
+                filings_read.append(entry)
+                continue
+            if form.upper().startswith("6-K"):
+                sentences = [s for block in sixk.split_6k(text)["body"]
+                             for s in filing_text._split_paragraph(block)]
+            else:
+                sentences = filing_text.split_sentences(text)
+            found = dilution_mod.extract_statements(sentences, prospectus=prospectus)
+            for statement in found:
+                statement.update({
+                    "accession": entry["accession"], "form": form, "filed": entry["filed"],
+                    "acceptance_datetime": row.get("acceptanceDateTime", ""),
+                    "file_number": row.get("fileNumber", ""),
+                    "document": entry["document"],
+                    "source_url": row.get("primary_doc_url", ""),
+                })
+            entry["statements"] = len(found)
+            filings_read.append(entry)
+            statements.extend(found)
+
+        def _topic(*topics: str) -> list[dict]:
+            return [s for s in statements if s["topic"] in topics]
+
+        shares = sorted(_topic("shares_outstanding"),
+                        key=lambda s: (s.get("as_of") or s["filed"], s["acceptance_datetime"]),
+                        reverse=True)
+        latest_shares = next((s for s in shares if s.get("basis") != "after_offering"), None)
+        offerings = _topic("offering")
+        program_kinds = {"equity_line", "atm"}
+        read_accessions = {entry["accession"] for entry in filings_read if "error" not in entry}
+
+        out = {
+            "cik": cik, "ticker": company.get("ticker", ""),
+            "name": raw.get("name") or company.get("name", ""),
+            "since": since,
+            "latest_shares_outstanding": latest_shares,
+            "shares_outstanding": shares,
+            "xbrl_shares_outstanding": self._xbrl_shares_outstanding(cik, statements),
+            "shelf_registrations": self._shelf_registrations(rows, statements),
+            "prospectus_supplements": [
+                {
+                    "accession": row.get("accessionNumber", ""), "form": row.get("form", ""),
+                    "filed": row.get("filingDate", ""), "file_number": row.get("fileNumber", ""),
+                    "filing_url": row.get("filing_url", ""),
+                    "read": row.get("accessionNumber", "") in read_accessions,
+                    "offering": [s for s in offerings
+                                 if s["accession"] == row.get("accessionNumber", "")],
+                }
+                for row in supplements
+            ],
+            "offerings": [s for s in offerings
+                          if s.get("kind") not in program_kinds and not s["form"].upper().startswith("424B")],
+            "equity_lines_and_atm": ([s for s in offerings if s.get("kind") in program_kinds]
+                                     + _topic("equity_line_terms")),
+            "warrants": _topic("warrants"),
+            "reverse_splits": _topic("reverse_split"),
+            "going_concern": _topic("going_concern"),
+            "filings_read": filings_read,
+            "filings_not_read": {
+                "current_reports": max(0, len(current) - max_filings),
+                "prospectus_supplements": max(0, len(supplements) - max_supplements),
+            },
+            "method": ("Text heuristics over the filer's current reports and prospectus "
+                       "supplements. Each statement is a sentence of the named filing; each "
+                       "figure carries the text it was parsed from. Share counts are as "
+                       "stated on their date and are not adjusted for later splits. A "
+                       "section can be incomplete; nothing in it is inferred."),
+        }
+        if not statements and not out["shelf_registrations"]:
+            counts = self._form_counts(cik, since=since)
+            top = ", ".join(f"{f} ({c})" for f, c in list(counts.items())[:8])
+            out["hint"] = (f"No current reports (6-K, 8-K) or prospectus supplements (424B) on or "
+                           f"after {since}, and no registration statements in the recent filing set."
+                           + (f" Since then this filer filed: {top}." if top else ""))
+        return out
+
+    def _xbrl_shares_outstanding(self, cik: str, statements: list[dict]) -> Optional[dict]:
+        """The cover-page share count SEC's XBRL API serves, as a cross-check."""
+        result = self.company_concept(cik, "dei", "EntityCommonStockSharesOutstanding",
+                                      unit="shares", limit=24, suggest_on_404=False)
+        fact = freshest_fact(result.get("facts", [])) if "error" not in result else None
+        if not fact:
+            return None
+        out = {
+            "value": fact.get("val"), "as_of": fact.get("end", ""),
+            "accession": fact.get("accession") or fact.get("accn", ""),
+            "form": fact.get("form", ""), "filed": fact.get("filed", ""),
+            "source": "XBRL dei:EntityCommonStockSharesOutstanding",
+        }
+        later = sorted(
+            s.get("effective_date") or s["filed"] for s in statements
+            if s["topic"] == "reverse_split" and s.get("status") == "effective"
+            and (s.get("effective_date") or s["filed"]) > out["as_of"]
+        )
+        if later:
+            out["note"] = (f"A reverse split took effect on {later[-1]}, after this count's date: "
+                           "it is on the pre-split basis.")
+        return out
+
+    @staticmethod
+    def _shelf_registrations(rows: list[dict], statements: list[dict]) -> list[dict]:
+        """Registration statements grouped by SEC file number, with the EFFECT
+        notice and the prospectus supplements filed under each."""
+        shelves: dict[str, dict] = {}
+        for row in sorted(rows, key=lambda r: r.get("filingDate", "")):
+            form = row.get("form", "").upper()
+            number = row.get("fileNumber", "")
+            base = form.split("/")[0]
+            if not number or base not in REGISTRATION_FORMS:
+                continue
+            ref = {"form": row.get("form", ""), "accession": row.get("accessionNumber", ""),
+                   "filed": row.get("filingDate", "")}
+            shelf = shelves.setdefault(number, {
+                "file_number": number, "form": base, "shelf": base in SHELF_FORMS,
+                "filed": ref["filed"], "accession": ref["accession"],
+                "amendments": [], "effective": None, "supplements": [], "capacity": [],
+            })
+            if ref["accession"] != shelf["accession"]:
+                shelf["amendments"].append(ref)
+        for row in sorted(rows, key=lambda r: r.get("filingDate", "")):
+            form = row.get("form", "").upper()
+            shelf = shelves.get(row.get("fileNumber", ""))
+            if not shelf:
+                continue
+            ref = {"form": row.get("form", ""), "accession": row.get("accessionNumber", ""),
+                   "filed": row.get("filingDate", "")}
+            if form == "EFFECT":
+                shelf["effective"] = {"date": ref["filed"], "accession": ref["accession"]}
+            elif form.startswith("424B"):
+                shelf["supplements"].append(ref)
+        for statement in statements:
+            shelf = shelves.get(statement.get("file_number", ""))
+            if shelf and statement["topic"] == "shelf_capacity":
+                shelf["capacity"].append(statement)
+        return sorted(shelves.values(), key=lambda s: s["filed"], reverse=True)
 
     def _resolve_filing(self, identifier: Optional[str | int], accession_or_url: Optional[str],
                         cik: Optional[str], form: Optional[str], as_of: Optional[str]) -> dict:

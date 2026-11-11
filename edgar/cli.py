@@ -1300,6 +1300,7 @@ PRIMARY_ROW_KEYS: dict = {
     "governance": "proposals",
     "item": None,
     "text": "documents",
+    "dilution": None,
     "holdings": "rows",
     "holders": "rows",
     "insiders": "transactions",
@@ -1797,6 +1798,104 @@ def text(ctx, target, cik, form_type, as_of, exhibits, exhibits_only, pattern, c
     _error_exit(result)
     _output_text(result, json_output, markdown, ndjson)
     _exit_if_no_data(result, "documents")
+
+
+_DILUTION_SECTIONS = [
+    ("shares_outstanding", "Shares outstanding (as stated)"),
+    ("offerings", "Offerings"),
+    ("equity_lines_and_atm", "Equity lines and at-the-market programs"),
+    ("warrants", "Warrants"),
+    ("reverse_splits", "Reverse splits"),
+    ("going_concern", "Going concern"),
+]
+
+
+@main.command()
+@click.argument("identifier")
+@click.option("--since", default=None, callback=_validate_date_option,
+              help="Read filings on/after YYYY-MM-DD (default: one year before the latest filing)")
+@click.option("--max-filings", default=25, show_default=True, type=PositiveInt,
+              help="Most recent current reports (6-K, 8-K) to read")
+@click.option("--max-supplements", default=3, show_default=True, type=PositiveOrZeroInt,
+              help="Most recent prospectus supplements (424B) to read")
+@output_options
+@click.pass_context
+def dilution(ctx, identifier, since, max_filings, max_supplements, markdown, json_output, ndjson):
+    """Gather what bears on share supply, every figure with its source sentence.
+
+    Sections: stated shares outstanding, shelf registrations (effectiveness,
+    takedowns, capacity), prospectus supplements, offerings, equity lines and
+    at-the-market programs, warrants (count, exercise price, multiple-share
+    exchange features), reverse splits and going-concern language.
+
+    Read from the filer's own 6-K / 8-K reports and 424B supplements. Each
+    statement is a sentence of a named filing; nothing is inferred.
+    """
+    client = get_client(use_cache=not ctx.obj["no_cache"],
+                       cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.dilution(identifier, since=since, max_filings=max_filings,
+                             max_supplements=max_supplements)
+    result = _finalize(client, result)
+    _error_exit(result)
+    _output_dilution(result, json_output, markdown, ndjson)
+    _exit_if_no_data(result, "shelf_registrations", "prospectus_supplements",
+                     *[key for key, _ in _DILUTION_SECTIONS])
+
+
+def _figures_text(statement: dict) -> str:
+    return "; ".join(figure.get("text", "") for figure in statement.get("figures", []))
+
+
+def _output_dilution(result: dict, json_output: bool, markdown: bool, ndjson: bool = False) -> None:
+    if ndjson:
+        rows = [{"section": key, **statement}
+                for key, _ in _DILUTION_SECTIONS for statement in result.get(key, [])]
+        rows.extend({"section": "shelf_capacity", **statement}
+                    for shelf in result.get("shelf_registrations", [])
+                    for statement in shelf.get("capacity", []))
+        _ndjson(rows)
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+
+    def emit(title: str, headers: list[str], rows: list[list]) -> None:
+        if not rows:
+            return
+        if markdown:
+            click.echo(f"\n### {title}\n")
+            click.echo(_markdown_table(headers, rows))
+        else:
+            console.print(_simple_table(title, headers, rows))
+
+    click.echo(f"## Dilution: {result.get('name', '')} (filings since {result.get('since', '')})"
+               if markdown else f"Dilution: {result.get('name', '')} · since {result.get('since', '')}")
+    latest = result.get("latest_shares_outstanding")
+    if latest:
+        click.echo(f"\nLatest stated shares outstanding ({latest.get('as_of') or latest['filed']}, "
+                   f"{latest['form']} {latest['accession']}): {_figures_text(latest)}")
+    xbrl = result.get("xbrl_shares_outstanding")
+    if xbrl:
+        click.echo(f"XBRL cover count: {_format_value(xbrl.get('value'))} as of {xbrl.get('as_of')} "
+                   f"({xbrl.get('form')} {xbrl.get('accession')}). {xbrl.get('note', '')}".rstrip())
+    emit("Shelf registrations",
+         ["File no.", "Form", "Filed", "Effective", "Supplements", "Capacity statements"],
+         [[shelf["file_number"], shelf["form"], shelf["filed"],
+           (shelf.get("effective") or {}).get("date", "not found"),
+           ", ".join(f"{s['form']} {s['filed']}" for s in shelf.get("supplements", [])),
+           " / ".join(_figures_text(s) for s in shelf.get("capacity", []) if s.get("figures"))]
+          for shelf in result.get("shelf_registrations", [])])
+    emit("Prospectus supplements", ["Filed", "Form", "Accession", "Read", "Stated on the cover"],
+         [[row["filed"], row["form"], row["accession"], "yes" if row.get("read") else "no",
+           " / ".join(_figures_text(s) for s in row.get("offering", []))]
+          for row in result.get("prospectus_supplements", [])])
+    for key, title in _DILUTION_SECTIONS:
+        emit(title, ["Filed", "Form", "Accession", "Figures", "Sentence"],
+             [[s["filed"], s["form"], s["accession"], _figures_text(s), _truncate(s["sentence"], 220)]
+              for s in result.get(key, [])])
+    if result.get("hint"):
+        click.echo(f"\n{result['hint']}")
+    click.echo(f"\n{result.get('method', '')}")
 
 
 def _looks_like_filing_ref(value: str) -> bool:

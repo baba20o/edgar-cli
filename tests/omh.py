@@ -1,9 +1,15 @@
 """Shared OMH (Ohmyhome Ltd, CIK 0001944902) fixtures for offline tests.
 
 OMH is a Singapore foreign private issuer: it files 6-K, 20-F, F-3 and 424B5
-rather than 8-K and 10-K. The documents under `tests/fixtures/omh/` are the
-filings as SEC serves them; `submissions.json` is the filing list trimmed to
-rows filed on or after 2025-12-01.
+rather than 8-K and 10-K. Under `tests/fixtures/omh/`:
+
+- `<accession>.htm`: 6-K primary documents as SEC serves them;
+- `<accession>.excerpt.txt`: verbatim paragraphs of the two 424B5 prospectus
+  supplements (the full documents are ~700 KB each);
+- `submissions.json`: the filing list trimmed to rows filed on or after
+  2025-12-01 plus every row under shelf file number 333-285637;
+- `companyfacts.json`: SEC's companyfacts payload trimmed to a few tags;
+- `form3_<accession>.xml`: one Form 3.
 """
 
 from __future__ import annotations
@@ -27,12 +33,14 @@ def fixture_json(name: str) -> dict:
 
 
 def offline_client(extra_documents: dict[str, str] | None = None,
-                   json_routes: dict[str, dict] | None = None) -> EdgarClient:
+                   json_routes: dict[str, dict] | None = None,
+                   default_document: str | None = None) -> EdgarClient:
     """An EdgarClient that answers from fixtures and fails on anything else.
 
     `_get` serves the submissions fixture (plus `json_routes`, matched by URL
     substring); `_get_text` serves a document by the accession in its URL, or
-    by a URL substring given in `extra_documents`.
+    by a URL substring given in `extra_documents`. A document with no fixture
+    is an error unless `default_document` supplies a stand-in.
     """
     client = EdgarClient(cache=None, rate_limiter=None, use_cache=False)
     company_facts = fixture_json("companyfacts.json")
@@ -66,9 +74,12 @@ def offline_client(extra_documents: dict[str, str] | None = None,
         match = re.search(r"/(\d{10})(\d{2})(\d{6})/", url)
         if match:
             accession = "-".join(match.groups())
-            for candidate in (f"{accession}.htm", f"form3_{accession}.xml"):
+            for candidate in (f"{accession}.htm", f"{accession}.excerpt.txt",
+                              f"form3_{accession}.xml"):
                 if (FIXTURES / candidate).exists():
                     return fixture_text(candidate)
+        if default_document is not None:
+            return default_document
         raise AssertionError(f"offline test tried to fetch {url}")
 
     client._get = fake_get
