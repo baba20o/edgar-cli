@@ -32,10 +32,6 @@ KNOWN_6K = {
         {"listing_compliance"},
         {"listing_compliance": ["regained compliance with Listing Rule 5550(a)(2)"]},
     ),
-    "0001213900-26-098819": (
-        {"financial_results"},
-        {"financial_results": ["six-month interim financial statements"]},
-    ),
     "0001213900-26-091913": (
         {"reverse_split", "shareholder_vote"},
         {"reverse_split": ["50 for 1 basis"],
@@ -104,6 +100,31 @@ def test_classify_6k_marks_recap_only_types_as_background():
     fresh = sixk.classify_6k(document_to_text(fixture_text("0001213900-26-100756.htm")))
     assert fresh["event_types"] == ["listing_compliance"]
     assert fresh["background_types"] == []
+
+
+def test_classify_6k_interim_financial_statements():
+    # Body of OMH's 6-K 0001213900-26-098819 (the document itself is 115 KB of
+    # inline XBRL cover page, so only its text is kept here).
+    result = sixk.classify_6k(
+        "FORM 6-K\n\nForm 20-F ☒ Form 40-F ☐\n\n"
+        "INFORMATION CONTAINED IN THIS REPORT ON FORM 6-K\n\n"
+        'Ohmyhome Limited (the "Company") is furnishing this Form 6-K to provide six-month '
+        "interim financial statements.\n\n"
+        "EXHIBIT INDEX\n\nExhibit No. Description\n\n"
+        "99.1 Unaudited Interim Condensed Consolidated Financial Statements for the Six Months "
+        "Ended June 30, 2026 and 2025\n\nSIGNATURES"
+    )
+
+    assert result["event_types"] == ["financial_results"]
+    assert result["snippets"]["financial_results"].endswith("six-month interim financial statements.")
+    assert result["heading"] == ""
+    assert result["exhibit_index"][-1].startswith("99.1 Unaudited Interim Condensed")
+
+
+def test_classify_6k_pro_forma_statements_are_not_results():
+    result = sixk.classify_6k(document_to_text(fixture_text("0001213900-26-072273.htm")))
+
+    assert "financial_results" not in result["event_types"]
 
 
 def test_classify_6k_heading_and_unclassified_lead():

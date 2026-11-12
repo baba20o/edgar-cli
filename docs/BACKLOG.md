@@ -31,7 +31,7 @@ closed (schema_version 1.1.0 → 1.2.0, additive):
   language, every figure with its accession, date and source sentence.
 - **`--compact`** on `company` / `filings` / `brief`.
 
-Tests: 259 passing on Windows and WSL (was 182), all offline against saved
+Tests: 260 passing on Windows and WSL (was 182), all offline against saved
 OMH fixtures.
 
 Open follow-ups from this pass:

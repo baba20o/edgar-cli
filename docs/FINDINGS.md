@@ -416,5 +416,5 @@ regression fixtures are under `tests/fixtures/omh/`; no test calls SEC.
     for a filing the index page shows as accepted `2026-11-09 17:00:10`
     Eastern). `events` passes it through as `acceptance_datetime`.
 
-Status: 9 items closed, 77 tests added (259 passing on Windows and WSL),
+Status: 9 items closed, 78 tests added (260 passing on Windows and WSL),
 each fix verified against live SEC data on 2026-11-11.
