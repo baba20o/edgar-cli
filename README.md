@@ -9,8 +9,24 @@ primary surface and the docs lead with them.
 
 ## Install
 
+Python 3.10+ on Linux, macOS, WSL or Windows. `git` must be on `PATH`: the
+shared [`research-cli-base`](https://github.com/baba20o/research-cli-base)
+package is not on PyPI, so pip installs it from GitHub (declared as a direct
+reference in `pyproject.toml`).
+
 ```bash
+git clone https://github.com/baba20o/edgar-cli
+cd edgar-cli
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -e .
+edgar --help
+```
+
+Without an editable checkout:
+
+```bash
+pip install git+https://github.com/baba20o/edgar-cli
 ```
 
 ## Setup
@@ -60,11 +76,15 @@ edgar pending --ndjson    # streams new filings since last drain
 | 4    | SEC outage / 403 / unavailable service |
 | 5    | Validation error (malformed input) |
 
+`events`, `insiders`, `text` and `dilution` still print their JSON envelope
+when they have nothing to return, then exit 2: stdout carries a `hint` that
+says why (for example the forms the filer does file), stderr repeats it.
+
 ### Envelope on every JSON response
 
 ```json
 {
-  "schema_version": "1.1.0",
+  "schema_version": "1.2.0",
   "cli_version": "0.1.0",
   "cache": {"calls": 10, "hits": 7, "misses": 3, "ttl_min_remaining": 52867,
             "last_key": "...", "last_hit": false, "last_etag": null},
@@ -79,7 +99,14 @@ argument returns the full command → primary-row-key map.
 
 Filing rows carry both SEC's raw camelCase (`accessionNumber`, `filingDate`)
 and snake_case aliases (`accession`, `filed`, `report_date`,
-`primary_document`) as of schema_version 1.1.0.
+`primary_document`) as of schema_version 1.1.0. `--compact` on `company`,
+`filings` and `brief` drops the camelCase duplicates and empty values from
+JSON and NDJSON output (about 30% smaller); the snake_case names are
+unchanged.
+
+An envelope can carry `warnings` (a list of `{code, message, ...}`) when the
+CLI detects something the caller should know, such as SEC's XBRL API lagging
+the filing list. Table and markdown output print them on stderr.
 
 ### Per-fact provenance + period metadata
 
@@ -135,8 +162,71 @@ edgar filings AAPL --form 8-K --since-last-fetch    # incremental mode
 edgar open AAPL --form 10-K --print-only            # print latest filing URL
 edgar exhibits 0000320193-25-000079 --cik 320193 --type-filter EX-99
 edgar earnings AAPL                                 # latest Item 2.02 8-K
-edgar events TSLA --limit 10                        # 8-K event detection
+edgar events TSLA --limit 10                        # 8-K and 6-K event detection
+edgar company OMH --compact                         # no duplicate camelCase fields
 ```
+
+### Reading a filing
+
+```bash
+edgar text OMH --form 6-K                            # latest 6-K as clean text
+edgar text OMH 0001213900-26-107603                  # one filing by accession
+edgar text 0001213900-26-107603 --cik 1944902 --exhibit EX-10   # plus its EX-10.x
+edgar text OMH 0001213900-26-107501 --grep "going concern|outstanding" --context 1
+edgar text OMH --form 20-F --max-chars 20000 --offset 40000     # page a long one
+```
+
+`text` returns the main document of any filing (6-K, 424B5, 20-F, F-3, 8-K,
+10-K, ...) as clean text: paragraphs separated by blank lines, one line per
+table row, markup and hidden inline-XBRL headers removed. `--exhibit TYPE`
+adds exhibits whose type starts with `TYPE` (`all` for every exhibit;
+`--exhibits-only` drops the main document). Each document is capped at
+`--max-chars` (default 50,000); `truncated` and `next_offset` say whether and
+where to continue. `--grep PATTERN` returns only the sentences matching a
+case-insensitive regular expression, each with its sentence index and, with
+`--context N`, its neighbours. `item` remains the 10-K/10-Q section
+extractor.
+
+### Foreign private issuers
+
+Many micro-caps file 6-K, 20-F, F-3 and 424B5 instead of 8-K, 10-K and S-3.
+The CLI reads them:
+
+```bash
+edgar events OMH                    # each 6-K classified from its own text
+edgar insiders OMH --since 2026-01-01   # Form 4/5 transactions, Form 3 statements
+edgar dilution OMH                  # share supply, every figure sourced
+edgar metrics OMH --bundle revenue  # warns when SEC's XBRL API lags a filing
+```
+
+- **`events`** reads 6-K current reports as well as 8-Ks. A 6-K has no item
+  numbers, so it is classified from its own text into `financing`,
+  `material_agreement`, `divestiture`, `reverse_split`, `name_change`,
+  `redomicile`, `listing_deficiency`, `listing_compliance`,
+  `shareholder_vote`, `shareholder_meeting_notice`,
+  `authorized_capital_change`, `charter_amendment`, `management_change`,
+  `auditor_change` and `financial_results`. Each row carries the accession,
+  the acceptance time (`acceptance_datetime`, UTC) and, per type, the
+  sentence it was classified from (`snippets`). Every 6-K examined is
+  returned; one that matches nothing has `event_types: ["other"]` and its
+  `lead` sentence. A type backed only by an "As previously disclosed" recap
+  is listed in `background_types`. When a 6-K's own text says nothing, its
+  first EX-99 exhibit is read instead (`--no-exhibits` turns that off).
+- **`insiders`** reads Form 5 and Form 3 as well as Form 4. Form 3 initial
+  statements come back in `initial_statements` with their holdings (or
+  `no_securities_owned`). With no transactions, `hint` and `forms_found` say
+  what was found instead.
+- **`dilution`** gathers what bears on share supply from the filer's 6-K /
+  8-K reports and 424B prospectus supplements: the latest stated shares
+  outstanding, shelf registrations (amendments, EFFECT notice, supplements
+  filed under each file number, stated capacity), offerings, equity lines
+  and at-the-market programs with their pricing terms, warrants (count,
+  exercise price, price floor, multiple-share exchange features), reverse
+  splits and going-concern language. Each statement is a sentence of a named
+  filing with its accession and date, and each figure carries the text it
+  was parsed from. Text heuristics: a section can be incomplete, but nothing
+  in it is inferred, and share counts are never adjusted across a split.
+  `--since`, `--max-filings` and `--max-supplements` bound what is read.
 
 ### Concepts
 
@@ -177,6 +267,16 @@ edgar brief AAPL                                    # profile + metrics + events
 `metrics --bundle` accepts named groups: `income-statement`,
 `balance-sheet`, `cash-flow`, `liquidity`, `capital-structure`, `quality`.
 
+Each metric is the fact covering the freshest period across the alias's
+candidate tags (latest period end first; a newer half-year or year-to-date
+fact is not passed over for an older annual one). `stale` is true when the
+filer's latest periodic report (10-K, 10-Q, 20-F, 40-F, or a 6-K with XBRL
+financial statements) covers a later period than the fact, or when the fact's
+period ended more than 548 days before `reference_date`; `stale_reason` says
+which. When the filing list has a newer XBRL report than any fact SEC's API
+serves, `metrics`, `concept` and `facts` add a `warnings` entry naming it.
+The full rule is in [docs/definitions.md](docs/definitions.md).
+
 `ttm` falls back to stub-period reconstruction (`AnnualFY + CurrentYTD −
 PriorYTD`) for filers that only tag Q4 inside the annual 10-K (Apple,
 Microsoft, NVIDIA). Each TTM envelope tags the formula it used.
@@ -206,7 +306,7 @@ edgar search "supply chain constraints" --form 10-K   # live EFTS full-text
 edgar mirror NVDA --to ./edgar.sqlite --with-bodies-for 10-K --bodies-limit 5
 edgar search "supply chain" --db ./edgar.sqlite       # local FTS5 over bodies
 edgar item NVDA --form 10-K --section "Risk Factors"  # one Item's body text
-edgar insiders NVDA --since 2026-01-01                # Form 4 aggregation
+edgar insiders NVDA --since 2026-01-01                # Form 4/5 aggregation, Form 3 statements
 edgar holdings BRK-A --top 10                         # 13F portfolio
 edgar governance AAPL                                 # DEF 14A extraction
 ```
@@ -298,7 +398,14 @@ python -m edgar --help
   to fetch historical chunks from `filings.files[]`.
 - `concept` suggests similar issuer-specific tags when SEC returns 404.
 - `concept --deltas` skips adjacent rows with mismatched period lengths.
-- Exhibit downloads use the same User-Agent and shared rate limiter.
+- Exhibit downloads use the same User-Agent and shared rate limiter; so do
+  the documents read by `text`, `events` and `dilution`.
+- Runs on Linux, macOS, WSL and Windows. The cache lock is `flock` on POSIX
+  and a byte-range lock on Windows.
+- `acceptance_datetime` is UTC (SEC's filing index pages show US Eastern).
+- `events` classifies 8-Ks from item numbers and keywords, and 6-Ks from
+  their text; `dilution` reads text too. Both quote the sentence behind
+  every statement so a claim can be checked against the filing.
 - Shipped-feature history and open ideas live in
   [docs/BACKLOG.md](docs/BACKLOG.md); live test-drive findings and their
   fixes in [docs/FINDINGS.md](docs/FINDINGS.md).

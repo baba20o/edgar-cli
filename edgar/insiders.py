@@ -1,8 +1,10 @@
-"""Form 4 (insider transaction) parsing and aggregation.
+"""Form 3/4/5 (insider ownership) parsing and aggregation.
 
-Form 4 primary documents are XML with a stable schema. Each transaction
-carries a code (`P`/`S`/`A`/`M`/`G`/`D`/`F`/`C`/`I`/`J`/`X`), share count,
-price per share, and an indicator of whether the security is derivative.
+Ownership documents are XML with one stable schema. Each Form 4 or 5
+transaction carries a code (`P`/`S`/`A`/`M`/`G`/`D`/`F`/`C`/`I`/`J`/`X`),
+share count, price per share, and an indicator of whether the security is
+derivative. A Form 3 (initial statement) has no transactions: it lists
+holdings, or declares that no securities are owned.
 
 Aggregation groups by (filer CIK, reporting-owner CIK, transaction code) and
 sums shares + dollar value over a time window.
@@ -85,19 +87,67 @@ def parse_form4_xml(xml_bytes: bytes | str) -> dict:
         },
         "non_derivative_transactions": [],
         "derivative_transactions": [],
+        # Holdings rows: the whole content of a Form 3 (initial statement),
+        # and the no-transaction lines of a Form 4 or 5.
+        "no_securities_owned": _text(root, "noSecuritiesOwned") in ("1", "true"),
+        "non_derivative_holdings": [],
+        "derivative_holdings": [],
     }
 
     table = root.find("nonDerivativeTable")
     if table is not None:
         for tx in table.findall("nonDerivativeTransaction"):
             out["non_derivative_transactions"].append(_parse_transaction(tx, derivative=False))
+        for holding in table.findall("nonDerivativeHolding"):
+            out["non_derivative_holdings"].append(_parse_holding(holding, derivative=False))
 
     dtable = root.find("derivativeTable")
     if dtable is not None:
         for tx in dtable.findall("derivativeTransaction"):
             out["derivative_transactions"].append(_parse_transaction(tx, derivative=True))
+        for holding in dtable.findall("derivativeHolding"):
+            out["derivative_holdings"].append(_parse_holding(holding, derivative=True))
 
     return out
+
+
+# Forms 3, 4 and 5 share one XML schema (`ownershipDocument`).
+parse_ownership_xml = parse_form4_xml
+
+
+def _parse_holding(holding, derivative: bool = False) -> dict:
+    """One holdings line: what the owner held, without a transaction."""
+    def _v(path):
+        node = holding.find(path)
+        if node is None:
+            return None
+        value = node.find("value")
+        if value is not None and value.text is not None:
+            return value.text.strip()
+        return (node.text or "").strip() or None
+
+    def _f(text):
+        try:
+            return float(text) if text not in (None, "") else None
+        except (ValueError, TypeError):
+            return None
+
+    row = {
+        "security_title": _v("securityTitle"),
+        "shares": _f(_v("postTransactionAmounts/sharesOwnedFollowingTransaction")),
+        "ownership": _v("ownershipNature/directOrIndirectOwnership"),
+        "nature_of_ownership": _v("ownershipNature/natureOfOwnership"),
+        "is_derivative": derivative,
+    }
+    if derivative:
+        row.update({
+            "conversion_or_exercise_price": _f(_v("conversionOrExercisePrice")),
+            "exercise_date": _v("exerciseDate"),
+            "expiration_date": _v("expirationDate"),
+            "underlying_security_title": _v("underlyingSecurity/underlyingSecurityTitle"),
+            "underlying_shares": _f(_v("underlyingSecurity/underlyingSecurityShares")),
+        })
+    return row
 
 
 def _parse_transaction(tx, derivative: bool = False) -> dict:

@@ -34,6 +34,9 @@ from research_cli_base.http_client import retry_wait_seconds
 
 from edgar import __version__ as CLI_VERSION
 from edgar import compute
+from edgar import dilution as dilution_mod
+from edgar import filing_text
+from edgar import sixk
 from edgar import governance as governance_mod
 from edgar import holders as holders_mod
 from edgar import insiders as insiders_mod
@@ -53,7 +56,15 @@ COMPANY_TICKERS_URL = f"{SEC_BASE_URL}/files/company_tickers_exchange.json"
 # EFTS search dropped the never-populated `highlight` field and gained
 # file_type/file_description/period_ending + a disclosed default date window;
 # every command now answers `edgar schema` (coarse schemas marked as such).
-SCHEMA_VERSION = "1.1.0"
+# 1.2.0 (additive): `events` reads 6-K as well as 8-K (rows gain
+# acceptance_datetime, heading, lead, classified_from, evidence_document) and
+# explains an empty result (hint, forms_filed); `insiders` gains
+# initial_statements, forms_found, hint; `metrics` gains stale_reason,
+# latest_periodic_report and warnings; `concept`/`facts` gain warnings;
+# submissions gain latest_periodic_report and newest_xbrl_filing; new
+# commands `text` and `dilution`; `--compact` on company/filings/brief.
+# `events` and `insiders` now exit 2 when they have nothing to return.
+SCHEMA_VERSION = "1.2.0"
 
 DEFAULT_CACHE_TTL = 900
 DEFAULT_RATE_LIMIT_INTERVAL = 0.2
@@ -159,6 +170,9 @@ COMMON_CONCEPT_CANDIDATES = {
     "revenue": [
         ("us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax", "USD"),
         ("us-gaap", "Revenues", "USD"),
+        # Filers that present revenue gross of sales taxes (common among
+        # foreign private issuers) use the IncludingAssessedTax element.
+        ("us-gaap", "RevenueFromContractWithCustomerIncludingAssessedTax", "USD"),
         ("us-gaap", "SalesRevenueNet", "USD"),
         ("us-gaap", "SalesRevenueGoodsNet", "USD"),
         ("us-gaap", "SalesRevenueServicesNet", "USD"),
@@ -272,6 +286,33 @@ DEFAULT_METRIC_BUNDLE = [
     "shares",
 ]
 STALE_METRIC_DAYS = 548
+# A fact is superseded when a periodic report covers a period ending more than
+# this many days after the fact's own period end (absorbs 52/53-week drift).
+STALE_PERIOD_TOLERANCE_DAYS = 7
+
+# Reports that carry a full set of financial statements for a period.
+PERIODIC_REPORT_FORMS = {
+    "10-K", "10-K/A", "10-KT", "10-KT/A", "10-Q", "10-Q/A", "10-QT", "10-QT/A",
+    "20-F", "20-F/A", "40-F", "40-F/A",
+}
+# A 6-K is a periodic report only when it carries XBRL financial statements
+# (a foreign private issuer's half-year or quarterly accounts).
+INTERIM_REPORT_FORMS = {"6-K", "6-K/A"}
+
+# 6-K exhibit fallback in `events`: skip exhibits larger than this, and
+# classify only the opening of the exhibit (a release leads with its news).
+MAX_EVENT_EXHIBIT_BYTES = 1_500_000
+EVENT_EXHIBIT_LEAD_CHARS = 6000
+
+# `edgar dilution`: the forms it reads and the registrations it lists.
+CURRENT_REPORT_FORMS = {"6-K", "6-K/A", "8-K", "8-K/A"}
+SHELF_FORMS = {"F-3", "S-3", "F-3ASR", "S-3ASR"}
+REGISTRATION_FORMS = SHELF_FORMS | {"F-1", "S-1", "F-1MEF", "S-1MEF", "F-3MEF", "S-3MEF"}
+
+# `edgar text`: documents that can be turned into text, and the longest
+# sentence returned by --grep before it is clipped around the match.
+TEXT_DOCUMENT_SUFFIXES = (".htm", ".html", ".txt", ".xml", ".xsd")
+TEXT_MATCH_SENTENCE_CHARS = 1000
 
 EVENT_KEYWORDS = {
     "reverse_split": ["reverse stock split"],
@@ -742,7 +783,13 @@ class EdgarClient(BaseAPIClient):
                 cik, form, top.get("accessionNumber", ""), top.get("filingDate", ""),
             )
 
+        # Where the filer's reporting stands, whatever the filters above asked
+        # for: used to judge whether a fact is stale and whether SEC's XBRL
+        # API has caught up with the filing list.
+        all_recent = self._recent_filings(result, limit=100000)
         return {
+            "latest_periodic_report": latest_periodic_report(all_recent),
+            "newest_xbrl_filing": newest_xbrl_filing(all_recent),
             "cik": cik,
             "ticker": company.get("ticker", ""),
             "name": result.get("name") or company.get("name", ""),
@@ -774,12 +821,16 @@ class EdgarClient(BaseAPIClient):
             return result
 
         concepts = self._summarize_concepts(result.get("facts", {}), taxonomy, tag_filter)
-        return {
+        out = {
             "cik": normalize_cik(result.get("cik", company["cik"])),
             "name": result.get("entityName", company.get("name", "")),
             "concepts": concepts[:limit],
             "total": len(concepts),
         }
+        coverage = self.xbrl_coverage_warning(company["cik"], [], company_facts=result)
+        if coverage:
+            out["warnings"] = [coverage]
+        return out
 
     @staticmethod
     def _populate_restatement_state(facts: list[dict]) -> list[dict]:
@@ -1432,16 +1483,44 @@ class EdgarClient(BaseAPIClient):
 
     def events(self, identifier: str | int, limit: int = 20,
                since_last_fetch: bool = False,
-               state_store: Optional["StateStore"] = None) -> dict:
-        """Detect notable recent filing events from 8-K metadata and document text."""
-        result = self.submissions(
-            identifier, form="8-K", limit=limit,
-            since_last_fetch=since_last_fetch, state_store=state_store,
-        )
-        if "error" in result:
-            return result
+               state_store: Optional["StateStore"] = None,
+               read_exhibits: bool = True) -> dict:
+        """Detect notable recent events from current reports: 8-K and 6-K.
+
+        Domestic filers report events on Form 8-K, classified from the item
+        numbers plus keywords in the document. Foreign private issuers report
+        on Form 6-K, which has no item numbers, so each 6-K is classified from
+        its own text (`edgar.sixk`) and returned with the sentence each type
+        was classified from. Every 6-K examined is returned; one that matches
+        no rule has `event_types: ["other"]` and its lead sentence. When a
+        6-K's own text classifies nothing and `read_exhibits` is true, its
+        first EX-99 exhibit is read instead (two extra requests).
+
+        An empty result carries a `hint` naming the forms the filer does file.
+        """
+        filings: list[dict] = []
+        result: dict = {}
+        examined_forms = ("8-K", "6-K")
+        for form in examined_forms:
+            result = self.submissions(
+                identifier, form=form, limit=limit,
+                since_last_fetch=since_last_fetch, state_store=state_store,
+            )
+            if "error" in result:
+                return result
+            filings.extend(result.get("filings", []))
+        filings.sort(key=lambda f: (f.get("acceptanceDateTime") or f.get("filingDate", ""),
+                                    f.get("accessionNumber", "")), reverse=True)
+        filings = filings[:limit]
+
         events = []
-        for filing in result.get("filings", []):
+        examined: dict[str, int] = {}
+        for filing in filings:
+            form = filing.get("form", "")
+            examined[form] = examined.get(form, 0) + 1
+            if form.upper().startswith("6-K"):
+                events.append(self._classify_6k_filing(result["cik"], filing, read_exhibits))
+                continue
             event_types = event_types_from_items(filing.get("items", ""))
             snippets = {}
             try:
@@ -1456,14 +1535,115 @@ class EdgarClient(BaseAPIClient):
             if event_types:
                 events.append(alias_filing_row({
                     "filingDate": filing.get("filingDate", ""),
-                    "form": filing.get("form", ""),
+                    "acceptanceDateTime": filing.get("acceptanceDateTime", ""),
+                    "form": form,
                     "items": filing.get("items", ""),
                     "accessionNumber": filing.get("accessionNumber", ""),
                     "filing_url": filing.get("filing_url", ""),
                     "event_types": sorted(event_types),
                     "snippets": snippets,
                 }))
-        return {"cik": result["cik"], "name": result["name"], "events": events, "total": len(events)}
+        out = {
+            "cik": result["cik"], "name": result["name"],
+            "events": events, "total": len(events),
+            "forms_examined": examined,
+            "filings_examined": len(filings),
+        }
+        if not events:
+            out["hint"] = self._empty_events_hint(result["cik"], identifier, examined,
+                                                  since_last_fetch)
+            out["forms_filed"] = self._form_counts(result["cik"])
+        return out
+
+    def _classify_6k_filing(self, cik: str, filing: dict, read_exhibits: bool = True) -> dict:
+        """Classify one 6-K from its text; fall back to its first EX-99 exhibit."""
+        row = {
+            "filingDate": filing.get("filingDate", ""),
+            "acceptanceDateTime": filing.get("acceptanceDateTime", ""),
+            "form": filing.get("form", ""),
+            "items": filing.get("items", ""),
+            "accessionNumber": filing.get("accessionNumber", ""),
+            "filing_url": filing.get("filing_url", ""),
+            "primary_doc_url": filing.get("primary_doc_url", ""),
+        }
+        document = filing.get("primaryDocument", "")
+        document_type = filing.get("form", "")
+        try:
+            text = filing_text.document_to_text(self._get_text(filing.get("primary_doc_url", "")))
+            parsed = sixk.classify_6k(text)
+        except Exception as exc:
+            parsed = sixk.classify_6k("")
+            row["fetch_error"] = str(exc)
+
+        if read_exhibits and "fetch_error" not in row and parsed["classified_from"] != "body":
+            docs = self.filing_documents(cik, filing.get("accessionNumber", ""))
+            for doc in docs.get("documents", []):
+                name = doc.get("document", "")
+                if not doc.get("type", "").upper().startswith("EX-99"):
+                    continue
+                if not name.lower().endswith((".htm", ".html", ".txt")):
+                    continue
+                if _number_or_zero(doc.get("size")) > MAX_EVENT_EXHIBIT_BYTES:
+                    continue
+                try:
+                    exhibit_text = filing_text.document_to_text(self._get_text(doc["url"]))
+                except Exception:
+                    break
+                # A release leads with its news: classify the opening only, so
+                # boilerplate deep in a long exhibit cannot set the type.
+                from_exhibit = sixk.classify_6k(exhibit_text[:EVENT_EXHIBIT_LEAD_CHARS])
+                if from_exhibit["event_types"]:
+                    from_exhibit["exhibit_index"] = parsed["exhibit_index"]
+                    from_exhibit["classified_from"] = "exhibit"
+                    parsed = from_exhibit
+                    document, document_type = name, doc.get("type", "")
+                break
+
+        row.update({
+            "event_types": parsed["event_types"] or ["other"],
+            "snippets": parsed["snippets"],
+            "heading": parsed["heading"],
+            "lead": parsed["lead"],
+            "classified_from": parsed["classified_from"],
+            "evidence_document": document,
+            "evidence_document_type": document_type,
+        })
+        if parsed["background_types"]:
+            row["background_types"] = parsed["background_types"]
+        return alias_filing_row(row)
+
+    def _form_counts(self, cik: str, since: Optional[str] = None,
+                     forms: Optional[set[str]] = None) -> dict[str, int]:
+        """Count the forms in a filer's recent filing set (cached submissions)."""
+        raw = self._get(f"/submissions/CIK{cik}.json")
+        if "error" in raw:
+            return {}
+        recent = raw.get("filings", {}).get("recent", {})
+        counts: dict[str, int] = {}
+        for form, filed in zip(recent.get("form", []), recent.get("filingDate", [])):
+            if since and filed < since:
+                continue
+            if forms and form.upper() not in forms:
+                continue
+            counts[form] = counts.get(form, 0) + 1
+        return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+
+    def _empty_events_hint(self, cik: str, identifier: str | int, examined: dict[str, int],
+                           since_last_fetch: bool) -> str:
+        if since_last_fetch:
+            return "No new 8-K or 6-K filings since the last fetch."
+        if examined:
+            seen = ", ".join(f"{count} {form}" for form, count in examined.items())
+            return (f"Examined {seen}; none carried a recognized event. "
+                    f"List them with `edgar filings {identifier} --form 8-K`.")
+        counts = self._form_counts(cik)
+        if not counts:
+            return "This filer has no filings in SEC's recent filing set."
+        top = ", ".join(f"{form} ({count})" for form, count in list(counts.items())[:8])
+        return ("`events` reads current reports (8-K, and 6-K for foreign private issuers) "
+                f"and this filer has none in its recent filing set. It files: {top}. "
+                f"Use `edgar filings {identifier} --form FORM` to list one form and "
+                "`edgar text` to read a filing.")
 
     def dashboard(self, identifier: str | int) -> dict:
         """One-call composite: profile + key metrics + recent events + earnings + quality.
@@ -1694,6 +1874,375 @@ class EdgarClient(BaseAPIClient):
                        "identity or structure is weak, including flattened text."),
         }
 
+    def filing_text(self, identifier: Optional[str | int] = None,
+                    accession_or_url: Optional[str] = None,
+                    cik: Optional[str] = None, form: Optional[str] = None,
+                    as_of: Optional[str] = None,
+                    exhibits: Optional[list[str]] = None,
+                    exhibits_only: bool = False,
+                    max_chars: int = 50000, offset: int = 0,
+                    pattern: Optional[str] = None, context: int = 0,
+                    limit: int = 50) -> dict:
+        """Return the text of any filing: main document and, on request, exhibits.
+
+        The filing is named by accession number or SEC URL, or picked as the
+        latest filing (optionally of one `form`, on or before `as_of`) of
+        `identifier`. `exhibits` is a list of exhibit type prefixes
+        (`EX-99`, `EX-10.1`, or `all`); `exhibits_only` drops the main
+        document.
+
+        Each document comes back as clean text capped at `max_chars`
+        (`offset` pages through a long one; `next_offset` says where to
+        resume). With `pattern` (a case-insensitive regular expression) only
+        the matching sentences are returned, each with `context` neighbours.
+        """
+        try:
+            regex = filing_text.compile_pattern(pattern) if pattern else None
+        except ValueError as exc:
+            return {"error": str(exc), "documents": []}
+
+        target = self._resolve_filing(identifier, accession_or_url, cik, form, as_of)
+        if "error" in target:
+            return target
+        resolved_cik = target["cik"]
+        accession = target["accession"]
+        wanted = [e.strip().upper() for e in (exhibits or []) if e and e.strip()]
+
+        selected: list[dict] = []
+        if wanted or not target.get("primary_doc_url"):
+            index = self.filing_documents(resolved_cik, accession)
+            if "error" in index:
+                return index
+            rows = [row for row in index.get("documents", []) if row.get("sequence")]
+            main = rows[0] if rows else None
+            if main and not target.get("form"):
+                target["form"] = main.get("type", "")
+            if main and not exhibits_only:
+                selected.append({**main, "role": "main"})
+            for row in rows[1:]:
+                doc_type = row.get("type", "").upper()
+                if not doc_type.startswith("EX-") or doc_type.startswith("EX-101"):
+                    continue
+                if "ALL" in wanted or any(doc_type.startswith(prefix) for prefix in wanted):
+                    selected.append({**row, "role": "exhibit"})
+        elif not exhibits_only:
+            selected.append({
+                "document": target.get("primary_document", ""),
+                "type": target.get("form", ""),
+                "description": target.get("primary_doc_description", ""),
+                "url": target["primary_doc_url"],
+                "role": "main",
+            })
+
+        documents = []
+        for row in selected:
+            name = row.get("document", "")
+            entry = {
+                "document": name, "type": row.get("type", ""), "role": row["role"],
+                "description": row.get("description", ""), "url": row.get("url", ""),
+            }
+            if not name.lower().endswith(TEXT_DOCUMENT_SUFFIXES):
+                entry["skipped"] = "not a text document"
+                documents.append(entry)
+                continue
+            try:
+                text = filing_text.document_to_text(self._get_text(row["url"]))
+            except Exception as exc:
+                entry["error"] = f"Could not fetch document: {exc}"
+                documents.append(entry)
+                continue
+            entry["length"] = len(text)
+            if regex is not None:
+                sentences = filing_text.split_sentences(text)
+                matches = filing_text.match_sentences(
+                    sentences, regex, context=context,
+                    max_sentence_chars=TEXT_MATCH_SENTENCE_CHARS, limit=limit + 1,
+                )
+                entry["sentences"] = len(sentences)
+                entry["matches_truncated"] = len(matches) > limit
+                entry["matches"] = matches[:limit]
+            else:
+                start = min(max(offset, 0), len(text))
+                chunk = text[start:start + max_chars]
+                entry["offset"] = start
+                entry["text"] = chunk
+                entry["truncated"] = start + len(chunk) < len(text)
+                entry["next_offset"] = start + len(chunk) if entry["truncated"] else None
+            documents.append(entry)
+
+        out = {
+            "cik": resolved_cik,
+            "name": target.get("name", ""),
+            "filing": {
+                "accession": accession,
+                "form": target.get("form", ""),
+                "filed": target.get("filed", ""),
+                "acceptance_datetime": target.get("acceptance_datetime", ""),
+                "report_date": target.get("report_date", ""),
+                "filing_url": target.get("filing_url", ""),
+            },
+            "pattern": pattern,
+            "documents": documents,
+            "total": len(documents),
+        }
+        if not documents:
+            out["hint"] = ("No document matched. List this filing's documents with "
+                           f"`edgar exhibits {accession} --cik {int(resolved_cik)}`.")
+        return out
+
+    def dilution(self, identifier: str | int, since: Optional[str] = None,
+                 max_filings: int = 25, max_supplements: int = 3) -> dict:
+        """Gather what bears on one filer's share supply, each figure sourced.
+
+        Reads the filer's current reports (6-K / 8-K) and prospectus
+        supplements (424B*) filed on or after `since` (default: one year
+        before its latest filing) and returns, by section: stated shares
+        outstanding, shelf registrations with effectiveness and takedowns,
+        prospectus supplements, offerings, equity lines and at-the-market
+        programs, warrants, reverse splits and going-concern language.
+
+        Every statement is a sentence of a filing with its accession, form and
+        filing date, and every figure carries the text it was parsed from
+        (`edgar.dilution`). Text heuristics: a section can be incomplete, but
+        nothing in it is inferred.
+        """
+        company = self.resolve_company(identifier)
+        if "error" in company:
+            return company
+        cik = company["cik"]
+        raw = self._get(f"/submissions/CIK{cik}.json")
+        if "error" in raw:
+            return raw
+        rows = self._recent_filings(raw, limit=100000)
+        latest_filed = max((row.get("filingDate", "") for row in rows), default="")
+        if not since:
+            latest = parse_date(latest_filed)
+            since = (latest - timedelta(days=365)).isoformat() if latest else ""
+
+        def _newest_first(items: list[dict]) -> list[dict]:
+            return sorted(items, key=lambda r: (r.get("acceptanceDateTime") or r.get("filingDate", ""),
+                                                r.get("accessionNumber", "")), reverse=True)
+
+        in_window = [row for row in rows if row.get("filingDate", "") >= since]
+        supplements = _newest_first([r for r in in_window
+                                     if r.get("form", "").upper().startswith("424B")])
+        current = _newest_first([r for r in in_window
+                                 if r.get("form", "").upper() in CURRENT_REPORT_FORMS])
+        to_read = _newest_first(supplements[:max_supplements] + current[:max_filings])
+
+        statements: list[dict] = []
+        filings_read: list[dict] = []
+        for row in to_read:
+            form = row.get("form", "")
+            prospectus = form.upper().startswith("424B")
+            entry = {"accession": row.get("accessionNumber", ""), "form": form,
+                     "filed": row.get("filingDate", ""),
+                     "document": row.get("primaryDocument", "")}
+            try:
+                text = filing_text.document_to_text(self._get_text(row.get("primary_doc_url", "")))
+            except Exception as exc:
+                entry["error"] = f"Could not fetch document: {exc}"
+                filings_read.append(entry)
+                continue
+            if form.upper().startswith("6-K"):
+                sentences = [s for block in sixk.split_6k(text)["body"]
+                             for s in filing_text._split_paragraph(block)]
+            else:
+                sentences = filing_text.split_sentences(text)
+            found = dilution_mod.extract_statements(sentences, prospectus=prospectus)
+            for statement in found:
+                statement.update({
+                    "accession": entry["accession"], "form": form, "filed": entry["filed"],
+                    "acceptance_datetime": row.get("acceptanceDateTime", ""),
+                    "file_number": row.get("fileNumber", ""),
+                    "document": entry["document"],
+                    "source_url": row.get("primary_doc_url", ""),
+                })
+            entry["statements"] = len(found)
+            filings_read.append(entry)
+            statements.extend(found)
+
+        def _topic(*topics: str) -> list[dict]:
+            return [s for s in statements if s["topic"] in topics]
+
+        shares = sorted(_topic("shares_outstanding"),
+                        key=lambda s: (s.get("as_of") or s["filed"], s["acceptance_datetime"]),
+                        reverse=True)
+        latest_shares = next((s for s in shares if s.get("basis") != "after_offering"), None)
+        offerings = _topic("offering")
+        program_kinds = {"equity_line", "atm"}
+        read_accessions = {entry["accession"] for entry in filings_read if "error" not in entry}
+
+        out = {
+            "cik": cik, "ticker": company.get("ticker", ""),
+            "name": raw.get("name") or company.get("name", ""),
+            "since": since,
+            "latest_shares_outstanding": latest_shares,
+            "shares_outstanding": shares,
+            "xbrl_shares_outstanding": self._xbrl_shares_outstanding(cik, statements),
+            "shelf_registrations": self._shelf_registrations(rows, statements),
+            "prospectus_supplements": [
+                {
+                    "accession": row.get("accessionNumber", ""), "form": row.get("form", ""),
+                    "filed": row.get("filingDate", ""), "file_number": row.get("fileNumber", ""),
+                    "filing_url": row.get("filing_url", ""),
+                    "read": row.get("accessionNumber", "") in read_accessions,
+                    "offering": [s for s in offerings
+                                 if s["accession"] == row.get("accessionNumber", "")],
+                }
+                for row in supplements
+            ],
+            "offerings": [s for s in offerings
+                          if s.get("kind") not in program_kinds and not s["form"].upper().startswith("424B")],
+            "equity_lines_and_atm": ([s for s in offerings if s.get("kind") in program_kinds]
+                                     + _topic("equity_line_terms")),
+            "warrants": _topic("warrants"),
+            "reverse_splits": _topic("reverse_split"),
+            "going_concern": _topic("going_concern"),
+            "filings_read": filings_read,
+            "filings_not_read": {
+                "current_reports": max(0, len(current) - max_filings),
+                "prospectus_supplements": max(0, len(supplements) - max_supplements),
+            },
+            "method": ("Text heuristics over the filer's current reports and prospectus "
+                       "supplements. Each statement is a sentence of the named filing; each "
+                       "figure carries the text it was parsed from. Share counts are as "
+                       "stated on their date and are not adjusted for later splits. A "
+                       "section can be incomplete; nothing in it is inferred."),
+        }
+        if not statements and not out["shelf_registrations"]:
+            counts = self._form_counts(cik, since=since)
+            top = ", ".join(f"{f} ({c})" for f, c in list(counts.items())[:8])
+            out["hint"] = (f"No current reports (6-K, 8-K) or prospectus supplements (424B) on or "
+                           f"after {since}, and no registration statements in the recent filing set."
+                           + (f" Since then this filer filed: {top}." if top else ""))
+        return out
+
+    def _xbrl_shares_outstanding(self, cik: str, statements: list[dict]) -> Optional[dict]:
+        """The cover-page share count SEC's XBRL API serves, as a cross-check."""
+        result = self.company_concept(cik, "dei", "EntityCommonStockSharesOutstanding",
+                                      unit="shares", limit=24, suggest_on_404=False)
+        fact = freshest_fact(result.get("facts", [])) if "error" not in result else None
+        if not fact:
+            return None
+        out = {
+            "value": fact.get("val"), "as_of": fact.get("end", ""),
+            "accession": fact.get("accession") or fact.get("accn", ""),
+            "form": fact.get("form", ""), "filed": fact.get("filed", ""),
+            "source": "XBRL dei:EntityCommonStockSharesOutstanding",
+        }
+        later = sorted(
+            s.get("effective_date") or s["filed"] for s in statements
+            if s["topic"] == "reverse_split" and s.get("status") == "effective"
+            and (s.get("effective_date") or s["filed"]) > out["as_of"]
+        )
+        if later:
+            out["note"] = (f"A reverse split took effect on {later[-1]}, after this count's date: "
+                           "it is on the pre-split basis.")
+        return out
+
+    @staticmethod
+    def _shelf_registrations(rows: list[dict], statements: list[dict]) -> list[dict]:
+        """Registration statements grouped by SEC file number, with the EFFECT
+        notice and the prospectus supplements filed under each."""
+        shelves: dict[str, dict] = {}
+        for row in sorted(rows, key=lambda r: r.get("filingDate", "")):
+            form = row.get("form", "").upper()
+            number = row.get("fileNumber", "")
+            base = form.split("/")[0]
+            if not number or base not in REGISTRATION_FORMS:
+                continue
+            ref = {"form": row.get("form", ""), "accession": row.get("accessionNumber", ""),
+                   "filed": row.get("filingDate", "")}
+            shelf = shelves.setdefault(number, {
+                "file_number": number, "form": base, "shelf": base in SHELF_FORMS,
+                "filed": ref["filed"], "accession": ref["accession"],
+                "amendments": [], "effective": None, "supplements": [], "capacity": [],
+            })
+            if ref["accession"] != shelf["accession"]:
+                shelf["amendments"].append(ref)
+        for row in sorted(rows, key=lambda r: r.get("filingDate", "")):
+            form = row.get("form", "").upper()
+            shelf = shelves.get(row.get("fileNumber", ""))
+            if not shelf:
+                continue
+            ref = {"form": row.get("form", ""), "accession": row.get("accessionNumber", ""),
+                   "filed": row.get("filingDate", "")}
+            if form == "EFFECT":
+                shelf["effective"] = {"date": ref["filed"], "accession": ref["accession"]}
+            elif form.startswith("424B"):
+                shelf["supplements"].append(ref)
+        for statement in statements:
+            shelf = shelves.get(statement.get("file_number", ""))
+            if shelf and statement["topic"] == "shelf_capacity":
+                shelf["capacity"].append(statement)
+        return sorted(shelves.values(), key=lambda s: s["filed"], reverse=True)
+
+    def _resolve_filing(self, identifier: Optional[str | int], accession_or_url: Optional[str],
+                        cik: Optional[str], form: Optional[str], as_of: Optional[str]) -> dict:
+        """Find one filing: by accession/URL, or the latest matching one of a filer."""
+        accession = extract_accession(accession_or_url or "")
+        if accession_or_url and not accession:
+            return {"error": f"Could not find accession number in {accession_or_url}", "documents": []}
+
+        resolved_cik = ""
+        name = ""
+        try:
+            if cik:
+                resolved_cik = normalize_cik(cik)
+            elif accession_or_url:
+                resolved_cik = extract_cik_from_url(accession_or_url)
+        except ValueError as exc:
+            return {"error": str(exc), "documents": []}
+        if not resolved_cik and identifier is not None:
+            company = self.resolve_company(identifier)
+            if "error" in company:
+                return company
+            resolved_cik, name = company["cik"], company.get("name", "")
+        if not resolved_cik:
+            return {"error": "A ticker, CIK or SEC URL is required to locate the filing "
+                             "(the accession number alone does not name the filer)",
+                    "documents": []}
+
+        raw = self._get(f"/submissions/CIK{resolved_cik}.json")
+        rows: list[dict] = []
+        if "error" not in raw:
+            name = raw.get("name") or name
+            rows = self._recent_filings(raw, limit=100000, form=None if accession else form,
+                                        end_date=None if accession else as_of)
+        elif not accession:
+            return raw
+
+        if accession:
+            match = next((row for row in rows if row.get("accessionNumber") == accession), None)
+            if match is None:
+                # Older than SEC's recent filing set (or the list is unavailable):
+                # the filing index still resolves from CIK + accession.
+                return {"cik": resolved_cik, "name": name, "accession": accession,
+                        **filing_urls(resolved_cik, accession)}
+        else:
+            if not rows:
+                label = f" {form}" if form else ""
+                when = f" on or before {as_of}" if as_of else ""
+                counts = self._form_counts(resolved_cik)
+                top = ", ".join(f"{f} ({c})" for f, c in list(counts.items())[:8])
+                return {"error": f"No matching{label} filing found{when} in the recent filing set."
+                                 + (f" This filer files: {top}." if top else ""),
+                        "documents": []}
+            match = rows[0]
+        return {
+            "cik": resolved_cik, "name": name,
+            "accession": match.get("accessionNumber", ""),
+            "form": match.get("form", ""),
+            "filed": match.get("filingDate", ""),
+            "acceptance_datetime": match.get("acceptanceDateTime", ""),
+            "report_date": match.get("reportDate", ""),
+            "primary_document": match.get("primaryDocument", ""),
+            "primary_doc_description": match.get("primaryDocDescription", ""),
+            "primary_doc_url": match.get("primary_doc_url", ""),
+            "filing_url": match.get("filing_url", ""),
+        }
+
     def _fetch_13f_holdings(self, cik: str, accession: str) -> list[dict]:
         """Fetch and parse the infoTable XML for one 13F-HR accession.
 
@@ -1888,67 +2437,119 @@ class EdgarClient(BaseAPIClient):
 
     def insiders(self, identifier: str | int, since: Optional[str] = None,
                  limit: int = 50, max_form4_fetches: int = 50) -> dict:
-        """Aggregate Form 4 transactions for a filer.
+        """Aggregate insider ownership filings (Forms 4, 5 and 3) for a filer.
 
-        Walks recent Form 4 filings, fetches the primary XML for each, and
-        aggregates by reporting owner + transaction code. `since` filters to
-        filings on or after that date; `limit` caps how many Form 4s are
-        fetched (default 50, hard ceiling 200).
+        Walks recent Form 4 and Form 5 filings, fetches the primary XML for
+        each, and aggregates transactions by reporting owner + transaction
+        code. Form 3 filings (initial statements, no transactions) are
+        returned as `initial_statements` with the holdings they declare.
+        `since` filters to filings on or after that date; `max_form4_fetches`
+        caps how many ownership documents are fetched in total (default 50,
+        hard ceiling 200).
+
+        When there are no transactions the result says why in `hint`, and
+        `forms_found` counts the insider forms in the window.
         """
         company = self.resolve_company(identifier)
         if "error" in company:
             return company
         cik = company["cik"]
-        max_form4_fetches = min(max_form4_fetches, 200)
-        result = self.submissions(identifier, form="4", limit=max_form4_fetches,
-                                  start_date=since)
-        if "error" in result:
-            return result
+        budget = min(max_form4_fetches, 200)
 
         transactions: list[dict] = []
+        initial_statements: list[dict] = []
         fetched = 0
         failed = 0
-        for filing in result.get("filings", []):
-            url = filing.get("primary_doc_url") or ""
-            if not url:
-                continue
-            # SEC's `primaryDocument` for Form 4 points at the styled XML
-            # (e.g. `xslF345X06/wk-form4_*.xml`). The raw schema-conformant XML
-            # lives at the same filename without the stylesheet directory.
-            raw_url = re.sub(r"/xslF345X[0-9]+/", "/", url)
-            try:
-                xml = self._get_text(raw_url)
-            except Exception:
-                failed += 1
-                continue
-            parsed = insiders_mod.parse_form4_xml(xml)
-            if "error" in parsed:
-                failed += 1
-                continue
-            fetched += 1
-            owner = parsed.get("reporting_owner", {})
-            for tx in (parsed.get("non_derivative_transactions", [])
-                       + parsed.get("derivative_transactions", [])):
-                tx2 = dict(tx)
-                tx2["owner_name"] = owner.get("name", "")
-                tx2["owner_cik"] = owner.get("cik", "")
-                tx2["officer_title"] = owner.get("officer_title", "")
-                tx2["is_director"] = owner.get("is_director", False)
-                tx2["is_officer"] = owner.get("is_officer", False)
-                tx2["filed"] = filing.get("filingDate", "")
-                tx2["accession"] = filing.get("accessionNumber", "")
-                transactions.append(tx2)
+        for form in ("4", "5", "3"):
+            if budget <= 0:
+                break
+            result = self.submissions(identifier, form=form, limit=budget,
+                                      start_date=since)
+            if "error" in result:
+                return result
+            for filing in result.get("filings", []):
+                url = filing.get("primary_doc_url") or ""
+                if not url:
+                    continue
+                budget -= 1
+                # SEC's `primaryDocument` for ownership forms points at the
+                # styled XML (e.g. `xslF345X06/wk-form4_*.xml`). The raw
+                # schema-conformant XML lives at the same filename without
+                # the stylesheet directory.
+                raw_url = re.sub(r"/xslF345X[0-9]+/", "/", url)
+                try:
+                    xml = self._get_text(raw_url)
+                except Exception:
+                    failed += 1
+                    continue
+                parsed = insiders_mod.parse_ownership_xml(xml)
+                if "error" in parsed:
+                    failed += 1
+                    continue
+                fetched += 1
+                owner = parsed.get("reporting_owner", {})
+                identity = {
+                    "owner_name": owner.get("name", ""),
+                    "owner_cik": owner.get("cik", ""),
+                    "officer_title": owner.get("officer_title", ""),
+                    "is_director": owner.get("is_director", False),
+                    "is_officer": owner.get("is_officer", False),
+                    "filed": filing.get("filingDate", ""),
+                    "accession": filing.get("accessionNumber", ""),
+                }
+                if form == "3":
+                    initial_statements.append({
+                        **identity,
+                        "form": filing.get("form", "3"),
+                        "is_ten_percent_owner": owner.get("is_ten_percent_owner", False),
+                        "period_of_report": parsed.get("periodOfReport", ""),
+                        "no_securities_owned": parsed.get("no_securities_owned", False),
+                        "holdings": (parsed.get("non_derivative_holdings", [])
+                                     + parsed.get("derivative_holdings", [])),
+                    })
+                    continue
+                for tx in (parsed.get("non_derivative_transactions", [])
+                           + parsed.get("derivative_transactions", [])):
+                    transactions.append({**tx, **identity, "form": filing.get("form", form)})
 
+        transactions.sort(key=lambda tx: (tx.get("filed", ""), tx.get("transaction_date") or ""),
+                          reverse=True)
         agg = insiders_mod.aggregate(transactions)
-        return {
+        forms_found = self._form_counts(cik, since=since, forms=FORM_CLASSES["insider"])
+        out = {
             "cik": cik, "ticker": company.get("ticker", ""),
             "name": company.get("name", ""),
             "since": since,
             "form4s_fetched": fetched, "form4s_failed": failed,
+            "forms_found": forms_found,
             "transactions": transactions[:limit],
             "transactions_total": len(transactions),
+            "initial_statements": initial_statements,
             **agg,
         }
+        if not transactions:
+            out["hint"] = self._empty_insiders_hint(cik, identifier, since, forms_found,
+                                                    initial_statements)
+        return out
+
+    def _empty_insiders_hint(self, cik: str, identifier: str | int, since: Optional[str],
+                             forms_found: dict[str, int],
+                             initial_statements: list[dict]) -> str:
+        window = f" on or after {since}" if since else " in the recent filing set"
+        if initial_statements:
+            empty = sum(1 for row in initial_statements if row.get("no_securities_owned"))
+            note = f" ({empty} declare no securities owned)" if empty else ""
+            return (f"No Form 4 or Form 5 transactions{window}. "
+                    f"{len(initial_statements)} Form 3 initial ownership statement(s){note} "
+                    "are listed in `initial_statements`.")
+        if forms_found:
+            found = ", ".join(f"{form} ({count})" for form, count in forms_found.items())
+            return (f"No Form 3, 4 or 5 could be read{window}; insider forms found: {found}. "
+                    f"List them with `edgar filings {identifier} --insider`.")
+        counts = self._form_counts(cik)
+        top = ", ".join(f"{form} ({count})" for form, count in list(counts.items())[:8])
+        return (f"No insider ownership forms (3, 4, 5, 144){window}. "
+                + (f"This filer files: {top}." if top else "This filer has no recent filings."))
 
     def quality(self, identifier: str | int, period_type: str = "annual",
                 as_of: Optional[str] = None) -> dict:
@@ -3311,6 +3912,7 @@ class EdgarClient(BaseAPIClient):
             return profile
 
         reference_date = latest_filing_date(profile)
+        latest_report = profile.get("latest_periodic_report")
         metrics = []
         for label in bundle or DEFAULT_METRIC_BUNDLE:
             if concept_alias_key(label) not in COMMON_CONCEPT_CANDIDATES:
@@ -3320,18 +3922,88 @@ class EdgarClient(BaseAPIClient):
                     "known_aliases": sorted(COMMON_CONCEPT_CANDIDATES),
                 })
                 continue
-            metric = self._best_metric(label, profile["cik"], reference_date)
+            metric = self._best_metric(label, profile["cik"], reference_date, latest_report)
             if metric:
                 metrics.append(metric)
             else:
                 metrics.append({"metric": label, "error": "No facts found"})
 
-        return {
+        out = {
             "cik": profile.get("cik", ""),
             "ticker": profile.get("ticker", ""),
             "name": profile.get("name", ""),
             "reference_date": reference_date,
+            "latest_periodic_report": latest_report,
             "metrics": metrics,
+        }
+        facts = [m["fact"] for m in metrics if isinstance(m.get("fact"), dict)]
+        coverage = self.xbrl_coverage_warning(
+            profile.get("cik", ""), facts, profile.get("newest_xbrl_filing"),
+            lookup_filings=False,
+        )
+        if coverage:
+            out["warnings"] = [coverage]
+        return out
+
+    def xbrl_coverage_warning(self, cik: str, facts: list[dict],
+                              newest_filing: Optional[dict] = None,
+                              company_facts: Optional[dict] = None,
+                              lookup_filings: bool = True) -> Optional[dict]:
+        """Warn when the filing list has a newer XBRL report than SEC's facts.
+
+        SEC's XBRL APIs (companyfacts, companyconcept, frames) can lag or omit
+        a filing that carries XBRL financial statements. When the newest such
+        report in the filing list is newer than every fact in hand, the
+        filer's companyfacts payload is checked for its accession number; if
+        it is absent there too, the figures this CLI returns predate that
+        report and the caller is told so.
+
+        `facts` are the facts already fetched (the cheap first check);
+        `newest_filing` comes from `submissions()["newest_xbrl_filing"]` and is
+        looked up when not given (unless `lookup_filings` is false);
+        `company_facts` is the raw companyfacts payload when the caller
+        already has it.
+        """
+        if not cik:
+            return None
+        if newest_filing is None and lookup_filings:
+            raw = self._get(f"/submissions/CIK{cik}.json")
+            if not isinstance(raw, dict) or "error" in raw or "filings" not in raw:
+                return None
+            newest_filing = newest_xbrl_filing(self._recent_filings(raw, limit=100000))
+        if not newest_filing or not newest_filing.get("accession"):
+            return None
+
+        accession = newest_filing["accession"]
+        in_hand = {f.get("accn") or f.get("accession") for f in facts}
+        newest_in_hand = max((f.get("filed", "") for f in facts), default="")
+        if accession in in_hand or newest_filing.get("filed", "") <= newest_in_hand:
+            return None
+
+        if company_facts is None:
+            company_facts = self._get(f"/api/xbrl/companyfacts/CIK{cik}.json")
+        if not isinstance(company_facts, dict) or "error" in company_facts:
+            return None
+        newest_fact_filed = ""
+        for tags in company_facts.get("facts", {}).values():
+            for concept in tags.values():
+                for rows in concept.get("units", {}).values():
+                    for row in rows:
+                        if row.get("accn") == accession:
+                            return None
+                        newest_fact_filed = max(newest_fact_filed, row.get("filed", ""))
+        return {
+            "code": "xbrl_filing_missing_from_sec_api",
+            "message": (
+                f"SEC's XBRL API has no facts from {newest_filing.get('form', '')} {accession} "
+                f"(filed {newest_filing.get('filed', '')}, period ending "
+                f"{newest_filing.get('report_date', '')}), although the filing list marks it as "
+                f"carrying XBRL financial data. The newest fact SEC serves for this filer was filed "
+                f"{newest_fact_filed or 'never'}, so figures here predate that report. Read it "
+                f"directly: `edgar text {accession} --cik {int(cik)} --exhibit EX-99`."
+            ),
+            "filing": newest_filing,
+            "newest_fact_filed": newest_fact_filed,
         }
 
     def brief(self, identifier: str | int) -> dict:
@@ -3343,7 +4015,8 @@ class EdgarClient(BaseAPIClient):
         reference_date = latest_filing_date(profile)
         metrics = []
         for label in BRIEF_METRICS:
-            metric = self._best_metric(label, profile["cik"], reference_date)
+            metric = self._best_metric(label, profile["cik"], reference_date,
+                                       profile.get("latest_periodic_report"))
             if not metric:
                 continue
             metrics.append(metric)
@@ -3401,13 +4074,20 @@ class EdgarClient(BaseAPIClient):
             "facts": [],
         }
 
-    def _best_metric(self, label: str, cik: str, reference_date: str) -> Optional[dict]:
+    def _best_metric(self, label: str, cik: str, reference_date: str,
+                     latest_report: Optional[dict] = None) -> Optional[dict]:
+        """Latest value of one metric: the freshest period across its alias tags.
+
+        `stale` follows `metric_staleness`: true when the filer's latest
+        periodic report (`latest_report`) covers a later period than this
+        fact, or when the fact is simply old; `stale_reason` says which.
+        """
         best = None
         for taxonomy, tag, unit in concept_alias_candidates(label):
             result = self.company_concept(cik, taxonomy, tag, unit=unit, limit=24, suggest_on_404=False)
             if "error" in result:
                 continue
-            fact = latest_distinct_fact(result.get("facts", []))
+            fact = freshest_fact(result.get("facts", []))
             if not fact:
                 continue
             candidate = {
@@ -3421,9 +4101,10 @@ class EdgarClient(BaseAPIClient):
                 best = candidate
 
         if best:
-            age_days = fact_age_days(best["fact"], reference_date)
-            best["age_days"] = age_days
-            best["stale"] = bool(age_days is not None and age_days > STALE_METRIC_DAYS)
+            best["age_days"] = fact_age_days(best["fact"], reference_date)
+            best["stale"], reason = metric_staleness(best["fact"], reference_date, latest_report)
+            if reason:
+                best["stale_reason"] = reason
         return best
 
     @staticmethod
@@ -3535,6 +4216,54 @@ def alias_filing_row(row: dict) -> dict:
         if camel in row and snake not in row:
             row[snake] = row[camel]
     return row
+
+
+def compact_filing_row(row: dict) -> dict:
+    """A filing row without its duplicate and empty fields.
+
+    Drops each SEC camelCase key that has a snake_case alias on the row
+    (`accessionNumber` when `accession` is there, ...) and every empty value.
+    Nothing is renamed, so a consumer of the snake_case names reads a compact
+    row exactly as it reads a full one.
+    """
+    return {
+        key: value for key, value in row.items()
+        if value not in ("", None, [], {})
+        and not (key in _FILING_ROW_ALIASES and _FILING_ROW_ALIASES[key] in row)
+    }
+
+
+def compact_result(result: dict) -> dict:
+    """Compact every filing row in a `company` / `filings` / `brief` result.
+
+    The envelope gains `"compact": true`. Opt-in (`--compact`): the default
+    output keeps both spellings of every filing field, as published in
+    schema_version 1.1.0.
+    """
+    if not isinstance(result, dict) or "error" in result:
+        return result
+    out = dict(result)
+    for key in ("filings", "events"):
+        if isinstance(out.get(key), list):
+            out[key] = [compact_filing_row(row) if isinstance(row, dict) else row
+                        for row in out[key]]
+    for key in ("profile",):
+        if isinstance(out.get(key), dict):
+            out[key] = compact_result(out[key])
+            out[key].pop("compact", None)
+    earnings = out.get("earnings")
+    if isinstance(earnings, dict) and isinstance(earnings.get("filing"), dict):
+        out["earnings"] = {**earnings, "filing": compact_filing_row(earnings["filing"])}
+    if isinstance(out.get("results"), list):
+        out["results"] = [compact_result(item) for item in out["results"]]
+        for item in out["results"]:
+            if isinstance(item, dict):
+                item.pop("compact", None)
+    # `files` lists SEC's historical chunk files: bulk an agent rarely needs.
+    if not out.get("files"):
+        out.pop("files", None)
+    out["compact"] = True
+    return out
 
 
 def enrich_fact_metadata(fact: dict, cik: str | int,
@@ -3957,6 +4686,102 @@ def pick_comparable_facts(facts: list[dict], periods: int) -> list[dict]:
     return out
 
 
+def freshest_fact(facts: list[dict]) -> Optional[dict]:
+    """The fact that covers the latest period.
+
+    Order: latest period `end`; for one end date a framed fact (SEC's
+    calendar-aligned, comparable one) before an unframed one; then the longer
+    period; then the latest filing (so a restatement wins). A newer unframed
+    fact is never passed over for an older framed one.
+
+    A fact "filed" before its own period ended cannot be a reported actual (it
+    is a mis-dated context) and is ignored when any other fact exists.
+    """
+    pool = [f for f in facts
+            if not (f.get("filed") and f.get("end") and f["end"] > f["filed"])] or list(facts)
+    if not pool:
+        return None
+
+    def _length(fact: dict) -> int:
+        start, end = parse_date(fact.get("start", "")), parse_date(fact.get("end", ""))
+        return (end - start).days if start and end else 0
+
+    return max(pool, key=lambda f: (f.get("end", ""), bool(f.get("frame")), _length(f),
+                                    f.get("filed", "")))
+
+
 def latest_distinct_fact(facts: list[dict]) -> Optional[dict]:
-    picked = pick_comparable_facts(facts, 1)
-    return picked[0] if picked else None
+    return freshest_fact(facts)
+
+
+def _is_xbrl_financial_row(row: dict) -> bool:
+    """True when a filing-list row is a report carrying XBRL financial data."""
+    form = str(row.get("form", "")).upper()
+    numeric = row.get("isXBRLNumeric")
+    if numeric is not None:
+        tagged = bool(numeric)
+    else:  # older rows have no isXBRLNumeric flag
+        tagged = bool(row.get("isXBRL") or row.get("isInlineXBRL"))
+    return tagged and (form in PERIODIC_REPORT_FORMS or form in INTERIM_REPORT_FORMS)
+
+
+def _report_summary(row: dict) -> dict:
+    return {
+        "form": row.get("form", ""),
+        "accession": row.get("accessionNumber", ""),
+        "filed": row.get("filingDate", ""),
+        "report_date": row.get("reportDate", ""),
+    }
+
+
+def latest_periodic_report(rows: list[dict]) -> Optional[dict]:
+    """The periodic report covering the latest period, from filing-list rows.
+
+    Annual and quarterly reports always count; a 6-K counts only when it
+    carries XBRL financial statements.
+    """
+    reports = [
+        row for row in rows
+        if row.get("reportDate") and (
+            str(row.get("form", "")).upper() in PERIODIC_REPORT_FORMS
+            or _is_xbrl_financial_row(row)
+        )
+    ]
+    if not reports:
+        return None
+    return _report_summary(max(reports, key=lambda r: (r.get("reportDate", ""),
+                                                       r.get("filingDate", ""))))
+
+
+def newest_xbrl_filing(rows: list[dict]) -> Optional[dict]:
+    """The most recently filed report that carries XBRL financial data."""
+    tagged = [row for row in rows if _is_xbrl_financial_row(row)]
+    if not tagged:
+        return None
+    return _report_summary(max(tagged, key=lambda r: (r.get("filingDate", ""),
+                                                      r.get("accessionNumber", ""))))
+
+
+def metric_staleness(fact: dict, reference_date: str,
+                     latest_report: Optional[dict] = None) -> tuple[bool, str]:
+    """Decide whether a metric's fact is stale, and say why.
+
+    1. Superseded: the filer's latest periodic report covers a period ending
+       more than STALE_PERIOD_TOLERANCE_DAYS after the fact's period end, so a
+       newer figure has been reported and this is not it.
+    2. Old: no such report is known, but the fact's period ended more than
+       STALE_METRIC_DAYS before the reference date.
+    """
+    end = parse_date(fact.get("end", ""))
+    report_end = parse_date((latest_report or {}).get("report_date", ""))
+    if end and report_end and (report_end - end).days > STALE_PERIOD_TOLERANCE_DAYS:
+        return True, (
+            f"Superseded: {latest_report.get('form', '')} {latest_report.get('accession', '')} "
+            f"(filed {latest_report.get('filed', '')}) reports the period ending "
+            f"{latest_report.get('report_date', '')}; this fact ends {fact.get('end', '')}."
+        )
+    age_days = fact_age_days(fact, reference_date)
+    if age_days is not None and age_days > STALE_METRIC_DAYS:
+        return True, (f"Old: the period ended {age_days} days before the reference date "
+                      f"{reference_date} (limit {STALE_METRIC_DAYS}).")
+    return False, ""

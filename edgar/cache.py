@@ -11,8 +11,6 @@ Adds:
 
 from __future__ import annotations
 
-import errno
-import fcntl
 import fnmatch
 import hashlib
 import json
@@ -24,6 +22,16 @@ from pathlib import Path
 from typing import Any, Optional
 
 from research_cli_base import FileCache
+
+try:  # POSIX
+    import fcntl
+except ImportError:  # Windows has no fcntl
+    fcntl = None  # type: ignore[assignment]
+
+try:  # Windows
+    import msvcrt
+except ImportError:
+    msvcrt = None  # type: ignore[assignment]
 
 DEFAULT_TTL = 900
 NEGATIVE_TTL = 3600
@@ -46,25 +54,97 @@ def ttl_for_url(url: str) -> int:
     return DEFAULT_TTL
 
 
+LOCK_TIMEOUT_SECONDS = 10.0
+_LOCK_POLL_SECONDS = 0.05
+
+
+def _acquire(fd: int, exclusive: bool) -> bool:
+    """Take the advisory lock on an open descriptor. Returns False on timeout.
+
+    POSIX uses `flock` (blocking; shared or exclusive). Windows has no
+    `fcntl`, so it locks byte 0 of the lock file with `msvcrt.locking`, which
+    is exclusive-only, polling until `LOCK_TIMEOUT_SECONDS` runs out.
+    """
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        return True
+    if msvcrt is not None:
+        deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                return True
+            except OSError:
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(_LOCK_POLL_SECONDS)
+    return False
+
+
+def _release(fd: int) -> None:
+    if fcntl is not None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    elif msvcrt is not None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+
 @contextmanager
 def _file_lock(path: Path, exclusive: bool = True):
-    """Best-effort cross-process advisory lock around a cache directory."""
+    """Best-effort cross-process advisory lock around a cache directory.
+
+    Works on POSIX and Windows. The lock is advisory and best-effort: if the
+    lock file cannot be created, or the lock cannot be taken before the
+    timeout, the body still runs (cache writes are atomic replaces, so the
+    worst case is a lost update of one entry, never a torn file).
+    """
     lock_path = path / ".lock"
     try:
         lock_path.touch(exist_ok=True)
+        fd = os.open(str(lock_path), os.O_RDWR)
     except OSError:
         yield
         return
-    flag = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-    fd = os.open(str(lock_path), os.O_RDWR)
+    locked = False
     try:
-        fcntl.flock(fd, flag)
+        try:
+            locked = _acquire(fd, exclusive)
+        except OSError:
+            locked = False
         yield
     finally:
         try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            if locked:
+                _release(fd)
+        except OSError:
+            pass
         finally:
             os.close(fd)
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Write `text` to `path` through a temp file and an atomic replace.
+
+    `os.replace` overwrites an existing target on every platform
+    (`Path.rename` raises FileExistsError on Windows). On Windows the replace
+    can fail briefly while another process has the target open, so it is
+    retried a few times before the error is raised.
+    """
+    tmp = path.with_name(f"{path.stem}.{os.getpid()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    for attempt in range(5):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == 4:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 class EdgarCache:
@@ -157,9 +237,7 @@ class EdgarCache:
         if negative:
             data["_negative"] = True
         with _file_lock(self._dir):
-            tmp = path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(data, default=str), encoding="utf-8")
-            tmp.rename(path)
+            _atomic_write(path, json.dumps(data, default=str))
             if self.max_bytes:
                 self._enforce_size_limit()
 
@@ -227,9 +305,8 @@ class EdgarCache:
         except (json.JSONDecodeError, OSError):
             return False
         data["_ts"] = time.time()
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, default=str), encoding="utf-8")
-        tmp.rename(path)
+        with _file_lock(self._dir):
+            _atomic_write(path, json.dumps(data, default=str))
         return True
 
     def clear(self) -> int:

@@ -86,6 +86,45 @@ when a fresh quarter is unavailable; that variant may land later if needed.
   ratio of `|slope|` to the average absolute value (threshold 0.5%) plus a
   sign-change check between the first and second half of the series.
 
+## Latest value and staleness (`edgar metrics`, `edgar brief`)
+
+**Which fact is "latest".** An alias such as `revenue` maps to several tags
+(`RevenueFromContractWithCustomerExcludingAssessedTax`, `Revenues`,
+`RevenueFromContractWithCustomerIncludingAssessedTax`, ...). The metric is the
+fact covering the freshest period across all of them, chosen in this order:
+
+1. the latest period end;
+2. for one end date, a framed fact (SEC's calendar-aligned, comparable one)
+   before an unframed one;
+3. the longer period;
+4. the latest filing (a restatement wins).
+
+A newer unframed fact (a half-year or year-to-date figure) is never passed
+over for an older framed one; its `period_type` and `period_length_days` say
+what it covers. A fact "filed" before its own period ended is a mis-dated
+context and is ignored when any other fact exists.
+
+**`stale`.** True when the figure is not the filer's latest reported period:
+
+1. **Superseded** — the filer's latest periodic report covers a period ending
+   more than 7 days after the fact's period end. Periodic reports are 10-K,
+   10-Q, 20-F and 40-F (and their amendments and transition forms), plus a
+   6-K that carries XBRL financial statements (a foreign private issuer's
+   interim accounts). The report is named in `latest_periodic_report` and in
+   the metric's `stale_reason`.
+2. **Old** — no such report is known, but the fact's period ended more than
+   548 days before `reference_date` (the filer's latest filing date).
+
+`age_days` is `reference_date` minus the fact's period end. A fresh fact has
+`stale: false` and no `stale_reason`.
+
+**`warnings`.** SEC's XBRL APIs can lag or omit a filing. When the filing list
+shows a report with XBRL financial data that is newer than every fact SEC's
+companyfacts API serves for the filer, `metrics`, `concept` and `facts` add a
+`warnings` entry with code `xbrl_filing_missing_from_sec_api` naming the
+filing. The figures returned then predate that report; read it with
+`edgar text`.
+
 ## Period assumptions
 
 - Computed metrics consume only one period kind at a time (`--period-type

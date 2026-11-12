@@ -213,6 +213,26 @@ def cite_option(fn):
     )(fn)
 
 
+def compact_option(fn):
+    return click.option(
+        "--compact", is_flag=True,
+        help="Drop duplicate camelCase filing fields and empty values (keeps snake_case)",
+    )(fn)
+
+
+def _machine_output(json_output: bool, markdown: bool, ndjson: bool) -> bool:
+    """True when the result goes out as JSON or NDJSON rather than a table."""
+    return ndjson or _wants_json(json_output, markdown, ndjson)
+
+
+def _compact(result, compact: bool):
+    """Compact a result for machine output; tables read the full rows."""
+    if not compact:
+        return result
+    from edgar.api import compact_result
+    return compact_result(result)
+
+
 def since_last_fetch_option(fn):
     return click.option(
         "--since-last-fetch", "since_last_fetch", is_flag=True,
@@ -237,6 +257,33 @@ def _error_exit(result: dict) -> None:
         raise exc
 
 
+def _echo_warnings(result: dict, json_output: bool, markdown: bool, ndjson: bool) -> None:
+    """Show envelope `warnings` on stderr when the output is not the JSON envelope.
+
+    JSON output already carries them; tables, markdown and NDJSON rows do not.
+    """
+    if not isinstance(result, dict) or (_wants_json(json_output, markdown, ndjson) and not ndjson):
+        return
+    for warning in result.get("warnings") or []:
+        message = warning.get("message") if isinstance(warning, dict) else str(warning)
+        if message:
+            click.echo(f"Warning: {message}", err=True)
+
+
+def _exit_if_no_data(result: dict, *row_keys: str) -> None:
+    """Exit 2 (no data) when every named row list is empty.
+
+    Call it after the envelope has been written: stdout still carries the
+    full JSON (with its `hint`), stderr carries the reason, and the exit code
+    tells a script the answer was empty.
+    """
+    if any(result.get(key) for key in row_keys):
+        return
+    hint = result.get("hint") or "No data found."
+    click.echo(f"No data: {hint}", err=True)
+    raise click.exceptions.Exit(2)
+
+
 def _exit_code_for_error(error: str) -> int:
     text = error.lower()
     if "429" in text or "rate limit" in text or "rate-limited" in text:
@@ -252,6 +299,7 @@ def _exit_code_for_error(error: str) -> int:
         return 2
     if (
         "not a cik" in text
+        or "invalid pattern" in text
         or "required" in text
         or "blank" in text
         or "ambiguous" in text
@@ -438,11 +486,12 @@ def search_companies(ctx, query, limit, markdown, json_output, ndjson):
 @click.option("--institutional", "form_class_flag", flag_value="institutional",
               help="Only institutional forms (SC 13D/G, 13F)")
 @cite_option
+@compact_option
 @since_last_fetch_option
 @output_options
 @click.pass_context
 def company(ctx, identifier, limit, form_type, start_date, end_date, all_history, show_urls,
-            form_class_flag, cite, since_last_fetch, markdown, json_output, ndjson):
+            form_class_flag, cite, compact, since_last_fetch, markdown, json_output, ndjson):
     """Show company profile and recent filings for a ticker or CIK."""
     client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
     state_store = StateStore() if since_last_fetch else None
@@ -452,7 +501,7 @@ def company(ctx, identifier, limit, form_type, start_date, end_date, all_history
         since_last_fetch=since_last_fetch, state_store=state_store,
         form_class=form_class_flag,
     )
-    result = _finalize(client, result, cite=cite)
+    result = _compact(_finalize(client, result, cite=cite), compact and _machine_output(json_output, markdown, ndjson))
     _output_company(result, json_output, markdown, ndjson, show_urls=show_urls)
 
 
@@ -471,11 +520,12 @@ def company(ctx, identifier, limit, form_type, start_date, end_date, all_history
 @click.option("--institutional", "form_class_flag", flag_value="institutional",
               help="Only institutional forms (SC 13D/G, 13F)")
 @cite_option
+@compact_option
 @since_last_fetch_option
 @output_options
 @click.pass_context
 def filings(ctx, identifier, limit, form_type, start_date, end_date, all_history, show_urls,
-            form_class_flag, cite, since_last_fetch, markdown, json_output, ndjson):
+            form_class_flag, cite, compact, since_last_fetch, markdown, json_output, ndjson):
     """Show recent filings for a ticker or CIK."""
     client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
     state_store = StateStore() if since_last_fetch else None
@@ -485,7 +535,7 @@ def filings(ctx, identifier, limit, form_type, start_date, end_date, all_history
         since_last_fetch=since_last_fetch, state_store=state_store,
         form_class=form_class_flag,
     )
-    result = _finalize(client, result, cite=cite)
+    result = _compact(_finalize(client, result, cite=cite), compact and _machine_output(json_output, markdown, ndjson))
     _output_filings(result, f"Recent Filings: {identifier}", json_output, markdown, ndjson, show_urls=show_urls)
 
 
@@ -503,6 +553,7 @@ def facts(ctx, identifier, limit, taxonomy, tag_filter, markdown, json_output, n
         identifier, taxonomy=taxonomy, tag_filter=tag_filter, limit=limit,
     )
     result = _finalize(client, result)
+    _echo_warnings(result, json_output, markdown, ndjson)
     _output_concepts(result, json_output, markdown, ndjson)
 
 
@@ -567,7 +618,14 @@ def concept(ctx, args, unit, limit, deltas, annual, quarterly, ytd, instant,
             )
         results.append(result)
     if len(results) == 1 and not batch_mode:
+        # Point-in-time queries (--as-of) leave newer filings out on purpose.
+        coverage_check = getattr(client, "xbrl_coverage_warning", None)
+        if coverage_check and not as_of and "error" not in results[0] and results[0].get("cik"):
+            coverage = coverage_check(results[0]["cik"], results[0].get("facts", []))
+            if coverage:
+                results[0].setdefault("warnings", []).append(coverage)
         single = _finalize(client, results[0], cite=cite)
+        _echo_warnings(single, json_output, markdown, ndjson)
         _output_concept_facts(single, json_output, markdown, ndjson, deltas=deltas)
     else:
         wrapped = _finalize_batch(client, results, key="results", cite=cite)
@@ -651,21 +709,33 @@ def earnings(ctx, identifier, cite, markdown, json_output, ndjson):
 
 @main.command()
 @click.argument("identifier")
-@click.option("--limit", "-n", default=20, show_default=True, type=PositiveInt, help="Recent 8-Ks to inspect")
+@click.option("--limit", "-n", default=20, show_default=True, type=PositiveInt,
+              help="Recent current reports (8-K and 6-K) to inspect")
+@click.option("--no-exhibits", is_flag=True,
+              help="Never read a 6-K's EX-99 exhibit when its own text classifies nothing")
 @cite_option
 @since_last_fetch_option
 @output_options
 @click.pass_context
-def events(ctx, identifier, limit, cite, since_last_fetch, markdown, json_output, ndjson):
-    """Detect notable recent 8-K events."""
+def events(ctx, identifier, limit, no_exhibits, cite, since_last_fetch, markdown, json_output, ndjson):
+    """Detect notable recent events from 8-K and 6-K current reports.
+
+    8-Ks are classified from their item numbers and keywords. 6-Ks (foreign
+    private issuers) have no item numbers, so each is classified from its own
+    text and returned with the sentence every type was classified from. An
+    empty result explains itself in `hint` and exits 2 (no data).
+    """
     client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
     state_store = StateStore() if since_last_fetch else None
     result = client.events(
         identifier, limit=limit,
         since_last_fetch=since_last_fetch, state_store=state_store,
+        read_exhibits=not no_exhibits,
     )
     result = _finalize(client, result, cite=cite)
     _output_events(result, json_output, markdown, ndjson)
+    if not since_last_fetch:
+        _exit_if_no_data(result, "events")
 
 
 @main.command()
@@ -730,6 +800,7 @@ def metrics(ctx, identifier, bundle, tickers, input_file, batch, cite, markdown,
         results.append(result)
     if len(results) == 1 and not (tickers or input_file or batch):
         single = _finalize(client, results[0], cite=cite)
+        _echo_warnings(single, json_output, markdown, ndjson)
         _output_metrics(single, json_output, markdown, ndjson)
     else:
         wrapped = _finalize_batch(client, results, key="results", cite=cite)
@@ -740,9 +811,10 @@ def metrics(ctx, identifier, bundle, tickers, input_file, batch, cite, markdown,
 @click.argument("identifier", required=False)
 @batch_options
 @cite_option
+@compact_option
 @output_options
 @click.pass_context
-def brief(ctx, identifier, tickers, input_file, batch, cite, markdown, json_output, ndjson):
+def brief(ctx, identifier, tickers, input_file, batch, cite, compact, markdown, json_output, ndjson):
     """Build a compact company brief."""
     identifiers = _collect_identifiers(identifier, tickers, input_file, batch)
     client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
@@ -752,10 +824,10 @@ def brief(ctx, identifier, tickers, input_file, batch, cite, markdown, json_outp
         result.setdefault("identifier", value)
         results.append(result)
     if len(results) == 1 and not (tickers or input_file or batch):
-        single = _finalize(client, results[0], cite=cite)
+        single = _compact(_finalize(client, results[0], cite=cite), compact and _machine_output(json_output, markdown, ndjson))
         _output_brief(single, json_output, markdown, ndjson)
     else:
-        wrapped = _finalize_batch(client, results, key="results", cite=cite)
+        wrapped = _compact(_finalize_batch(client, results, key="results", cite=cite), compact and _machine_output(json_output, markdown, ndjson))
         _output_brief_batch(wrapped["results"], json_output, markdown, ndjson, envelope=wrapped)
 
 
@@ -1250,6 +1322,8 @@ PRIMARY_ROW_KEYS: dict = {
     "dashboard": None,
     "governance": "proposals",
     "item": None,
+    "text": "documents",
+    "dilution": None,
     "holdings": "rows",
     "holders": "rows",
     "insiders": "transactions",
@@ -1304,6 +1378,19 @@ def _output_schemas() -> dict:
             },
         },
     }
+    warnings_schema = {
+        "type": "array",
+        "description": "Present only when something the caller should know was detected",
+        "items": {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "enum": ["xbrl_filing_missing_from_sec_api"]},
+                "message": {"type": "string"},
+                "filing": {"type": "object"},
+                "newest_fact_filed": {"type": "string"},
+            },
+        },
+    }
     filing_row_schema = {
         "type": "object",
         "description": ("SEC camelCase passthrough plus snake_case aliases "
@@ -1332,6 +1419,7 @@ def _output_schemas() -> dict:
                 "total": {"type": "integer"},
                 "alias": {"type": ["string", "null"]},
                 "candidate_tags": {"type": "array", "items": {"type": "string"}},
+                "warnings": warnings_schema,
             },
             "required": ["cik", "facts"],
         },
@@ -1342,6 +1430,11 @@ def _output_schemas() -> dict:
                 **envelope_meta,
                 "cik": {"type": "string"}, "ticker": {"type": "string"},
                 "name": {"type": "string"}, "reference_date": {"type": "string"},
+                "latest_periodic_report": {
+                    "type": ["object", "null"],
+                    "description": "The periodic report covering the latest period "
+                                   "(10-K/10-Q/20-F/40-F, or a 6-K with XBRL financials)",
+                },
                 "metrics": {
                     "type": "array",
                     "items": {
@@ -1349,10 +1442,18 @@ def _output_schemas() -> dict:
                         "properties": {
                             "metric": {"type": "string"}, "tag": {"type": "string"},
                             "fact": fact_schema, "age_days": {"type": ["integer", "null"]},
-                            "stale": {"type": "boolean"}, "error": {"type": "string"},
+                            "stale": {
+                                "type": "boolean",
+                                "description": "True when the latest periodic report covers a "
+                                               "later period than this fact, or the fact's period "
+                                               "ended more than 548 days before reference_date",
+                            },
+                            "stale_reason": {"type": "string"},
+                            "error": {"type": "string"},
                         },
                     },
                 },
+                "warnings": warnings_schema,
             },
         },
         "ratios": {
@@ -1389,7 +1490,45 @@ def _output_schemas() -> dict:
         },
         "events": {
             "type": "object",
-            "properties": {**envelope_meta, "events": {"type": "array"}},
+            "properties": {
+                **envelope_meta,
+                "cik": {"type": "string"}, "name": {"type": "string"},
+                "events": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "description": "One current report: an 8-K with a recognized event, "
+                                       "or any 6-K examined",
+                        "properties": {
+                            "form": {"type": "string"},
+                            "accession": {"type": "string"}, "filed": {"type": "string"},
+                            "acceptance_datetime": {"type": "string", "description": "UTC"},
+                            "items": {"type": "string", "description": "8-K item numbers"},
+                            "event_types": {"type": "array", "items": {"type": "string"}},
+                            "snippets": {
+                                "type": "object",
+                                "description": "event type -> the text it was classified from "
+                                               "(for a 6-K: one sentence of the report)",
+                            },
+                            "background_types": {
+                                "type": "array",
+                                "description": "6-K types supported only by an "
+                                               "'As previously disclosed' recap",
+                            },
+                            "heading": {"type": "string"}, "lead": {"type": "string"},
+                            "classified_from": {"type": ["string", "null"],
+                                                "enum": ["body", "exhibit_index", "exhibit", None]},
+                            "evidence_document": {"type": "string"},
+                            "evidence_document_type": {"type": "string"},
+                            "filing_url": {"type": "string"}, "primary_doc_url": {"type": "string"},
+                        },
+                    },
+                },
+                "forms_examined": {"type": "object"},
+                "filings_examined": {"type": "integer"},
+                "hint": {"type": "string", "description": "Present when events is empty"},
+                "forms_filed": {"type": "object", "description": "Present when events is empty"},
+            },
         },
         "delta": {
             "type": "object",
@@ -1665,6 +1804,214 @@ def item(ctx, identifier, form, section, as_of, db_path, max_chars,
 
 
 @main.command()
+@click.argument("target", nargs=-1, required=True)
+@click.option("--cik", default=None,
+              help="Filer CIK, when only an accession number is given")
+@click.option("--form", "form_type", default=None,
+              help="Read the latest filing of this form (e.g. 6-K, 424B5, 20-F)")
+@click.option("--as-of", "as_of", default=None, callback=_validate_date_option,
+              help="Use the latest filing on/before YYYY-MM-DD")
+@click.option("--exhibit", "-e", "exhibits", multiple=True,
+              help="Also read exhibits whose type starts with this (EX-99, EX-10.1, all); repeatable")
+@click.option("--exhibits-only", is_flag=True, help="Leave out the main document")
+@click.option("--grep", "-g", "pattern", default=None,
+              help="Return only sentences matching this regular expression (case-insensitive)")
+@click.option("--context", "-C", default=0, show_default=True, type=PositiveOrZeroInt,
+              help="With --grep: sentences of context before and after each match")
+@click.option("--limit", "-n", default=50, show_default=True, type=PositiveInt,
+              help="With --grep: maximum matches per document")
+@click.option("--max-chars", default=50000, show_default=True, type=PositiveInt,
+              help="Return at most this many characters of each document")
+@click.option("--offset", default=0, show_default=True, type=PositiveOrZeroInt,
+              help="Start this many characters into each document (see next_offset)")
+@output_options
+@click.pass_context
+def text(ctx, target, cik, form_type, as_of, exhibits, exhibits_only, pattern, context,
+         limit, max_chars, offset, markdown, json_output, ndjson):
+    """Read any filing as clean text: main document, exhibits, or matching sentences.
+
+    TARGET is a ticker or CIK (reads its latest filing; narrow with --form),
+    a ticker or CIK plus an accession number, an accession number with
+    --cik, or an SEC filing URL.
+
+    \b
+      edgar text OMH --form 6-K
+      edgar text OMH 0001213900-26-107603 --exhibit EX-10
+      edgar text OMH 0001213900-26-107501 --grep "going concern|outstanding"
+    """
+    if len(target) > 2:
+        raise click.UsageError("Give a ticker/CIK, an accession number or URL, or both")
+    named = [value for value in target if _looks_like_filing_ref(value)]
+    others = [value for value in target if not _looks_like_filing_ref(value)]
+    if len(named) > 1 or len(others) > 1:
+        raise click.UsageError("Give one ticker/CIK and at most one accession number or URL")
+    client = get_client(use_cache=not ctx.obj["no_cache"],
+                       cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.filing_text(
+        identifier=others[0] if others else None,
+        accession_or_url=named[0] if named else None,
+        cik=cik, form=form_type, as_of=as_of,
+        exhibits=_split_input_values(",".join(exhibits)) if exhibits else None,
+        exhibits_only=exhibits_only, max_chars=max_chars, offset=offset,
+        pattern=pattern, context=context, limit=limit,
+    )
+    result = _finalize(client, result)
+    _error_exit(result)
+    _output_text(result, json_output, markdown, ndjson)
+    _exit_if_no_data(result, "documents")
+
+
+_DILUTION_SECTIONS = [
+    ("shares_outstanding", "Shares outstanding (as stated)"),
+    ("offerings", "Offerings"),
+    ("equity_lines_and_atm", "Equity lines and at-the-market programs"),
+    ("warrants", "Warrants"),
+    ("reverse_splits", "Reverse splits"),
+    ("going_concern", "Going concern"),
+]
+
+
+@main.command()
+@click.argument("identifier")
+@click.option("--since", default=None, callback=_validate_date_option,
+              help="Read filings on/after YYYY-MM-DD (default: one year before the latest filing)")
+@click.option("--max-filings", default=25, show_default=True, type=PositiveInt,
+              help="Most recent current reports (6-K, 8-K) to read")
+@click.option("--max-supplements", default=3, show_default=True, type=PositiveOrZeroInt,
+              help="Most recent prospectus supplements (424B) to read")
+@output_options
+@click.pass_context
+def dilution(ctx, identifier, since, max_filings, max_supplements, markdown, json_output, ndjson):
+    """Gather what bears on share supply, every figure with its source sentence.
+
+    Sections: stated shares outstanding, shelf registrations (effectiveness,
+    takedowns, capacity), prospectus supplements, offerings, equity lines and
+    at-the-market programs, warrants (count, exercise price, multiple-share
+    exchange features), reverse splits and going-concern language.
+
+    Read from the filer's own 6-K / 8-K reports and 424B supplements. Each
+    statement is a sentence of a named filing; nothing is inferred.
+    """
+    client = get_client(use_cache=not ctx.obj["no_cache"],
+                       cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.dilution(identifier, since=since, max_filings=max_filings,
+                             max_supplements=max_supplements)
+    result = _finalize(client, result)
+    _error_exit(result)
+    _output_dilution(result, json_output, markdown, ndjson)
+    _exit_if_no_data(result, "shelf_registrations", "prospectus_supplements",
+                     *[key for key, _ in _DILUTION_SECTIONS])
+
+
+def _figures_text(statement: dict) -> str:
+    return "; ".join(figure.get("text", "") for figure in statement.get("figures", []))
+
+
+def _output_dilution(result: dict, json_output: bool, markdown: bool, ndjson: bool = False) -> None:
+    if ndjson:
+        rows = [{"section": key, **statement}
+                for key, _ in _DILUTION_SECTIONS for statement in result.get(key, [])]
+        rows.extend({"section": "shelf_capacity", **statement}
+                    for shelf in result.get("shelf_registrations", [])
+                    for statement in shelf.get("capacity", []))
+        _ndjson(rows)
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+
+    def emit(title: str, headers: list[str], rows: list[list]) -> None:
+        if not rows:
+            return
+        if markdown:
+            click.echo(f"\n### {title}\n")
+            click.echo(_markdown_table(headers, rows))
+        else:
+            console.print(_simple_table(title, headers, rows))
+
+    click.echo(f"## Dilution: {result.get('name', '')} (filings since {result.get('since', '')})"
+               if markdown else f"Dilution: {result.get('name', '')} · since {result.get('since', '')}")
+    latest = result.get("latest_shares_outstanding")
+    if latest:
+        click.echo(f"\nLatest stated shares outstanding ({latest.get('as_of') or latest['filed']}, "
+                   f"{latest['form']} {latest['accession']}): {_figures_text(latest)}")
+    xbrl = result.get("xbrl_shares_outstanding")
+    if xbrl:
+        click.echo(f"XBRL cover count: {_format_value(xbrl.get('value'))} as of {xbrl.get('as_of')} "
+                   f"({xbrl.get('form')} {xbrl.get('accession')}). {xbrl.get('note', '')}".rstrip())
+    emit("Shelf registrations",
+         ["File no.", "Form", "Filed", "Effective", "Supplements", "Capacity statements"],
+         [[shelf["file_number"], shelf["form"], shelf["filed"],
+           (shelf.get("effective") or {}).get("date", "not found"),
+           ", ".join(f"{s['form']} {s['filed']}" for s in shelf.get("supplements", [])),
+           " / ".join(_figures_text(s) for s in shelf.get("capacity", []) if s.get("figures"))]
+          for shelf in result.get("shelf_registrations", [])])
+    emit("Prospectus supplements", ["Filed", "Form", "Accession", "Read", "Stated on the cover"],
+         [[row["filed"], row["form"], row["accession"], "yes" if row.get("read") else "no",
+           " / ".join(_figures_text(s) for s in row.get("offering", []))]
+          for row in result.get("prospectus_supplements", [])])
+    for key, title in _DILUTION_SECTIONS:
+        emit(title, ["Filed", "Form", "Accession", "Figures", "Sentence"],
+             [[s["filed"], s["form"], s["accession"], _figures_text(s), _truncate(s["sentence"], 220)]
+              for s in result.get(key, [])])
+    if result.get("hint"):
+        click.echo(f"\n{result['hint']}")
+    click.echo(f"\n{result.get('method', '')}")
+
+
+def _looks_like_filing_ref(value: str) -> bool:
+    """True for an accession number (dashed) or an SEC URL."""
+    import re
+    return bool(re.search(r"\d{10}-\d{2}-\d{6}", value) or "sec.gov/" in value.lower())
+
+
+def _output_text(result: dict, json_output: bool, markdown: bool, ndjson: bool = False) -> None:
+    documents = result.get("documents", [])
+    if ndjson:
+        rows = []
+        for doc in documents:
+            if "matches" in doc:
+                rows.extend({"document": doc["document"], "type": doc["type"],
+                             "accession": result["filing"]["accession"], **match}
+                            for match in doc["matches"])
+            else:
+                rows.append({"accession": result["filing"]["accession"], **doc})
+        _ndjson(rows)
+        return
+    if _wants_json(json_output, markdown, ndjson):
+        _json(result)
+        return
+    filing = result.get("filing", {})
+    header = (f"{result.get('name', '')} · {filing.get('form', '')} · "
+              f"{filing.get('accession', '')} · filed {filing.get('filed', '')}")
+    click.echo(f"# {header}\n" if markdown else header)
+    for doc in documents:
+        title = f"{doc.get('type', '')} {doc.get('document', '')}".strip()
+        click.echo(f"\n## {title}\n" if markdown else f"\n=== {title} ===")
+        if doc.get("skipped") or doc.get("error"):
+            click.echo(doc.get("skipped") or doc.get("error"))
+            continue
+        if "matches" in doc:
+            for match in doc["matches"]:
+                for line in match.get("before", []):
+                    click.echo(f"  {line}")
+                click.echo(f"- [{match['index']}] {match['sentence']}")
+                for line in match.get("after", []):
+                    click.echo(f"  {line}")
+            if doc.get("matches_truncated"):
+                click.echo(f"(more matches; raise --limit above {len(doc['matches'])})")
+            if not doc["matches"]:
+                click.echo(f"(no sentence matches {result.get('pattern')!r})")
+            continue
+        click.echo(doc.get("text", ""))
+        if doc.get("truncated"):
+            click.echo(f"\n[truncated: {doc['length']} characters in total; "
+                       f"continue with --offset {doc['next_offset']}]")
+    if result.get("hint"):
+        click.echo(f"\n{result['hint']}")
+
+
+@main.command()
 @click.argument("identifier")
 @click.option("--quarter", default=None,
               help="Quarter (e.g. 2025Q4 or CY2025Q4); defaults to most recent 13F-HR")
@@ -1773,31 +2120,44 @@ def holders(ctx, identifier, candidates, cusip, quarter, top_n, max_filers,
 @main.command()
 @click.argument("identifier")
 @click.option("--since", default=None, callback=_validate_date_option,
-              help="Only Form 4 filings on/after YYYY-MM-DD")
+              help="Only insider filings on/after YYYY-MM-DD")
 @click.option("--limit", "-n", default=50, show_default=True, type=PositiveInt,
               help="Max transactions to return after aggregation")
 @click.option("--max-fetch", default=50, show_default=True, type=PositiveInt,
-              help="Max Form 4 filings to download (hard ceiling 200)")
+              help="Max Form 3/4/5 filings to download (hard ceiling 200)")
 @output_options
 @click.pass_context
 def insiders(ctx, identifier, since, limit, max_fetch, markdown, json_output, ndjson):
-    """Aggregate Form 4 insider transactions for a filer."""
+    """Aggregate insider ownership filings: Form 4/5 transactions, Form 3 holdings.
+
+    With no transactions the result explains itself in `hint` and lists any
+    Form 3 initial statements. With no insider filings at all it exits 2.
+    """
     client = get_client(use_cache=not ctx.obj["no_cache"],
                        cache_max_mb=ctx.obj.get("cache_max_mb"))
     result = client.insiders(identifier, since=since, limit=limit,
                               max_form4_fetches=max_fetch)
     result = _finalize(client, result)
     _error_exit(result)
+    _output_insiders(result, identifier, json_output, markdown, ndjson)
+    _exit_if_no_data(result, "transactions", "initial_statements")
+
+
+def _output_insiders(result: dict, identifier: str, json_output: bool, markdown: bool,
+                     ndjson: bool = False) -> None:
     if ndjson:
-        _ndjson(result.get("transactions", []))
+        _ndjson(result.get("transactions", []) or result.get("initial_statements", []))
         return
     if _wants_json(json_output, markdown, ndjson):
         _json(result)
         return
     s = result.get("summary", {})
-    body = "\n".join([
-        f"Form 4 filings parsed: {result.get('form4s_fetched', 0)}"
+    statements = result.get("initial_statements", [])
+    body = "\n".join(line for line in [
+        f"Ownership filings parsed: {result.get('form4s_fetched', 0)}"
         f"  failed: {result.get('form4s_failed', 0)}",
+        f"Form 3 initial statements: {len(statements)}",
+        result.get("hint", ""),
         f"Transactions: {result.get('transactions_total', 0)}",
         f"Acquired: {_format_value(s.get('acquired_shares'))} shares "
         f"(${_format_value(s.get('acquired_value'))})",
@@ -1805,8 +2165,26 @@ def insiders(ctx, identifier, since, limit, max_fetch, markdown, json_output, nd
         f"(${_format_value(s.get('disposed_value'))})",
         f"Net: {_format_value(s.get('net_shares'))} shares "
         f"(${_format_value(s.get('net_value'))})",
-    ])
-    console.print(Panel(body, title=f"Insiders: {result.get('name', identifier)}", expand=False))
+    ] if line)
+    statement_rows = [
+        [
+            row.get("filed", ""), row.get("owner_name", ""), row.get("officer_title", ""),
+            "D" if row.get("is_director") else "", "O" if row.get("is_officer") else "",
+            "none owned" if row.get("no_securities_owned") else len(row.get("holdings", [])),
+            row.get("accession", ""),
+        ]
+        for row in statements
+    ]
+    statement_headers = ["Filed", "Insider", "Title", "Dir", "Off", "Holdings", "Accession"]
+    if markdown:
+        click.echo(body + "\n")
+        if statement_rows:
+            click.echo(_markdown_table(statement_headers, statement_rows) + "\n")
+    else:
+        console.print(Panel(body, title=f"Insiders: {result.get('name', identifier)}", expand=False))
+        if statement_rows:
+            console.print(_simple_table("Form 3 initial statements", statement_headers,
+                                        statement_rows))
     rows = []
     for ins in result.get("insiders", [])[:10]:
         rows.append([
@@ -2598,25 +2976,32 @@ def _output_events(result: dict, json_output: bool, markdown: bool, ndjson: bool
     rows = [
         [
             event.get("filingDate", ""),
+            event.get("form", ""),
             ", ".join(event.get("event_types", [])),
             event.get("items", ""),
             event.get("accessionNumber", ""),
-            next(iter(event.get("snippets", {}).values()), ""),
+            next(iter(event.get("snippets", {}).values()), "") or event.get("lead", ""),
         ]
         for event in result.get("events", [])
     ]
+    headers = ["Filed", "Form", "Events", "Items", "Accession", "Snippet"]
     if markdown:
-        click.echo(_markdown_table(["Filed", "Events", "Items", "Accession", "Snippet"], rows))
+        if result.get("hint"):
+            click.echo(f"> {result['hint']}\n")
+        click.echo(_markdown_table(headers, rows))
         return
 
     table = Table(title=f"Events: {result.get('name', '')}")
     table.add_column("Filed", style="green", no_wrap=True)
+    table.add_column("Form", style="cyan", no_wrap=True)
     table.add_column("Events")
     table.add_column("Items", no_wrap=True)
     table.add_column("Accession", style="magenta", no_wrap=True)
     table.add_column("Snippet", overflow="fold")
     for row in rows:
         table.add_row(*[str(cell) for cell in row])
+    if result.get("hint"):
+        table.caption = result["hint"]
     console.print(table)
 
 
