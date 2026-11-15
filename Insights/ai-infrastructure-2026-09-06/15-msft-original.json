@@ -1,0 +1,17 @@
+{
+  "cik": "0000789019",
+  "accessionNumber": "0001193125-26-323660",
+  "filing_url": "https://www.sec.gov/Archives/edgar/data/789019/000119312526323660/0001193125-26-323660-index.htm",
+  "documents": [
+    {
+      "sequence": "1",
+      "description": "10-K",
+      "document": "msft-20260630.htm iXBRL",
+      "href": "/ix?doc=/Archives/edgar/data/789019/000119312526323660/msft-20260630.htm",
+      "type": "10-K",
+      "size": "8585501",
+      "url": "https://www.sec.gov/ix?doc=/Archives/edgar/data/789019/000119312526323660/msft-20260630.htm",
+      "downloaded_to": "Insights/ai-infrastructure-2026-09-06/documents/msft/msft-20260630.htm iXBRL"
+    }
+  ]
+}

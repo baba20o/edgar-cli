@@ -1,0 +1,28 @@
+{
+  "commit": "e2aa67eb9ba83c8f517b7a52a6e67eb5dacc2c7d",
+  "remote": "origin",
+  "branch": "main",
+  "remote_verified": true,
+  "local_main": "e2aa67eb9ba83c8f517b7a52a6e67eb5dacc2c7d",
+  "files": [
+    "edgar/api.py",
+    "edgar/cli.py",
+    "edgar/documents.py",
+    "edgar/items.py",
+    "tests/test_documents.py",
+    "tests/test_items.py"
+  ],
+  "pre_commit_tests": {
+    "passed": 182,
+    "skipped": 2
+  },
+  "post_push_tests": {
+    "passed": 182,
+    "skipped": 2
+  },
+  "review_model": "claude-fable-5-1",
+  "initial_review_run": "run_c0e873a5faa645c7bd012ca20ac557de",
+  "final_review_run": "run_8f3fa92eaa8c4b8b98b506e1767f651f",
+  "final_review_report": "evt_e2b45d150bb24c51a0dc935991fc696c",
+  "note": "Original CRLF formatting differences preserved; no substantive tracked working diff remains. Two skips require optional original worktree fixtures."
+}

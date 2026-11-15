@@ -1,0 +1,50 @@
+{
+  "cik": "0001045810",
+  "name": "NVIDIA CORP",
+  "taxonomy": "us-gaap",
+  "tag": "NetCashProvidedByUsedInOperatingActivities",
+  "label": "Net Cash Provided by (Used in) Operating Activities",
+  "description": "Amount of cash inflow (outflow) from operating activities, including discontinued operations. Operating activity cash flows include transactions, adjustments, and changes in value not defined as investing or financing activities.",
+  "as_of": "2026-09-06",
+  "facts": [
+    {
+      "start": "2026-01-26",
+      "end": "2026-07-26",
+      "val": 74421000000,
+      "accn": "0001045810-26-000075",
+      "fy": 2027,
+      "fp": "Q2",
+      "form": "10-Q",
+      "filed": "2026-08-26",
+      "unit": "USD",
+      "filing_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000075/0001045810-26-000075-index.htm",
+      "primary_doc_url": "",
+      "accession": "0001045810-26-000075",
+      "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000075/0001045810-26-000075-index.htm",
+      "as_of": "2026-07-26",
+      "period_type": "ytd",
+      "period_length_days": 181,
+      "fiscal_period": "Q2-FY2027",
+      "calendar_period": "",
+      "is_restated": false,
+      "is_cumulative": true,
+      "superseded_by": null,
+      "prior_values": [],
+      "latest_known_value": 74421000000
+    }
+  ],
+  "total": 72,
+  "restated_facts_in_window": 3,
+  "alias": "operating_cash_flow",
+  "candidate_tags": [
+    "NetCashProvidedByUsedInOperatingActivities"
+  ],
+  "identifier": "NVDA",
+  "schema_version": "1.0.0",
+  "cli_version": "0.1.0",
+  "cache": {
+    "calls": 0,
+    "hits": 0,
+    "misses": 0
+  }
+}

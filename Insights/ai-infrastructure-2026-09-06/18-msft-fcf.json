@@ -1,0 +1,45 @@
+{
+  "cik": "0000789019",
+  "ticker": "MSFT",
+  "name": "MICROSOFT CORP",
+  "target": "fcf",
+  "period_type": "annual",
+  "as_of": "2026-09-06",
+  "metric": "fcf",
+  "value": 66987000000.0,
+  "formula": "OperatingCashFlow - CapEx",
+  "inputs": [
+    {
+      "label": "OperatingCashFlow",
+      "tag": "NetCashProvidedByUsedInOperatingActivities",
+      "val": 182935000000,
+      "unit": "USD",
+      "source_url": "https://www.sec.gov/Archives/edgar/data/789019/000119312526323660/0001193125-26-323660-index.htm",
+      "as_of": "2026-06-30",
+      "fiscal_period": "FY2026",
+      "calendar_period": "CY2026",
+      "accession": "0001193125-26-323660"
+    },
+    {
+      "label": "CapEx",
+      "tag": "PaymentsToAcquirePropertyPlantAndEquipment",
+      "val": 115948000000,
+      "unit": "USD",
+      "source_url": "https://www.sec.gov/Archives/edgar/data/789019/000119312526323660/0001193125-26-323660-index.htm",
+      "as_of": "2026-06-30",
+      "fiscal_period": "FY2026",
+      "calendar_period": "CY2026",
+      "accession": "0001193125-26-323660"
+    }
+  ],
+  "caveats": [
+    "FCF capex scope: PP&E only; excludes acquisitions and capitalized software."
+  ],
+  "schema_version": "1.0.0",
+  "cli_version": "0.1.0",
+  "cache": {
+    "calls": 0,
+    "hits": 0,
+    "misses": 0
+  }
+}

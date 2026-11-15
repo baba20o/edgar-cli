@@ -1,0 +1,58 @@
+{
+  "preexisting_files_unchanged": true,
+  "msft_cash_ppe_by_period": [
+    {
+      "start": "2025-07-01",
+      "end": "2026-06-30",
+      "val": 115948000000,
+      "fiscal_period": "FY2026"
+    },
+    {
+      "start": "2024-07-01",
+      "end": "2025-06-30",
+      "val": 64551000000,
+      "fiscal_period": "FY2026"
+    },
+    {
+      "start": "2023-07-01",
+      "end": "2024-06-30",
+      "val": 44477000000,
+      "fiscal_period": "FY2026"
+    }
+  ],
+  "msft_cash_ppe_growth_fy2026_percent": 79.62231413920775,
+  "msft_fcf_arithmetic_matches": true,
+  "nvda_metrics_periods": [
+    {
+      "metric": "revenue",
+      "end": "2026-07-26",
+      "start": "2026-04-27",
+      "value": 96221000000,
+      "stale": false
+    },
+    {
+      "metric": "operating_cash_flow",
+      "end": "2026-04-26",
+      "start": "2026-01-26",
+      "value": 50344000000,
+      "stale": false
+    },
+    {
+      "metric": "capex",
+      "end": "2026-04-26",
+      "start": "2026-01-26",
+      "value": 1757000000,
+      "stale": false
+    }
+  ],
+  "vrt_mda_mislabeled_equity_section": true,
+  "msft_download_is_viewer_shell": true,
+  "msft_expected_html_bytes": 8585501,
+  "msft_cli_download_bytes": 6356,
+  "local_markdown_links_valid": true,
+  "captured_cli_calls": 20,
+  "json_outputs": 19,
+  "all_cli_exit_codes_zero": true,
+  "median_seconds": 0.8374999999999999,
+  "production_source_unchanged": true
+}

@@ -1,0 +1,35 @@
+[
+  {
+    "label": "msft",
+    "method": "Supplemental direct SEC primary_doc_url download, NOT CLI exhibits download. BeautifulSoup text extraction, script/style excluded.",
+    "source_url": "https://www.sec.gov/Archives/edgar/data/789019/000119312526323660/msft-20260630.htm",
+    "retrieved_at_utc": "2026-09-07T02:19:28.435985+00:00",
+    "file": "documents/msft-direct.html",
+    "text_file": "documents/msft-direct.txt",
+    "bytes": 8585501,
+    "sha256": "4bcf2da2871acc19e32c5a62f36f6d83d6aae03cdc4aaa9a86a9a21ee8223f02",
+    "text_sha256": "8fd41e80c0b84efed5ea1e3861f9b1615d1ee7c5a1169ad0d615d7753b51086c"
+  },
+  {
+    "label": "nvda",
+    "method": "Supplemental direct SEC primary_doc_url download, NOT CLI exhibits download. BeautifulSoup text extraction, script/style excluded.",
+    "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000075/nvda-20260726.htm",
+    "retrieved_at_utc": "2026-09-07T02:19:28.850415+00:00",
+    "file": "documents/nvda-direct.html",
+    "text_file": "documents/nvda-direct.txt",
+    "bytes": 1517047,
+    "sha256": "e2634e509c241c5f45e3f6c115dc38a85645e5fdbee760b4a04f5e9035f6f7a9",
+    "text_sha256": "adb5b358bbdd6a8e86cbecdfdf49efb9b87d4579a5259ee7052f1be5fca0b096"
+  },
+  {
+    "label": "vrt",
+    "method": "Supplemental direct SEC primary_doc_url download, NOT CLI exhibits download. BeautifulSoup text extraction, script/style excluded.",
+    "source_url": "https://www.sec.gov/Archives/edgar/data/1674101/000162828026050609/vrt-20260630.htm",
+    "retrieved_at_utc": "2026-09-07T02:19:29.352971+00:00",
+    "file": "documents/vrt-direct.html",
+    "text_file": "documents/vrt-direct.txt",
+    "bytes": 1517952,
+    "sha256": "9346a7542ba74f5a8f841365e837d45f4bd25c790be0a4da7b4b5807c3e0024d",
+    "text_sha256": "282b6fc5ba301ef693ce40284a1e05a8e52834b082890ca7499ec80fca1f99ec"
+  }
+]

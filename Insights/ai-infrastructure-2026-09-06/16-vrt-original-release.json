@@ -1,0 +1,17 @@
+{
+  "cik": "0001674101",
+  "accessionNumber": "0001628280-26-050323",
+  "filing_url": "https://www.sec.gov/Archives/edgar/data/1674101/000162828026050323/0001628280-26-050323-index.htm",
+  "documents": [
+    {
+      "sequence": "2",
+      "description": "EX-99.1",
+      "document": "q22026exhibit991vrt07292026.htm",
+      "href": "/Archives/edgar/data/1674101/000162828026050323/q22026exhibit991vrt07292026.htm",
+      "type": "EX-99.1",
+      "size": "692759",
+      "url": "https://www.sec.gov/Archives/edgar/data/1674101/000162828026050323/q22026exhibit991vrt07292026.htm",
+      "downloaded_to": "Insights/ai-infrastructure-2026-09-06/documents/vrt/q22026exhibit991vrt07292026.htm"
+    }
+  ]
+}

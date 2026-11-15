@@ -1,0 +1,35 @@
+{
+  "cik": "0001674101",
+  "ticker": "VRT",
+  "name": "Vertiv Holdings Co",
+  "filing": {
+    "accession": "0001628280-26-050609",
+    "filed": "2026-07-29",
+    "form": "10-Q",
+    "filing_url": "https://www.sec.gov/Archives/edgar/data/1674101/000162828026050609/0001628280-26-050609-index.htm"
+  },
+  "body_source": "live",
+  "body_length": 130843,
+  "section": {
+    "item": "2",
+    "title": "Management's Discussion and Analysis",
+    "text": "ITEM 2. UNREGISTERED SALES OF EQUITY SECURITIES AND USE OF PROCEEDS A) Recent Sales of Unregistered Securities None. B) Use of Proceeds from our Initial Public Offering of Common Stock Not applicable. C) Repurchases of Shares or of Company Equity Securities On November 29, 2023, the Board of Directors of the Company approved a stock repurchase program, which authorizes the repurchase of shares of Company Class A common stock in an aggregate amount of up to $3.0 billion through December 31, 2027. The stock repurchase program does not obligate the Company to repurchase any specific dollar amount or number of shares of Class A common stock and the Board's authorization of the program may be modified, suspended or discontinued at any time. As of June 30, 2026, $2.4 billion shares were available for repurchase. During 2026, Vertiv made no share repurchases.",
+    "length": 864,
+    "truncated_to_max_chars": false,
+    "confidence": "high",
+    "items_found_in_document": [
+      "1",
+      "2",
+      "3",
+      "4"
+    ]
+  },
+  "caveat": "Item-level extraction is heuristic. Confidence `high` means the section is bounded by the next Item header; `medium` runs to end-of-document; `low` means only one Item header matched (likely a parsing miss).",
+  "schema_version": "1.0.0",
+  "cli_version": "0.1.0",
+  "cache": {
+    "calls": 0,
+    "hits": 0,
+    "misses": 0
+  }
+}

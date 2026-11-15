@@ -1,0 +1,36 @@
+{
+  "source_worktree": "/mnt/c/projects/edgar-cli-copilot-e1",
+  "files": [
+    {
+      "file": "edgar/items.py",
+      "before_sha256": "42b6cb64d89d193cfe0ca75569719a4efd743dac5a282c5d55368f0afd136e25",
+      "after_sha256": "2937a9395423eed72972531285cf8519ea513e65597667cf4e823778d8bf8571"
+    },
+    {
+      "file": "edgar/api.py",
+      "before_sha256": "96249239d25ff31570d50252acfd7b12692c534686544daf69e8e9345c13fe50",
+      "after_sha256": "3bc7983a26a96d2a8551016b7a22475dd97c682b88cabb08caace9cbf9b8c79f"
+    },
+    {
+      "file": "edgar/cli.py",
+      "before_sha256": "1d768ecca6165821e90905648bd463da271a162923078443d652a3939cbd468b",
+      "after_sha256": "93c8c27ef464417a27bf8fd52614e6e653372741e1465bad2635f99c745afa7a"
+    },
+    {
+      "file": "edgar/documents.py",
+      "before_sha256": null,
+      "after_sha256": "77091f7a5211d6da7a58368d696df4b04fee451b12dfd0dbd646b716edca56af"
+    },
+    {
+      "file": "tests/test_items.py",
+      "before_sha256": null,
+      "after_sha256": "12a2780c6f0890daaa0b9fa6f57f409a33dd266b4aa902cb802145f8fa4443de"
+    },
+    {
+      "file": "tests/test_documents.py",
+      "before_sha256": null,
+      "after_sha256": "98480c2dd3dc07c5be81669ea530194600442aad171b735a750a42e89c845df0"
+    }
+  ],
+  "preserved_original_newline_style": true
+}

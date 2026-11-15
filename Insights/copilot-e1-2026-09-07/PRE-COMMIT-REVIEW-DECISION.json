@@ -1,0 +1,103 @@
+{
+  "ok": true,
+  "code": "OK",
+  "errors": [],
+  "warnings": [],
+  "data": {
+    "dryRun": false,
+    "report": {
+      "schema_version": 1,
+      "event_id": "evt_e2b45d150bb24c51a0dc935991fc696c",
+      "task_id": "task_bedaa07777654b6a802397bda65b9606",
+      "type": "worker_report",
+      "state": "pending_verification",
+      "summary": "Runtime worker report from claude-sdk.",
+      "assignment_event_id": "evt_75210fc172f64a5aa7ec469d0f125129",
+      "local_result": "Runtime run run_8f3fa92eaa8c4b8b98b506e1767f651f ended with state completed.\nResult excerpt: No further reads needed — the diff regions and new tests are sufficient for a final verdict.\n\n# Final verdict on B1 repair\n\n**BLOCKERS: none.** The scoped repair addresses B1.\n\n**Static trace of `edgar/items.py` (new gate, `find_items`):**\n- Catalog Item 15 is now \"Exhibits and Financial Statement Schedules\"; the old comma caption is retained via `_TITLE_ALIASES`, consulted by both `_title_follows` (heading recognition) and `_resolve_item_key` (request alias). Both captions → `title_match=True` → strong candidate.\n- Unknown line-start captions (\"Market for **the** Registrant's…\", \"Condensed Consolidated Financial Statements (Unaudited)\") now pass as weak candidates (`title_matched=False`) because `conflicting_title` is false and `at_start` holds; they yield `low` confidence when targeted and still serve as boundaries for the preceding Item (14 → 15 test).\n- The Part I/II conflict property is preserved: for bare \"ITEM 2. UNREGISTERED SALES…\" with no PART header, `(\"I\",\"2\")` sees `(\"II\",\"2\")`'s title match → conflict → rejected; `(\"II\",\"2\")` accepted; request \"2\" → error, as tested. The subsequent `identity[0] not in (None, part or \"I\")` filter still keeps bare weak candidates out of Part II when Part is unknown.\n- No within-catalog title is a prefix of another (10-K and 10-Q catalogs are never mixed), so the broadened conflict scan cannot self-reject a correct heading.\n\n**Tests (`tests/test_items.py:101-130`):** the six new cases assert exactly the intended semantics — two Item 15 captions → `high`, two variants → `low` but extractable with a correct end boundary, Item 14 bounded by the variant Item 15, and the old-title request alias. Expected confidences agree with my trace.\n\n**Residual (unchanged from first report, non-blocking):** weak line-start cross-references (e.g., \"Item 1A of our Form 10-K…\") are now candidates, but the pick prefers any later title-matched heading and otherwise labels `low`, so this is honest rather than false-rigor. Optional follow-ups 1–8 stand.\n\n**Worker report:** files changed — none; commands — `git diff --stat`, `sed`/`grep` reads of the two files only; no tests, network, agents, UAF or Git mutation. Verifier limit: static reasoning; the 182-pass/2-skip run is the parent's evidence, not mine. Orchestrator verification still required: record the run, then commit.",
+      "needs_orchestrator_verification": true,
+      "runtime_run_id": "run_8f3fa92eaa8c4b8b98b506e1767f651f",
+      "dedupe_key": "runtime-worker-report:run_8f3fa92eaa8c4b8b98b506e1767f651f",
+      "commands_run": [
+        "uaf runtime report --run run_8f3fa92eaa8c4b8b98b506e1767f651f"
+      ],
+      "details": "runtime_run_id: run_8f3fa92eaa8c4b8b98b506e1767f651f\nruntime_adapter: claude-sdk\nruntime_state: completed\ncandidate_event_id: rtevt_5680b6b5134c422081f7d6b29d0c0172",
+      "created_at": "2026-09-07T04:46:54.971Z",
+      "mission_id": "mission_0e35d2c901c9417daee5a90144be86f6",
+      "launch_profile": "claude-edgar-review",
+      "profile_safety": "read_only_scan",
+      "profile_risk_accepted": false,
+      "requested_provider": "claude",
+      "resolved_model": "claude-fable-5-1",
+      "model_resolution": "provider_reported",
+      "effort_resolution": "default_unknown",
+      "artifact_refs": [
+        {
+          "path": ".uaf/runtime/runs/run_8f3fa92eaa8c4b8b98b506e1767f651f/artifacts/result.txt",
+          "sha256": "e86d752fd74f273a88e6753e6a4fc9f08bea4f30d8cb06713b08a4b538c2c735",
+          "size_bytes": 2366,
+          "media_type": "text/plain"
+        }
+      ],
+      "review_thread_id": "review_a932fcc527c2fd9de659b49f",
+      "review_iteration": 1
+    },
+    "bridged_response_artifact": null,
+    "reviewer_verdict": {
+      "schema_version": 1,
+      "event_id": "evt_5ae25fa182d84f1c9c77358dccf38d11",
+      "task_id": "task_bedaa07777654b6a802397bda65b9606",
+      "type": "reviewer_verdict",
+      "summary": "Claude same-session recheck reports BLOCKERS: none after B1 caption repair. Parent verified 182 tests passing with 2 optional original-filing skips on current main plus the six-file repair. Optional observations are recorded in CLI-ROUGH-EDGES.md for later work.",
+      "target_event_id": "evt_e2b45d150bb24c51a0dc935991fc696c",
+      "verdict": "approved",
+      "created_at": "2026-09-07T04:47:47.786Z",
+      "mission_id": "mission_0e35d2c901c9417daee5a90144be86f6",
+      "review_thread_id": "review_a932fcc527c2fd9de659b49f",
+      "review_iteration": 1
+    },
+    "orchestrator_decision": {
+      "schema_version": 1,
+      "event_id": "evt_cff64d670e4a45c6aa39c4407f909587",
+      "task_id": "task_bedaa07777654b6a802397bda65b9606",
+      "type": "orchestrator_decision",
+      "summary": "Claude same-session recheck reports BLOCKERS: none after B1 caption repair. Parent verified 182 tests passing with 2 optional original-filing skips on current main plus the six-file repair. Optional observations are recorded in CLI-ROUGH-EDGES.md for later work.",
+      "target_event_id": "evt_e2b45d150bb24c51a0dc935991fc696c",
+      "decision": "accepted",
+      "created_at": "2026-09-07T04:47:47.788Z",
+      "mission_id": "mission_0e35d2c901c9417daee5a90144be86f6",
+      "review_thread_id": "review_a932fcc527c2fd9de659b49f",
+      "review_iteration": 1
+    },
+    "abort_event": null,
+    "abort_already_satisfied": false,
+    "synthesis_source_citation_coverage": null,
+    "appended_events": [
+      {
+        "schema_version": 1,
+        "event_id": "evt_5ae25fa182d84f1c9c77358dccf38d11",
+        "task_id": "task_bedaa07777654b6a802397bda65b9606",
+        "type": "reviewer_verdict",
+        "summary": "Claude same-session recheck reports BLOCKERS: none after B1 caption repair. Parent verified 182 tests passing with 2 optional original-filing skips on current main plus the six-file repair. Optional observations are recorded in CLI-ROUGH-EDGES.md for later work.",
+        "target_event_id": "evt_e2b45d150bb24c51a0dc935991fc696c",
+        "verdict": "approved",
+        "created_at": "2026-09-07T04:47:47.786Z",
+        "mission_id": "mission_0e35d2c901c9417daee5a90144be86f6",
+        "review_thread_id": "review_a932fcc527c2fd9de659b49f",
+        "review_iteration": 1
+      },
+      {
+        "schema_version": 1,
+        "event_id": "evt_cff64d670e4a45c6aa39c4407f909587",
+        "task_id": "task_bedaa07777654b6a802397bda65b9606",
+        "type": "orchestrator_decision",
+        "summary": "Claude same-session recheck reports BLOCKERS: none after B1 caption repair. Parent verified 182 tests passing with 2 optional original-filing skips on current main plus the six-file repair. Optional observations are recorded in CLI-ROUGH-EDGES.md for later work.",
+        "target_event_id": "evt_e2b45d150bb24c51a0dc935991fc696c",
+        "decision": "accepted",
+        "created_at": "2026-09-07T04:47:47.788Z",
+        "mission_id": "mission_0e35d2c901c9417daee5a90144be86f6",
+        "review_thread_id": "review_a932fcc527c2fd9de659b49f",
+        "review_iteration": 1
+      }
+    ]
+  }
+}

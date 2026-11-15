@@ -1,0 +1,29 @@
+{
+  "head": "0d01c1cb72252f04095608dd7027aa358b105633",
+  "preexisting_status": " M .env.example\n M .gitignore\n M README.md\n M docs/BACKLOG.md\n M docs/definitions.md\n M edgar/__init__.py\n M edgar/__main__.py\n M edgar/api.py\n M edgar/cache.py\n M edgar/cli.py\n M edgar/compute.py\n M edgar/governance.py\n M edgar/holders.py\n M edgar/insiders.py\n M edgar/items.py\n M edgar/mirror.py\n M edgar/state.py\n M pyproject.toml\n M tests/conftest.py\n M tests/test_api.py\n M tests/test_cli.py\n",
+  "preexisting_file_sha256": {
+    ".env.example": "7287024acea5f3576b6255324b26c78d74bdb37316e0792bae0e0245087443c2",
+    ".gitignore": "89b621d56dde116180f12c66fe8b6e8edbf58653801b24be24d8f70de64c5447",
+    "README.md": "610718b8d71be3f4bed4f6e69b083d07e24e51484a74174a7a4c5e2f4131e926",
+    "docs/BACKLOG.md": "095835bb4c4261fbc7f7242c6149f5a8842e84895712c03a621418fc87978077",
+    "docs/definitions.md": "cd2a97931144d2851f856026c882c6b8fb861617943699ed0eef39df66eff730",
+    "edgar/__init__.py": "72dc60a3a30ca5cc9dfe176285a997009cf66d2ec63791fcc921660f0c1484fa",
+    "edgar/__main__.py": "00cebf49119373b5bdfe89b8836fb6cff7d1f048263477f32fdf5af699f8cc80",
+    "edgar/api.py": "96249239d25ff31570d50252acfd7b12692c534686544daf69e8e9345c13fe50",
+    "edgar/cache.py": "5519b9f43be044646f1f2a24e71fe114425e59cb7a46852cd6a7497cf7166655",
+    "edgar/cli.py": "1d768ecca6165821e90905648bd463da271a162923078443d652a3939cbd468b",
+    "edgar/compute.py": "790b652ea289940cf115d8277662fb15bbc528bb14c6501b68fad6578b23e4c2",
+    "edgar/governance.py": "0671b9770996b36cf543967827cd07a28d30c16efc1960a50ad067c4737afa98",
+    "edgar/holders.py": "59d5cc1e50c526f5cddc9f6376992295636b45c73bee39f8b62c1a92655f47ec",
+    "edgar/insiders.py": "d45212b3b53de1bc0999c58367983dcd8fcbe62ced4294f7c84985b9fa2b0f0e",
+    "edgar/items.py": "42b6cb64d89d193cfe0ca75569719a4efd743dac5a282c5d55368f0afd136e25",
+    "edgar/mirror.py": "f8b25c64251a07cc0bc42a756a22eb12202703a5119f12d9a1e45ea0f49b4431",
+    "edgar/state.py": "97faae48284b652897f4cd52ad10bfafdd7ac35311793b492d80d44d4b33f76f",
+    "pyproject.toml": "4822873cdfd4fbb65b04912a6910fa26ea2db92957b107013febaf905c483f94",
+    "tests/conftest.py": "0a77576169018be7679adf42ddd6a6600241a13e5192e39f7b5de2916ea030ae",
+    "tests/test_api.py": "f76f65b4a4a102a2a3773c42ce6b2131edc1c8ef9d403fc4d8e4930aa561d769",
+    "tests/test_cli.py": "3bc2945b3b35ea0dbc947a1b1390ccb789f60ba68969792af6c3794798474313"
+  },
+  "dependency_repo": "https://github.com/baba20o/research-cli-base",
+  "dependency_head": "c0f8dbfcf7da815c10742da5530f991575ec1f98"
+}

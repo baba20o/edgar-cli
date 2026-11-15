@@ -1,0 +1,45 @@
+{
+  "cik": "0001045810",
+  "ticker": "NVDA",
+  "name": "NVIDIA CORP",
+  "target": "fcf",
+  "period_type": "annual",
+  "as_of": "2026-09-06",
+  "metric": "fcf",
+  "value": 96676000000.0,
+  "formula": "OperatingCashFlow - CapEx",
+  "inputs": [
+    {
+      "label": "OperatingCashFlow",
+      "tag": "NetCashProvidedByUsedInOperatingActivities",
+      "val": 102718000000,
+      "unit": "USD",
+      "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000021/0001045810-26-000021-index.htm",
+      "as_of": "2026-01-25",
+      "fiscal_period": "FY2026",
+      "calendar_period": "CY2025",
+      "accession": "0001045810-26-000021"
+    },
+    {
+      "label": "CapEx",
+      "tag": "PaymentsToAcquireProductiveAssets",
+      "val": 6042000000,
+      "unit": "USD",
+      "source_url": "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000021/0001045810-26-000021-index.htm",
+      "as_of": "2026-01-25",
+      "fiscal_period": "FY2026",
+      "calendar_period": "CY2025",
+      "accession": "0001045810-26-000021"
+    }
+  ],
+  "caveats": [
+    "FCF capex scope: PP&E only; excludes acquisitions and capitalized software."
+  ],
+  "schema_version": "1.0.0",
+  "cli_version": "0.1.0",
+  "cache": {
+    "calls": 0,
+    "hits": 0,
+    "misses": 0
+  }
+}

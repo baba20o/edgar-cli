@@ -1,0 +1,69 @@
+{
+  "cik": "0001674101",
+  "ticker": "VRT",
+  "name": "Vertiv Holdings Co",
+  "entityType": "operating",
+  "sic": "3679",
+  "sicDescription": "Electronic Components, NEC",
+  "exchanges": [
+    "NYSE"
+  ],
+  "tickers": [
+    "VRT"
+  ],
+  "fiscalYearEnd": "1231",
+  "filings": [
+    {
+      "accessionNumber": "0001628280-26-050609",
+      "filingDate": "2026-07-29",
+      "reportDate": "2026-06-30",
+      "acceptanceDateTime": "2026-07-29T20:08:23.000Z",
+      "act": "34",
+      "form": "10-Q",
+      "fileNumber": "001-38518",
+      "filmNumber": "261217440",
+      "items": "",
+      "core_type": "XBRL",
+      "size": 8748106,
+      "isXBRL": 1,
+      "isInlineXBRL": 1,
+      "isXBRLNumeric": 1,
+      "primaryDocument": "vrt-20260630.htm",
+      "primaryDocDescription": "10-Q",
+      "filing_url": "https://www.sec.gov/Archives/edgar/data/1674101/000162828026050609/0001628280-26-050609-index.htm",
+      "primary_doc_url": "https://www.sec.gov/Archives/edgar/data/1674101/000162828026050609/vrt-20260630.htm"
+    },
+    {
+      "accessionNumber": "0001628280-26-026556",
+      "filingDate": "2026-04-22",
+      "reportDate": "2026-03-31",
+      "acceptanceDateTime": "2026-04-22T20:13:35.000Z",
+      "act": "34",
+      "form": "10-Q",
+      "fileNumber": "001-38518",
+      "filmNumber": "26883940",
+      "items": "",
+      "core_type": "XBRL",
+      "size": 7325502,
+      "isXBRL": 1,
+      "isInlineXBRL": 1,
+      "isXBRLNumeric": 1,
+      "primaryDocument": "vrt-20260331.htm",
+      "primaryDocDescription": "10-Q",
+      "filing_url": "https://www.sec.gov/Archives/edgar/data/1674101/000162828026026556/0001628280-26-026556-index.htm",
+      "primary_doc_url": "https://www.sec.gov/Archives/edgar/data/1674101/000162828026026556/vrt-20260331.htm"
+    }
+  ],
+  "total_recent": 2,
+  "history_limited": false,
+  "all_history": false,
+  "since_last_fetch": false,
+  "warning": "",
+  "schema_version": "1.0.0",
+  "cli_version": "0.1.0",
+  "cache": {
+    "calls": 0,
+    "hits": 0,
+    "misses": 0
+  }
+}

@@ -1,0 +1,428 @@
+{
+  "method": "Actual CLI subprocess python3 -m edgar. Canonical argv recorded. No application code modified. Default repository SEC User-Agent. Sequential calls; --no-cache when shown. Supplemental web research is separate.",
+  "calls": [
+    {
+      "label": "01-msft-filings",
+      "argv": [
+        "edgar",
+        "--no-cache",
+        "filings",
+        "MSFT",
+        "--form",
+        "10-K",
+        "--limit",
+        "2",
+        "--end-date",
+        "2026-09-06"
+      ],
+      "started_at_utc": "2026-09-07T02:16:30.469233+00:00",
+      "elapsed_seconds": 0.786,
+      "exit_code": 0,
+      "stdout": "01-msft-filings.json",
+      "stderr": "01-msft-filings.stderr.txt",
+      "json_parseable": true
+    },
+    {
+      "label": "02-nvda-filings",
+      "argv": [
+        "edgar",
+        "--no-cache",
+        "filings",
+        "NVDA",
+        "--form",
+        "10-Q",
+        "--limit",
+        "2",
+        "--end-date",
+        "2026-09-06"
+      ],
+      "started_at_utc": "2026-09-07T02:16:54.681557+00:00",
+      "elapsed_seconds": 0.526,
+      "exit_code": 0,
+      "stdout": "02-nvda-filings.json",
+      "stderr": "02-nvda-filings.stderr.txt",
+      "json_parseable": true
+    },
+    {
+      "label": "03-vrt-filings",
+      "argv": [
+        "edgar",
+        "--no-cache",
+        "filings",
+        "VRT",
+        "--form",
+        "10-Q",
+        "--limit",
+        "2",
+        "--end-date",
+        "2026-09-06"
+      ],
+      "started_at_utc": "2026-09-07T02:16:55.235825+00:00",
+      "elapsed_seconds": 0.572,
+      "exit_code": 0,
+      "stdout": "03-vrt-filings.json",
+      "stderr": "03-vrt-filings.stderr.txt",
+      "json_parseable": true
+    },
+    {
+      "label": "04-msft-capex",
+      "argv": [
+        "edgar",
+        "--no-cache",
+        "concept",
+        "MSFT",
+        "capex",
+        "--annual",
+        "--limit",
+        "3",
+        "--as-of",
+        "2026-09-06"
+      ],
+      "started_at_utc": "2026-09-07T02:16:55.837268+00:00",
+      "elapsed_seconds": 0.951,
+      "exit_code": 0,
+      "stdout": "04-msft-capex.json",
+      "stderr": "04-msft-capex.stderr.txt",
+      "json_parseable": true
+    },
+    {
+      "label": "05-msft-cash-statement",
+      "argv": [
+        "edgar",
+        "--no-cache",
+        "statements",
+        "MSFT",
+        "--statement",
+        "cash",
+        "--period-type",
+        "annual",
+        "--as-of",
+        "2026-09-06"
+      ],
+      "started_at_utc": "2026-09-07T02:16:56.815384+00:00",
+      "elapsed_seconds": 4.482,
+      "exit_code": 0,
+      "stdout": "05-msft-cash-statement.json",
+      "stderr": "05-msft-cash-statement.stderr.txt",
+      "json_parseable": true
+    },
+    {
+      "label": "06-msft-mda",
+      "argv": [
+        "edgar",
+        "--no-cache",
+        "item",
+        "MSFT",
+        "--form",
+        "10-K",
+        "--section",
+        "7",
+        "--as-of",
+        "2026-09-06",
+        "--max-chars",
+        "150000"
+      ],
+      "started_at_utc": "2026-09-07T02:17:15.691497+00:00",
+      "elapsed_seconds": 0.95,
+      "exit_code": 0,
+      "stdout": "06-msft-mda.json",
+      "stderr": "06-msft-mda.stderr.txt",
+      "json_parseable": true
+    },
+    {
+      "label": "07-nvda-mda",
+      "argv": [
+        "edgar",
+        "--no-cache",
+        "item",
+        "NVDA",
+        "--form",
+        "10-Q",
+        "--section",
+        "2",
+        "--as-of",
+        "2026-09-06",
+        "--max-chars",
+        "150000"
+      ],
+      "started_at_utc": "2026-09-07T02:17:16.670223+00:00",
+      "elapsed_seconds": 0.82,
+      "exit_code": 0,
+      "stdout": "07-nvda-mda.json",
+      "stderr": "07-nvda-mda.stderr.txt",
+      "json_parseable": true
+    },
+    {
+      "label": "08-vrt-earnings",
+      "argv": [
+        "edgar",
+        "--no-cache",
+        "earnings",
+        "VRT"
+      ],
+      "started_at_utc": "2026-09-07T02:17:17.517346+00:00",
+      "elapsed_seconds": 0.798,
+      "exit_code": 0,
+      "stdout": "08-vrt-earnings.json",
+      "stderr": "08-vrt-earnings.stderr.txt",
+      "json_parseable": true
+    },
+    {
+      "label": "09-vrt-revenue",
+      "argv": [
+        "edgar",
+        "--no-cache",
+        "concept",
+        "VRT",
+        "revenue",
+        "--quarterly",
+        "--limit",
+        "4",
+        "--as-of",
+        "2026-09-06"
+      ],
+      "started_at_utc": "2026-09-07T02:17:18.342934+00:00",
+      "elapsed_seconds": 2.193,
+      "exit_code": 0,
+      "stdout": "09-vrt-revenue.json",
+      "stderr": "09-vrt-revenue.stderr.txt",
+      "json_parseable": true
+    },
+    {
+      "label": "10-nvda-metrics",
+      "argv": [
+        "edgar",
+        "--no-cache",
+        "metrics",
+        "NVDA",
+        "--bundle",
+        "revenue,cash-flow"
+      ],
+      "started_at_utc": "2026-09-07T02:17:53.976237+00:00",
+      "elapsed_seconds": 2.252,
+      "exit_code": 0,
+      "stdout": "10-nvda-metrics.json",
+      "stderr": "10-nvda-metrics.stderr.txt",
+      "json_parseable": true
+    },
+    {
+      "label": "11-nvda-capex-ytd",
+      "argv": [
+        "edgar",
+        "--no-cache",
+        "concept",
+        "NVDA",
+        "capex",
+        "--ytd",
+        "--limit",
+        "2",
+        "--as-of",
+        "2026-09-06"
+      ],
+      "started_at_utc": "2026-09-07T02:17:56.255998+00:00",
+      "elapsed_seconds": 0.82,
+      "exit_code": 0,
+      "stdout": "11-nvda-capex-ytd.json",
+      "stderr": "11-nvda-capex-ytd.stderr.txt",
+      "json_parseable": true
+    },
+    {
+      "label": "12-msft-mda-markdown",
+      "argv": [
+        "edgar",
+        "--no-cache",
+        "item",
+        "MSFT",
+        "--form",
+        "10-K",
+        "--section",
+        "7",
+        "--as-of",
+        "2026-09-06",
+        "--max-chars",
+        "150000",
+        "--markdown"
+      ],
+      "started_at_utc": "2026-09-07T02:17:57.104104+00:00",
+      "elapsed_seconds": 0.885,
+      "exit_code": 0,
+      "stdout": "12-msft-mda-markdown.txt",
+      "stderr": "12-msft-mda-markdown.stderr.txt",
+      "json_parseable": false
+    },
+    {
+      "label": "13-nvda-financial-notes",
+      "argv": [
+        "edgar",
+        "--no-cache",
+        "item",
+        "NVDA",
+        "--form",
+        "10-Q",
+        "--section",
+        "1",
+        "--as-of",
+        "2026-09-06",
+        "--max-chars",
+        "150000"
+      ],
+      "started_at_utc": "2026-09-07T02:17:58.016804+00:00",
+      "elapsed_seconds": 0.831,
+      "exit_code": 0,
+      "stdout": "13-nvda-financial-notes.json",
+      "stderr": "13-nvda-financial-notes.stderr.txt",
+      "json_parseable": true
+    },
+    {
+      "label": "14-vrt-mda",
+      "argv": [
+        "edgar",
+        "--no-cache",
+        "item",
+        "VRT",
+        "--form",
+        "10-Q",
+        "--section",
+        "2",
+        "--as-of",
+        "2026-09-06",
+        "--max-chars",
+        "150000"
+      ],
+      "started_at_utc": "2026-09-07T02:17:58.873563+00:00",
+      "elapsed_seconds": 0.926,
+      "exit_code": 0,
+      "stdout": "14-vrt-mda.json",
+      "stderr": "14-vrt-mda.stderr.txt",
+      "json_parseable": true
+    },
+    {
+      "label": "15-msft-original",
+      "argv": [
+        "edgar",
+        "--no-cache",
+        "exhibits",
+        "0001193125-26-323660",
+        "--cik",
+        "789019",
+        "--type-filter",
+        "10-K",
+        "--download",
+        "Insights/ai-infrastructure-2026-09-06/documents/msft"
+      ],
+      "started_at_utc": "2026-09-07T02:18:27.800102+00:00",
+      "elapsed_seconds": 0.421,
+      "exit_code": 0,
+      "stdout": "15-msft-original.json",
+      "stderr": "15-msft-original.stderr.txt",
+      "json_parseable": true
+    },
+    {
+      "label": "16-vrt-original-release",
+      "argv": [
+        "edgar",
+        "--no-cache",
+        "exhibits",
+        "0001628280-26-050323",
+        "--cik",
+        "1674101",
+        "--type-filter",
+        "EX-99.1",
+        "--download",
+        "Insights/ai-infrastructure-2026-09-06/documents/vrt"
+      ],
+      "started_at_utc": "2026-09-07T02:18:28.246939+00:00",
+      "elapsed_seconds": 0.485,
+      "exit_code": 0,
+      "stdout": "16-vrt-original-release.json",
+      "stderr": "16-vrt-original-release.stderr.txt",
+      "json_parseable": true
+    },
+    {
+      "label": "17-vrt-business",
+      "argv": [
+        "edgar",
+        "--no-cache",
+        "item",
+        "VRT",
+        "--form",
+        "10-K",
+        "--section",
+        "1",
+        "--as-of",
+        "2026-09-06",
+        "--max-chars",
+        "150000"
+      ],
+      "started_at_utc": "2026-09-07T02:18:28.759446+00:00",
+      "elapsed_seconds": 0.844,
+      "exit_code": 0,
+      "stdout": "17-vrt-business.json",
+      "stderr": "17-vrt-business.stderr.txt",
+      "json_parseable": true
+    },
+    {
+      "label": "18-msft-fcf",
+      "argv": [
+        "edgar",
+        "--no-cache",
+        "reconstruct",
+        "MSFT",
+        "--metric",
+        "fcf",
+        "--period-type",
+        "annual",
+        "--as-of",
+        "2026-09-06"
+      ],
+      "started_at_utc": "2026-09-07T02:19:44.185004+00:00",
+      "elapsed_seconds": 0.9,
+      "exit_code": 0,
+      "stdout": "18-msft-fcf.json",
+      "stderr": "18-msft-fcf.stderr.txt",
+      "json_parseable": true
+    },
+    {
+      "label": "19-nvda-fcf",
+      "argv": [
+        "edgar",
+        "--no-cache",
+        "reconstruct",
+        "NVDA",
+        "--metric",
+        "fcf",
+        "--period-type",
+        "annual",
+        "--as-of",
+        "2026-09-06"
+      ],
+      "started_at_utc": "2026-09-07T02:19:45.112081+00:00",
+      "elapsed_seconds": 0.961,
+      "exit_code": 0,
+      "stdout": "19-nvda-fcf.json",
+      "stderr": "19-nvda-fcf.stderr.txt",
+      "json_parseable": true
+    },
+    {
+      "label": "20-nvda-ocf-ytd",
+      "argv": [
+        "edgar",
+        "--no-cache",
+        "concept",
+        "NVDA",
+        "operating_cash_flow",
+        "--ytd",
+        "--limit",
+        "1",
+        "--as-of",
+        "2026-09-06"
+      ],
+      "started_at_utc": "2026-09-07T02:19:46.099984+00:00",
+      "elapsed_seconds": 0.511,
+      "exit_code": 0,
+      "stdout": "20-nvda-ocf-ytd.json",
+      "stderr": "20-nvda-ocf-ytd.stderr.txt",
+      "json_parseable": true
+    }
+  ]
+}

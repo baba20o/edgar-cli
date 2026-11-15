@@ -1,0 +1,53 @@
+{
+  "cik": "0001674101",
+  "ticker": "VRT",
+  "name": "Vertiv Holdings Co",
+  "filing": {
+    "accession": "0001674101-26-000008",
+    "filed": "2026-02-13",
+    "form": "10-K",
+    "filing_url": "https://www.sec.gov/Archives/edgar/data/1674101/000167410126000008/0001674101-26-000008-index.htm"
+  },
+  "body_source": "live",
+  "body_length": 369540,
+  "section": {
+    "item": "1",
+    "title": "Business",
+    "text": "Item 1. Business Overview Vertiv is a global leader in critical digital infrastructure for applications in data centers, communication networks, and commercial and industrial environments. As businesses, industries, and communities become more connected, we pioneer and deliver end-to-end power and cooling technologies to help our customers stay resilient, optimized, and future-ready. With our industry-leading innovative technologies and global services network, we are fueling the revolution of the digital world \u2014 keeping technology ecosystems running efficiently and without interruption. We believe that Vertiv is supercharging data\u2019s potential; accelerating the pace of technology, raising the bar for accelerated compute and redefining the limits of densification. The world depends on data we power and cool\u2122. Our Company Our roots trace back to 1946 and the beginning of the information age, when Ralph Liebert founded the precursor to the Liebert Corporation, which was established in 1965 as the industry\u2019s first manufacturer of computer room air conditioning. In 1987, Liebert was acquired by Emerson Electric Co, which later formed its Network Power business in 2000 to integrate critical infrastructure technologies, including Liebert and previously acquired ASCO, a provider of power transfer switches, under one brand. Over the next decade, Emerson Network Power expanded through acquisitions of Avansys, Marconi\u2019s outside plant and power system; Knurr AG, a leading provider of enclosure systems; and Avocent, a leading provider of IT management software and keyboard, video and mouse (or \"KVM\") solutions. In 2016, Emerson Network Power was spun off as a standalone business and ultimately became \u2014 Vertiv. Vertiv became publicly-traded on February 7, 2020, with its shares listed on the New York Stock Exchange (NYSE:VRT), through a business combination with GS Acquisition Holdings Corp (\u201cGSAH\u201d), a special purpose acquisition company later renamed Vertiv Holdings Co (the \"Business Combination\"). Our Business Vertiv has the most complete portfolio of critical digital infrastructure offerings. We design, manufacture, sell, install, maintain, and service critical digital infrastructure technologies and rapidly deployable customized solutions to meet the specific business requirements and needs of a diverse group of customers. Vertiv leads with first-to-market designs engineered for next-gen rack-scale artificial intelligence (\"AI\") compute \u2014 enabling transformation and scale to stay multiple compute generations ahead. Our global footprint comprises engineering, manufacturing, operations, sales and service locations in more than 40 countries across the Americas, Asia Pacific and Europe, Middle East & Africa. We provide the hardware, software and services to facilitate an increasingly interconnected marketplace of digital systems, where large amounts of indispensable data need to be transmitted, analyzed, processed and stored. Whether this growing quantity of data is managed centrally in hyperscale/cloud locations, distributed at the edge of the network, processed in an enterprise location or managed via a hybrid platform, the underpinnings and operations of all those locations rely on our critical digital infrastructure and services. Our broad range of offerings includes AC and DC power management, thermal management, low/medium voltage switchgear, busbar, air cooled and liquid cooled thermal management products, integrated modular solutions, racks, single phase UPS, rack power distribution, rack thermal systems, configurable integrated solutions, energy storage solutions, hardware, software for managing IT equipment and services. These comprehensive offerings are integral to the reliable operation of technologies used to support applications that include AI, e-commerce, online banking, file sharing, video on-demand, energy storage, wireless communications, Internet of Things and online gaming. In addition, through our global services network, we provide lifecycle management services, predictive analytics and professional services for deploying, maintaining and optimizing these products and their related systems. Our most prominent brands include Vertiv, Liebert, NetSure, Geist, Energy Labs, ERS, Alb\u00e9r, and Avocent. We manage our business across three reportable segments based on our main geographic regions\u2014the Americas, Asia Pacific and Europe, Middle East & Africa. For the year ended December 31, 2025, Vertiv\u2019s net sales was $10,229.9, of which 62% was transacted in the Americas; 20% was transacted in Asia Pacific; and 18% was transacted in Europe, Middle East & Africa. This compares with net sales for the year ended December 31, 2024 of $8,011.8, of which 56% was transacted in the Americas, 22% was transacted in Asia Pacific, and 22% in Europe, Middle East & Africa. 6 Table of contents Backlog Vertiv\u2019s estimated combined order backlog was $15.0 billion and $7.2 billion as of December 31, 2025 and 2024, respectively, as continued strong demand has contributed to an increase in customer orders being placed in advance of our ability to fulfill them. The backlog consists of product and services for which a customer purchase order or purchase commitment has been received and which has not yet been delivered. Orders may be subject to cancellation or rescheduling by the customer. The majority of the combined backlog as of December 31, 2025 is considered firm and is expected to be shipped within the next 12 to 18 months. We do not believe that Vertiv\u2019s backlog estimates as of any date are necessarily indicative of our net sales for any future period. Additionally, our current backlog estimates are subject to a number of risks, as further detailed in \u201c",
+    "length": 5739,
+    "truncated_to_max_chars": false,
+    "confidence": "high",
+    "items_found_in_document": [
+      "1",
+      "1A",
+      "1B",
+      "1C",
+      "2",
+      "3",
+      "4",
+      "5",
+      "6",
+      "7",
+      "7A",
+      "8",
+      "9",
+      "9A",
+      "9B",
+      "10",
+      "11",
+      "12",
+      "13",
+      "14",
+      "15",
+      "16"
+    ]
+  },
+  "caveat": "Item-level extraction is heuristic. Confidence `high` means the section is bounded by the next Item header; `medium` runs to end-of-document; `low` means only one Item header matched (likely a parsing miss).",
+  "schema_version": "1.0.0",
+  "cli_version": "0.1.0",
+  "cache": {
+    "calls": 0,
+    "hits": 0,
+    "misses": 0
+  }
+}

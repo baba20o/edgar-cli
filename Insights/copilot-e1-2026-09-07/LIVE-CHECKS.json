@@ -1,0 +1,50 @@
+[
+  {
+    "label": "VRT-BUSINESS-LIVE",
+    "argv": [
+      "edgar",
+      "--no-cache",
+      "item",
+      "VRT",
+      "--form",
+      "10-K",
+      "--section",
+      "1",
+      "--as-of",
+      "2026-09-06",
+      "--max-chars",
+      "150000"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 1.28,
+    "summary": {
+      "length": 39355,
+      "confidence": "high",
+      "part": null,
+      "item": "1"
+    }
+  },
+  {
+    "label": "MSFT-DOWNLOAD-LIVE",
+    "argv": [
+      "edgar",
+      "--no-cache",
+      "exhibits",
+      "0001193125-26-323660",
+      "--cik",
+      "789019",
+      "--type-filter",
+      "10-K",
+      "--download",
+      "mission-input/msft-live"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 0.93,
+    "summary": {
+      "file": "mission-input/msft-live/msft-20260630.htm",
+      "bytes": 8585501,
+      "sha256": "4bcf2da2871acc19e32c5a62f36f6d83d6aae03cdc4aaa9a86a9a21ee8223f02",
+      "matches_original": true
+    }
+  }
+]

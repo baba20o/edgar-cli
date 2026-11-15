@@ -1,0 +1,281 @@
+{
+  "excludes": "this hash manifest",
+  "files": [
+    {
+      "file": "01-msft-filings.json",
+      "bytes": 2141,
+      "sha256": "5834356fa5719b546e5a1e950fccfdfc26f64d4a6dbda7c3edd302de09ad1e14"
+    },
+    {
+      "file": "01-msft-filings.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "02-nvda-filings.json",
+      "bytes": 2140,
+      "sha256": "2a2b8df6d5a4dd775b9720b4d775a7337d5bc41ee85b28e0baf2ac74660304fb"
+    },
+    {
+      "file": "02-nvda-filings.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "03-vrt-filings.json",
+      "bytes": 2016,
+      "sha256": "4c82bef67876c07d3b47488ff0b2da56965d8c3633a40467e8ec465dc0f2a5b0"
+    },
+    {
+      "file": "03-vrt-filings.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "04-msft-capex.json",
+      "bytes": 3537,
+      "sha256": "919da2cc9e7f008e5c2514d95e1f103e972ae9481a34ea6e6dfb7a7e91f29d91"
+    },
+    {
+      "file": "04-msft-capex.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "05-msft-cash-statement.json",
+      "bytes": 4977,
+      "sha256": "d4ad2f84ca60305394f795ede0ccfd18e4b6a8a69ba0a1b26a42100fbe16ec31"
+    },
+    {
+      "file": "05-msft-cash-statement.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "06-msft-mda.json",
+      "bytes": 43320,
+      "sha256": "f8d6e0f1184ed763f13f27a8bd3cf61114a5136a2b1689b8ee2b993762525ed3"
+    },
+    {
+      "file": "06-msft-mda.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "07-nvda-mda.json",
+      "bytes": 35231,
+      "sha256": "e4ac416d05f3d92e21e189171bbadf903fb03755e8aefd94f082742d6d76bbaa"
+    },
+    {
+      "file": "07-nvda-mda.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "08-vrt-earnings.json",
+      "bytes": 4579,
+      "sha256": "a6476c62445d94f4f7d273aa3aede99af93108577c55e4db9073c570816d8076"
+    },
+    {
+      "file": "08-vrt-earnings.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "09-vrt-revenue.json",
+      "bytes": 4660,
+      "sha256": "3cc7a5afb5c62b237ba369bd0255b2af0eb093d8c5ff897cc751f226caa742bd"
+    },
+    {
+      "file": "09-vrt-revenue.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "10-nvda-metrics.json",
+      "bytes": 3700,
+      "sha256": "497f64e58e57bb15de9fe2fc66dd7beb31b2eab52d0d606c1e17bf55f9f9708a"
+    },
+    {
+      "file": "10-nvda-metrics.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "11-nvda-capex-ytd.json",
+      "bytes": 2440,
+      "sha256": "bbc6694a071daae61dce546c8c377432b82805720ef767a5a8e8afb374cc5559"
+    },
+    {
+      "file": "11-nvda-capex-ytd.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "12-msft-mda-markdown.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "12-msft-mda-markdown.txt",
+      "bytes": 3410,
+      "sha256": "92ee107065e2fe41168dbf2df59b8bc087cc6efe10641ee7123804572b3b4b6c"
+    },
+    {
+      "file": "13-nvda-financial-notes.json",
+      "bytes": 42479,
+      "sha256": "97d589558dfd8f47284e2567f73ab05c2bd9a59fe73e20d52664cc9a0dc05714"
+    },
+    {
+      "file": "13-nvda-financial-notes.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "14-vrt-mda.json",
+      "bytes": 1829,
+      "sha256": "d834dec8e20f24488d59cd680333caa4b9e8a018d888e95eaa78223ac6ef01bc"
+    },
+    {
+      "file": "14-vrt-mda.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "15-msft-original.json",
+      "bytes": 665,
+      "sha256": "0165608f6fa1531f39148122c23bcf4e08cca61bec575947de84749add426d2d"
+    },
+    {
+      "file": "15-msft-original.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "16-vrt-original-release.json",
+      "bytes": 700,
+      "sha256": "d4cded5141b85c86da75df6ccb0aeaf5bb2d8d61c43cba97edc70dfa74847352"
+    },
+    {
+      "file": "16-vrt-original-release.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "17-vrt-business.json",
+      "bytes": 6969,
+      "sha256": "62039aa006e6b8253b2f6a0848299bd650c2e9bc68f2b4d7d878ed18d674e267"
+    },
+    {
+      "file": "17-vrt-business.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "18-msft-fcf.json",
+      "bytes": 1290,
+      "sha256": "b72eb0da2ed0fe6e9847c0734d64f300ce4e6db52719acb73326b0e81bc9e982"
+    },
+    {
+      "file": "18-msft-fcf.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "19-nvda-fcf.json",
+      "bytes": 1278,
+      "sha256": "2e16d699812bd275e8e26c5947e057801a2fdf0fcc9ee528385ec2d4a1b5f4fc"
+    },
+    {
+      "file": "19-nvda-fcf.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "20-nvda-ocf-ytd.json",
+      "bytes": 1653,
+      "sha256": "1f0cc6758c171ee9f6964084a7f7c5dc9c56a687f2d0f830172346484d7d424f"
+    },
+    {
+      "file": "20-nvda-ocf-ytd.stderr.txt",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "file": "BASELINE.json",
+      "bytes": 2581,
+      "sha256": "1f9a49cf72fa4f4ad3cf18490f04a02bf952dfa03e02fc1adb6d80e6af1439c3"
+    },
+    {
+      "file": "DOCUMENTS.json",
+      "bytes": 1864,
+      "sha256": "88e79af4515fa0d256aba1362e637d5075c0fbb3408a0534e039fee8f22f4616"
+    },
+    {
+      "file": "FINDINGS.md",
+      "bytes": 10314,
+      "sha256": "e109589ba9f6537f676871827115791a72759de48204d019c9497cd044c1217d"
+    },
+    {
+      "file": "MANIFEST.json",
+      "bytes": 10203,
+      "sha256": "7b6fd31a1bb87a463ce1ac7d8eecae0dbac2a06b3ccf586d87bec2da2ced6d3d"
+    },
+    {
+      "file": "VALIDATION.json",
+      "bytes": 1396,
+      "sha256": "3e4652627a15c36e6e0fb40e40b2e6e9699d685ea93a806038037a6d4893cee9"
+    },
+    {
+      "file": "capture_cli.py",
+      "bytes": 1981,
+      "sha256": "c7f556c8d87d93f1841b396e55c758a8c07e90dea326b01a2a3848182ddc3286"
+    },
+    {
+      "file": "capture_supplemental.py",
+      "bytes": 1707,
+      "sha256": "e6bd956b2c5ab42c9faf0b12dca8ebd998e9065b3b1906397523071bb18beedf"
+    },
+    {
+      "file": "documents/msft/msft-20260630.htm iXBRL",
+      "bytes": 6356,
+      "sha256": "c154b0c606e928280771b4baa5f4177d293bfac8cdb70a6f005792b8fbe6fdf9"
+    },
+    {
+      "file": "documents/msft-direct.html",
+      "bytes": 8585501,
+      "sha256": "4bcf2da2871acc19e32c5a62f36f6d83d6aae03cdc4aaa9a86a9a21ee8223f02"
+    },
+    {
+      "file": "documents/msft-direct.txt",
+      "bytes": 358790,
+      "sha256": "8fd41e80c0b84efed5ea1e3861f9b1615d1ee7c5a1169ad0d615d7753b51086c"
+    },
+    {
+      "file": "documents/nvda-direct.html",
+      "bytes": 1517047,
+      "sha256": "e2634e509c241c5f45e3f6c115dc38a85645e5fdbee760b4a04f5e9035f6f7a9"
+    },
+    {
+      "file": "documents/nvda-direct.txt",
+      "bytes": 175489,
+      "sha256": "adb5b358bbdd6a8e86cbecdfdf49efb9b87d4579a5259ee7052f1be5fca0b096"
+    },
+    {
+      "file": "documents/vrt/q22026exhibit991vrt07292026.htm",
+      "bytes": 692759,
+      "sha256": "d4d0a061a46d88b421ca10cf7d176adb19db3e56af3b053098d07cf3bb41f8bc"
+    },
+    {
+      "file": "documents/vrt-direct.html",
+      "bytes": 1517952,
+      "sha256": "9346a7542ba74f5a8f841365e837d45f4bd25c790be0a4da7b4b5807c3e0024d"
+    },
+    {
+      "file": "documents/vrt-direct.txt",
+      "bytes": 159066,
+      "sha256": "282b6fc5ba301ef693ce40284a1e05a8e52834b082890ca7499ec80fca1f99ec"
+    }
+  ],
+  "rough_edges_sha256": "4372bdae67d548079807e077c89de9d98ae890abd2697a8659708e886a1dd8bf"
+}
