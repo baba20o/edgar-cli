@@ -14,6 +14,9 @@ Set SEC_USER_AGENT to an organization/contact string.
 from __future__ import annotations
 
 import logging
+import threading
+from copy import copy
+from contextvars import ContextVar
 import os
 import re
 import sqlite3
@@ -43,6 +46,8 @@ from edgar import insiders as insiders_mod
 from edgar import items as items_mod
 from edgar.cache import EdgarCache, ttl_for_url
 from edgar.documents import normalize_sec_document_url, sec_document_name
+from edgar.forensics_api import ForensicsMixin
+from edgar.point_in_time import point_in_time, filter_payload
 from edgar.state import StateStore
 from edgar import mirror as mirror_mod
 
@@ -64,7 +69,7 @@ COMPANY_TICKERS_URL = f"{SEC_BASE_URL}/files/company_tickers_exchange.json"
 # submissions gain latest_periodic_report and newest_xbrl_filing; new
 # commands `text` and `dilution`; `--compact` on company/filings/brief.
 # `events` and `insiders` now exit 2 when they have nothing to return.
-SCHEMA_VERSION = "1.2.0"
+SCHEMA_VERSION = "1.3.0"
 
 DEFAULT_CACHE_TTL = 900
 DEFAULT_RATE_LIMIT_INTERVAL = 0.2
@@ -260,6 +265,10 @@ COMMON_CONCEPT_CANDIDATES = {
     ],
 }
 
+from edgar.ifrs import append_ifrs_candidates
+
+append_ifrs_candidates(COMMON_CONCEPT_CANDIDATES)
+
 COMMON_CONCEPTS = {
     alias: candidates[0] for alias, candidates in COMMON_CONCEPT_CANDIDATES.items()
 }
@@ -426,7 +435,7 @@ def get_client(use_cache: bool = True, cache_max_mb: Optional[int] = None) -> "E
     return EdgarClient(edgar_cache=cache, rate_limiter=rate_limiter, use_cache=use_cache)
 
 
-class EdgarClient(BaseAPIClient):
+class EdgarClient(ForensicsMixin, BaseAPIClient):
     """SEC EDGAR public data client."""
 
     BASE_URL = DATA_BASE_URL
@@ -443,6 +452,13 @@ class EdgarClient(BaseAPIClient):
         self.use_cache = bool(use_cache_flag and edgar_cache is not None)
         self._cache_calls: list[dict] = []
         self._fiscal_grids: dict[str, list[tuple]] = {}
+        self._pit_cutoff = ContextVar("edgar_cutoff", default=None)
+        self._pit_warnings = ContextVar("edgar_cutoff_warnings", default=None)
+        self._pit_submissions = {}
+        self._request_memo = None
+        self._facts_snapshot = None
+        self._io_locks = {}
+        self._io_locks_guard = threading.Lock()
 
     def _build_headers(self) -> dict[str, str]:
         return {
@@ -463,8 +479,8 @@ class EdgarClient(BaseAPIClient):
     def _record_cache(self, meta: dict) -> None:
         self._cache_calls.append(meta)
 
-    def _summarize_cache(self) -> dict:
-        calls = list(self._cache_calls)
+    def _summarize_cache(self, start: int = 0) -> dict:
+        calls = list(self._cache_calls[start:])
         hits = [c for c in calls if c.get("hit")]
         ages = [c["age_seconds"] for c in hits if c.get("age_seconds") is not None]
         ttls = [c["ttl_remaining"] for c in hits if c.get("ttl_remaining") is not None]
@@ -497,12 +513,48 @@ class EdgarClient(BaseAPIClient):
             wrapped[key] = value
         return wrapped
 
-    def _get(self, path: str, params: Optional[dict] = None,
+    def _key_lock(self, key):
+        with self._io_locks_guard:
+            return self._io_locks.setdefault(key, threading.RLock())
+
+    def _get(self, path: str, params: Optional[dict] = None, skip_cache: bool = False) -> dict:
+        match = re.search(r"/companyconcept/CIK(\d{10})/([^/]+)/([^/]+)\.json$", path)
+        snapshot = self._facts_snapshot
+        if match and snapshot and match.group(1) == snapshot.get("cik"):
+            taxonomy, tag = match.group(2), match.group(3)
+            concept = snapshot["data"].get("facts", {}).get(taxonomy, {}).get(tag)
+            self._record_cache({"key": path, "hit": True, "bundled_companyfacts": True})
+            if concept is None:
+                return {"error": f"404 No {taxonomy}:{tag} in companyfacts snapshot"}
+            payload = {**concept, "cik": match.group(1), "taxonomy": taxonomy, "tag": tag,
+                       "entityName": snapshot["data"].get("entityName", "")}
+        else:
+            payload = self._get_uncut(path, params=params, skip_cache=skip_cache)
+        cutoff = self._pit_cutoff.get()
+        return filter_payload(self, path, payload, cutoff) if cutoff else payload
+
+    def _get_uncut(self, path: str, params: Optional[dict] = None, skip_cache: bool = False) -> dict:
+        memo = self._request_memo if self.use_cache and not skip_cache else None
+        if memo is None:
+            return self._request_json(path, params=params, skip_cache=skip_cache)
+        key = (path, repr(sorted((params or {}).items())))
+        with self._key_lock(("json", key)):
+            if key in memo:
+                self._record_cache({"key": path, "hit": True, "request_memo": True})
+                return memo[key]
+            result = self._request_json(path, params=params, skip_cache=skip_cache)
+            if "error" not in result:
+                memo[key] = result
+            return result
+
+    def _request_json(self, path: str, params: Optional[dict] = None,
              skip_cache: bool = False) -> dict:
         """GET with EdgarCache, conditional headers, negative caching, and meta tracking."""
         url = path if path.startswith("http") else f"{self.BASE_URL}{path}"
         cache = self.edgar_cache if (self.use_cache and not skip_cache) else None
 
+        if cache is None:
+            self._record_cache({"key": url, "hit": False, "bypassed": True})
         if cache is not None:
             payload, meta = cache.get_with_meta(url, params)
             if meta.get("hit"):
@@ -548,6 +600,7 @@ class EdgarClient(BaseAPIClient):
                     return meta["stale_payload"]
 
                 if resp.status_code == 429:
+                    last_error = f"429 rate limited: {url}"
                     wait = retry_wait_seconds(attempt, resp)
                     log.warning("429 rate limited, waiting %.1fs (attempt %d)", wait, attempt)
                     time.sleep(wait)
@@ -589,25 +642,30 @@ class EdgarClient(BaseAPIClient):
                     time.sleep(retry_wait_seconds(attempt))
                     continue
 
+        if cache is not None:
+            self._record_cache({"key": cache._key(url, params), "hit": False})
         error = self._default_error()
         error["error"] = f"Failed after {self.max_retries + 1} attempts: {last_error}"
         return error
 
     def _get_text(self, url: str) -> str:
-        """GET text/HTML with the same session, headers, limiter, and timeout."""
-        if self.rate_limiter:
-            self.rate_limiter.acquire()
-        response = self.session.get(url, timeout=self.request_timeout)
-        response.raise_for_status()
-        return response.text
+        """GET cached text/HTML with the shared limiter and transport telemetry."""
+        from edgar.transport import fetch_document
+        content, encoding = fetch_document(self, url)
+        try:
+            return content.decode(encoding, errors="replace")
+        except LookupError:
+            return content.decode("utf-8", errors="replace")
+
+    def _get_filing_text(self, url: str) -> str:
+        """Get normalized filing text, cached by source content and parser version."""
+        from edgar.transport import rendered_document
+        return rendered_document(self, url, self._get_text(url))
 
     def _get_bytes(self, url: str) -> bytes:
-        """GET bytes with the same session, headers, limiter, and timeout."""
-        if self.rate_limiter:
-            self.rate_limiter.acquire()
-        response = self.session.get(url, timeout=self.request_timeout)
-        response.raise_for_status()
-        return response.content
+        """GET cached exact bytes through the same document representation."""
+        from edgar.transport import fetch_document
+        return fetch_document(self, url)[0]
 
     def companies(self) -> dict:
         """Return ticker/CIK/company/exchange mappings."""
@@ -691,11 +749,13 @@ class EdgarClient(BaseAPIClient):
         choices = ", ".join(f"{c['ticker']} ({c['cik']})" for c in companies[:5])
         return {"error": f"Ambiguous company identifier {identifier}; matches: {choices}"}
 
+    @point_in_time
     def submissions(self, identifier: str | int, limit: int = 20, form: Optional[str] = None,
                     start_date: Optional[str] = None, end_date: Optional[str] = None,
                     all_history: bool = False, since_last_fetch: bool = False,
                     state_store: Optional["StateStore"] = None,
-                    form_class: Optional[str] = None) -> dict:
+                    form_class: Optional[str] = None,
+                    as_of: Optional[str] = None) -> dict:
         """Return company submission metadata and recent filings."""
         company = self.resolve_company(identifier)
         if "error" in company:
@@ -705,6 +765,9 @@ class EdgarClient(BaseAPIClient):
         result = self._get(f"/submissions/CIK{cik}.json")
         if "error" in result:
             return result
+
+        if as_of and since_last_fetch:
+            return {"error": "Cannot combine as-of replay with since-last-fetch state mutation"}
 
         if since_last_fetch and state_store is not None:
             high_water = state_store.get_high_water(cik, form)
@@ -794,6 +857,9 @@ class EdgarClient(BaseAPIClient):
             "ticker": company.get("ticker", ""),
             "name": result.get("name") or company.get("name", ""),
             "entityType": result.get("entityType", ""),
+            "state_of_incorporation": result.get("stateOfIncorporation", ""),
+            "state_of_incorporation_description": result.get("stateOfIncorporationDescription", ""),
+            "filer_category": result.get("category", ""),
             "sic": result.get("sic", ""),
             "sicDescription": result.get("sicDescription", ""),
             "exchanges": result.get("exchanges", []),
@@ -809,8 +875,10 @@ class EdgarClient(BaseAPIClient):
             "warning": warning,
         }
 
+    @point_in_time
     def company_facts(self, identifier: str | int, taxonomy: Optional[str] = None,
-                      tag_filter: Optional[str] = None, limit: int = 50) -> dict:
+                      tag_filter: Optional[str] = None, limit: int = 50,
+                      as_of: Optional[str] = None) -> dict:
         """Return summarized XBRL concepts available for one company."""
         company = self.resolve_company(identifier)
         if "error" in company:
@@ -918,6 +986,7 @@ class EdgarClient(BaseAPIClient):
         self._fiscal_grids[cik] = grid
         return grid
 
+    @point_in_time
     def company_concept(self, identifier: str | int, taxonomy: str, tag: str,
                         unit: Optional[str] = None, limit: int = 20,
                         suggest_on_404: bool = True,
@@ -963,7 +1032,7 @@ class EdgarClient(BaseAPIClient):
                 enrich_fact_metadata(item, company["cik"], fiscal_grid=fiscal_grid)
                 if period_type and item.get("period_type") != period_type:
                     continue
-                if as_of and item.get("filed", "") > as_of:
+                if as_of and not self._pit_cutoff.get() and item.get("filed", "") > as_of:
                     continue
                 if since and item.get("filed", "") < since:
                     continue
@@ -988,6 +1057,7 @@ class EdgarClient(BaseAPIClient):
             "restated_facts_in_window": restated_count,
         }
 
+    @point_in_time
     def company_concept_alias(self, identifier: str | int, concept: str,
                               unit: Optional[str] = None, limit: int = 20,
                               period_type: Optional[str] = None,
@@ -1033,7 +1103,7 @@ class EdgarClient(BaseAPIClient):
                 sources.append({"taxonomy": r.get("taxonomy"), "tag": r.get("tag"),
                                 "label": r.get("label", ""), "fact_count": len(r.get("facts", []))})
                 for fact in r.get("facts", []):
-                    key3 = (fact.get("start", ""), fact.get("end", ""), fact.get("accn", ""))
+                    key3 = (fact.get("start", ""), fact.get("end", ""), fact.get("accn", ""), fact.get("unit", ""))
                     if key3 in seen:
                         continue
                     item = dict(fact)
@@ -1481,10 +1551,12 @@ class EdgarClient(BaseAPIClient):
             }
         return {"error": "No recent Item 2.02 earnings 8-K found", "filings": result.get("filings", [])}
 
+    @point_in_time
     def events(self, identifier: str | int, limit: int = 20,
                since_last_fetch: bool = False,
                state_store: Optional["StateStore"] = None,
-               read_exhibits: bool = True) -> dict:
+               read_exhibits: bool = True,
+               as_of: Optional[str] = None) -> dict:
         """Detect notable recent events from current reports: 8-K and 6-K.
 
         Domestic filers report events on Form 8-K, classified from the item
@@ -1521,28 +1593,7 @@ class EdgarClient(BaseAPIClient):
             if form.upper().startswith("6-K"):
                 events.append(self._classify_6k_filing(result["cik"], filing, read_exhibits))
                 continue
-            event_types = event_types_from_items(filing.get("items", ""))
-            snippets = {}
-            try:
-                text = html_to_text(self._get_text(filing.get("primary_doc_url", "")))
-            except Exception:
-                text = ""
-            for event_type, keywords in EVENT_KEYWORDS.items():
-                snippet = first_snippet(text, keywords)
-                if snippet:
-                    event_types.add(event_type)
-                    snippets[event_type] = snippet
-            if event_types:
-                events.append(alias_filing_row({
-                    "filingDate": filing.get("filingDate", ""),
-                    "acceptanceDateTime": filing.get("acceptanceDateTime", ""),
-                    "form": form,
-                    "items": filing.get("items", ""),
-                    "accessionNumber": filing.get("accessionNumber", ""),
-                    "filing_url": filing.get("filing_url", ""),
-                    "event_types": sorted(event_types),
-                    "snippets": snippets,
-                }))
+            events.append(self._classify_8k_filing(result["cik"], filing, read_exhibits))
         out = {
             "cik": result["cik"], "name": result["name"],
             "events": events, "total": len(events),
@@ -1554,6 +1605,41 @@ class EdgarClient(BaseAPIClient):
                                                   since_last_fetch)
             out["forms_filed"] = self._form_counts(result["cik"])
         return out
+
+    def _classify_8k_filing(self, cik: str, filing: dict, read_exhibits: bool = True) -> dict:
+        from edgar.events_classifier import classify_8k
+        row = dict(filing)
+        document = filing.get("primaryDocument", "")
+        source_url = filing.get("primary_doc_url", "")
+        document_type = filing.get("form", "8-K")
+        try:
+            text = self._get_filing_text(source_url)
+        except Exception as exc:
+            text = ""
+            row["fetch_error"] = str(exc)
+        parsed = classify_8k(text, filing.get("items", ""))
+        if read_exhibits and "fetch_error" not in row and parsed["needs_exhibit"]:
+            docs = self.filing_documents(cik, filing.get("accessionNumber", ""))
+            for doc in docs.get("documents", []):
+                if (not doc.get("type", "").upper().startswith("EX-99")
+                        or not doc.get("document", "").lower().endswith((".htm", ".html", ".txt"))
+                        or _number_or_zero(doc.get("size")) > MAX_EVENT_EXHIBIT_BYTES):
+                    continue
+                try:
+                    exhibit = self._get_filing_text(doc["url"])
+                    candidate = classify_8k(exhibit[:EVENT_EXHIBIT_LEAD_CHARS], filing.get("items", ""))
+                    if candidate["snippets"]:
+                        parsed = candidate
+                        parsed["classified_from"] = "exhibit"
+                        document, document_type, source_url = doc["document"], doc["type"], doc["url"]
+                except Exception as exc:
+                    row["exhibit_error"] = str(exc)
+                break
+        row.update(parsed)
+        row["event_types"] = parsed["event_types"] or ["other"]
+        row.update(evidence_document=document, evidence_document_type=document_type,
+                   evidence_source_url=source_url)
+        return alias_filing_row(row)
 
     def _classify_6k_filing(self, cik: str, filing: dict, read_exhibits: bool = True) -> dict:
         """Classify one 6-K from its text; fall back to its first EX-99 exhibit."""
@@ -1569,7 +1655,7 @@ class EdgarClient(BaseAPIClient):
         document = filing.get("primaryDocument", "")
         document_type = filing.get("form", "")
         try:
-            text = filing_text.document_to_text(self._get_text(filing.get("primary_doc_url", "")))
+            text = self._get_filing_text(filing.get("primary_doc_url", ""))
             parsed = sixk.classify_6k(text)
         except Exception as exc:
             parsed = sixk.classify_6k("")
@@ -1586,7 +1672,7 @@ class EdgarClient(BaseAPIClient):
                 if _number_or_zero(doc.get("size")) > MAX_EVENT_EXHIBIT_BYTES:
                     continue
                 try:
-                    exhibit_text = filing_text.document_to_text(self._get_text(doc["url"]))
+                    exhibit_text = self._get_filing_text(doc["url"])
                 except Exception:
                     break
                 # A release leads with its news: classify the opening only, so
@@ -1645,7 +1731,9 @@ class EdgarClient(BaseAPIClient):
                 f"Use `edgar filings {identifier} --form FORM` to list one form and "
                 "`edgar text` to read a filing.")
 
-    def dashboard(self, identifier: str | int) -> dict:
+    @point_in_time
+    def dashboard(self, identifier: str | int,
+                  as_of: Optional[str] = None) -> dict:
         """One-call composite: profile + key metrics + recent events + earnings + quality.
 
         Composes the existing primitives so an agent can get the full state of
@@ -1778,6 +1866,7 @@ class EdgarClient(BaseAPIClient):
             **summary,
         }
 
+    @point_in_time
     def filing_section(self, identifier: str | int, form: str = "10-K",
                        section: str = "Risk Factors",
                        as_of: Optional[str] = None,
@@ -1801,7 +1890,7 @@ class EdgarClient(BaseAPIClient):
         cik = company["cik"]
         # Pick the latest filing of the requested form.
         result = self.submissions(identifier, form=form, limit=10,
-                                   end_date=as_of)
+                                   end_date=None if self._pit_cutoff.get() else as_of)
         if "error" in result:
             return result
         filings = result.get("filings", [])
@@ -1874,6 +1963,7 @@ class EdgarClient(BaseAPIClient):
                        "identity or structure is weak, including flattened text."),
         }
 
+    @point_in_time
     def filing_text(self, identifier: Optional[str | int] = None,
                     accession_or_url: Optional[str] = None,
                     cik: Optional[str] = None, form: Optional[str] = None,
@@ -1946,7 +2036,7 @@ class EdgarClient(BaseAPIClient):
                 documents.append(entry)
                 continue
             try:
-                text = filing_text.document_to_text(self._get_text(row["url"]))
+                text = self._get_filing_text(row["url"])
             except Exception as exc:
                 entry["error"] = f"Could not fetch document: {exc}"
                 documents.append(entry)
@@ -1990,8 +2080,10 @@ class EdgarClient(BaseAPIClient):
                            f"`edgar exhibits {accession} --cik {int(resolved_cik)}`.")
         return out
 
+    @point_in_time
     def dilution(self, identifier: str | int, since: Optional[str] = None,
-                 max_filings: int = 25, max_supplements: int = 3) -> dict:
+                 max_filings: int = 25, max_supplements: int = 3,
+                 as_of: Optional[str] = None, include_periodic: bool = False, include_shelf: bool = False) -> dict:
         """Gather what bears on one filer's share supply, each figure sourced.
 
         Reads the filer's current reports (6-K / 8-K) and prospectus
@@ -2028,7 +2120,24 @@ class EdgarClient(BaseAPIClient):
                                      if r.get("form", "").upper().startswith("424B")])
         current = _newest_first([r for r in in_window
                                  if r.get("form", "").upper() in CURRENT_REPORT_FORMS])
-        to_read = _newest_first(supplements[:max_supplements] + current[:max_filings])
+        from edgar import registrations
+        withdrawals = _newest_first([r for r in in_window if r.get("form", "").upper() in registrations.WITHDRAWAL_FORMS])
+        to_read = supplements[:max_supplements] + current[:max_filings] + withdrawals[:10]
+        periodic_accessions = set()
+        shelf_accessions = set()
+        if include_periodic:
+            periodic = _newest_first([r for r in rows if r.get("form", "").upper().split("/")[0] in {"10-K", "10-Q", "20-F", "40-F"}])[:1]
+            to_read.extend(periodic)
+            periodic_accessions = {r["accessionNumber"] for r in periodic}
+        if include_shelf:
+            for shelf in registrations.aggregate(rows, []):
+                if shelf["supplements"] or shelf["status"] == "withdrawn":
+                    continue
+                candidates = _newest_first([r for r in rows if r.get("fileNumber") == shelf["file_number"]
+                    and r.get("form", "").upper().split("/")[0] in REGISTRATION_FORMS])
+                if candidates:
+                    to_read.append(candidates[0]); shelf_accessions.add(candidates[0]["accessionNumber"])
+        to_read = _newest_first(list({r["accessionNumber"]: r for r in to_read}.values()))
 
         statements: list[dict] = []
         filings_read: list[dict] = []
@@ -2039,7 +2148,7 @@ class EdgarClient(BaseAPIClient):
                      "filed": row.get("filingDate", ""),
                      "document": row.get("primaryDocument", "")}
             try:
-                text = filing_text.document_to_text(self._get_text(row.get("primary_doc_url", "")))
+                text = self._get_filing_text(row.get("primary_doc_url", ""))
             except Exception as exc:
                 entry["error"] = f"Could not fetch document: {exc}"
                 filings_read.append(entry)
@@ -2049,7 +2158,18 @@ class EdgarClient(BaseAPIClient):
                              for s in filing_text._split_paragraph(block)]
             else:
                 sentences = filing_text.split_sentences(text)
-            found = dilution_mod.extract_statements(sentences, prospectus=prospectus)
+            if entry["accession"] in periodic_accessions:
+                sentences = [sentence for sentence in sentences if re.search(
+                    r"warrant|stockholders?|shareholders?|equity|subsequent event|liquidity|going concern|"
+                    r"at.the.market|issued.{0,100}shares|cash (?:used|provided)|substantial doubt", sentence, re.I)]
+                entry["scan_scope"] = "periodic financing, equity, warrant and liquidity sentences"
+            shelf_cover = entry["accession"] in shelf_accessions
+            if shelf_cover:
+                sentences = sentences[:dilution_mod.PROSPECTUS_COVER_SENTENCES]
+                entry["scan_scope"] = "registration cover: first 60 sentences"
+            found = dilution_mod.extract_statements(sentences, prospectus=prospectus, shelf=shelf_cover)
+            if form.upper() in registrations.WITHDRAWAL_FORMS or form.upper() == "POS AM":
+                found.extend(registrations.withdrawal_statements(sentences, form=form))
             for statement in found:
                 statement.update({
                     "accession": entry["accession"], "form": form, "filed": entry["filed"],
@@ -2068,7 +2188,8 @@ class EdgarClient(BaseAPIClient):
         shares = sorted(_topic("shares_outstanding"),
                         key=lambda s: (s.get("as_of") or s["filed"], s["acceptance_datetime"]),
                         reverse=True)
-        latest_shares = next((s for s in shares if s.get("basis") != "after_offering"), None)
+        from edgar.share_supply import select_latest_shares, share_count_warnings
+        latest_shares = select_latest_shares(shares)
         offerings = _topic("offering")
         program_kinds = {"equity_line", "atm"}
         read_accessions = {entry["accession"] for entry in filings_read if "error" not in entry}
@@ -2099,9 +2220,14 @@ class EdgarClient(BaseAPIClient):
             "warrants": _topic("warrants"),
             "reverse_splits": _topic("reverse_split"),
             "going_concern": _topic("going_concern"),
+            "agents": _topic("agent"),
+            "shelf_capacity": _topic("shelf_capacity"),
+            "registration_status_evidence": _topic("registration_status"),
+            "include_periodic": include_periodic, "include_shelf": include_shelf,
             "filings_read": filings_read,
             "filings_not_read": {
                 "current_reports": max(0, len(current) - max_filings),
+                **({"withdrawal_requests": max(0, len(withdrawals) - 10)} if withdrawals else {}),
                 "prospectus_supplements": max(0, len(supplements) - max_supplements),
             },
             "method": ("Text heuristics over the filer's current reports and prospectus "
@@ -2110,6 +2236,9 @@ class EdgarClient(BaseAPIClient):
                        "stated on their date and are not adjusted for later splits. A "
                        "section can be incomplete; nothing in it is inferred."),
         }
+        warnings = share_count_warnings(latest_shares, out["xbrl_shares_outstanding"], out["reverse_splits"])
+        if warnings:
+            out["warnings"] = warnings
         if not statements and not out["shelf_registrations"]:
             counts = self._form_counts(cik, since=since)
             top = ", ".join(f"{f} ({c})" for f, c in list(counts.items())[:8])
@@ -2130,6 +2259,7 @@ class EdgarClient(BaseAPIClient):
             "accession": fact.get("accession") or fact.get("accn", ""),
             "form": fact.get("form", ""), "filed": fact.get("filed", ""),
             "source": "XBRL dei:EntityCommonStockSharesOutstanding",
+            "source_url": fact.get("source_url") or fact.get("filing_url", ""),
         }
         later = sorted(
             s.get("effective_date") or s["filed"] for s in statements
@@ -2143,40 +2273,8 @@ class EdgarClient(BaseAPIClient):
 
     @staticmethod
     def _shelf_registrations(rows: list[dict], statements: list[dict]) -> list[dict]:
-        """Registration statements grouped by SEC file number, with the EFFECT
-        notice and the prospectus supplements filed under each."""
-        shelves: dict[str, dict] = {}
-        for row in sorted(rows, key=lambda r: r.get("filingDate", "")):
-            form = row.get("form", "").upper()
-            number = row.get("fileNumber", "")
-            base = form.split("/")[0]
-            if not number or base not in REGISTRATION_FORMS:
-                continue
-            ref = {"form": row.get("form", ""), "accession": row.get("accessionNumber", ""),
-                   "filed": row.get("filingDate", "")}
-            shelf = shelves.setdefault(number, {
-                "file_number": number, "form": base, "shelf": base in SHELF_FORMS,
-                "filed": ref["filed"], "accession": ref["accession"],
-                "amendments": [], "effective": None, "supplements": [], "capacity": [],
-            })
-            if ref["accession"] != shelf["accession"]:
-                shelf["amendments"].append(ref)
-        for row in sorted(rows, key=lambda r: r.get("filingDate", "")):
-            form = row.get("form", "").upper()
-            shelf = shelves.get(row.get("fileNumber", ""))
-            if not shelf:
-                continue
-            ref = {"form": row.get("form", ""), "accession": row.get("accessionNumber", ""),
-                   "filed": row.get("filingDate", "")}
-            if form == "EFFECT":
-                shelf["effective"] = {"date": ref["filed"], "accession": ref["accession"]}
-            elif form.startswith("424B"):
-                shelf["supplements"].append(ref)
-        for statement in statements:
-            shelf = shelves.get(statement.get("file_number", ""))
-            if shelf and statement["topic"] == "shelf_capacity":
-                shelf["capacity"].append(statement)
-        return sorted(shelves.values(), key=lambda s: s["filed"], reverse=True)
+        from edgar.registrations import aggregate
+        return aggregate(rows, statements)
 
     def _resolve_filing(self, identifier: Optional[str | int], accession_or_url: Optional[str],
                         cik: Optional[str], form: Optional[str], as_of: Optional[str]) -> dict:
@@ -2209,12 +2307,18 @@ class EdgarClient(BaseAPIClient):
         if "error" not in raw:
             name = raw.get("name") or name
             rows = self._recent_filings(raw, limit=100000, form=None if accession else form,
-                                        end_date=None if accession else as_of)
+                                        end_date=None if accession or self._pit_cutoff.get() else as_of)
         elif not accession:
             return raw
 
+        cutoff = self._pit_cutoff.get()
+        if cutoff:
+            from edgar.point_in_time import available
+            rows = [row for row in rows if available(row, cutoff)]
         if accession:
             match = next((row for row in rows if row.get("accessionNumber") == accession), None)
+            if match is None and as_of:
+                return {"error": "No filing with proven availability at the requested as-of cutoff", "documents": []}
             if match is None:
                 # Older than SEC's recent filing set (or the list is unavailable):
                 # the filing index still resolves from CIK + accession.
@@ -2435,8 +2539,10 @@ class EdgarClient(BaseAPIClient):
                        "share counts before relying on cross-filer totals."),
         }
 
+    @point_in_time
     def insiders(self, identifier: str | int, since: Optional[str] = None,
-                 limit: int = 50, max_form4_fetches: int = 50) -> dict:
+                 limit: int = 50, max_form4_fetches: int = 50,
+                 as_of: Optional[str] = None) -> dict:
         """Aggregate insider ownership filings (Forms 4, 5 and 3) for a filer.
 
         Walks recent Form 4 and Form 5 filings, fetches the primary XML for
@@ -2496,6 +2602,8 @@ class EdgarClient(BaseAPIClient):
                     "is_officer": owner.get("is_officer", False),
                     "filed": filing.get("filingDate", ""),
                     "accession": filing.get("accessionNumber", ""),
+                    "acceptance_datetime": filing.get("acceptanceDateTime", ""),
+                    "source_url": raw_url,
                 }
                 if form == "3":
                     initial_statements.append({
@@ -2551,6 +2659,7 @@ class EdgarClient(BaseAPIClient):
         return (f"No insider ownership forms (3, 4, 5, 144){window}. "
                 + (f"This filer files: {top}." if top else "This filer has no recent filings."))
 
+    @point_in_time
     def quality(self, identifier: str | int, period_type: str = "annual",
                 as_of: Optional[str] = None) -> dict:
         """Earnings-quality and balance-sheet-quality flags.
@@ -2689,6 +2798,7 @@ class EdgarClient(BaseAPIClient):
             "flagged_count": flagged_count,
         }
 
+    @point_in_time
     def verify(self, identifier: str | int, period_type: str = "annual",
                as_of: Optional[str] = None) -> dict:
         """Cross-statement consistency checks.
@@ -2770,6 +2880,7 @@ class EdgarClient(BaseAPIClient):
             "total": len(checks),
         }
 
+    @point_in_time
     def statement(self, identifier: str | int, statement: str = "income",
                   period_type: str = "annual", as_of: Optional[str] = None) -> dict:
         """Compose a normalized financial statement (income/balance/cash flow).
@@ -3172,9 +3283,11 @@ class EdgarClient(BaseAPIClient):
             "exchange": company.get("exchange", ""),
         }
 
+    @point_in_time
     def explain_concept(self, identifier: str | int, concept: str,
                         unit: Optional[str] = None,
-                        period_type: Optional[str] = None) -> dict:
+                        period_type: Optional[str] = None,
+                        as_of: Optional[str] = None) -> dict:
         """Trace concept-alias resolution: candidates tried, freshness scores, winner."""
         candidates = concept_alias_candidates(concept, unit=unit)
         trials = []
@@ -3206,6 +3319,7 @@ class EdgarClient(BaseAPIClient):
             "winner": winner,
         }
 
+    @point_in_time
     def diff_concept(self, identifier_a: str, identifier_b: str, concept: str,
                      period_type: str = "annual", periods: int = 4,
                      as_of: Optional[str] = None) -> dict:
@@ -3497,6 +3611,7 @@ class EdgarClient(BaseAPIClient):
             )
         return best
 
+    @point_in_time
     def ttm(self, identifier: str | int, bundle: Optional[list[str]] = None,
             as_of: Optional[str] = None) -> dict:
         """Compute trailing-twelve-months for a bundle of canonical metrics.
@@ -3611,6 +3726,7 @@ class EdgarClient(BaseAPIClient):
             return None
         return compute.ttm_from_stub_period(annual, current_ytd, prior_ytd)
 
+    @point_in_time
     def ratios(self, identifier: str | int, period_type: str = "annual",
                as_of: Optional[str] = None) -> dict:
         """Compute the canonical ratio set for one company at one period kind."""
@@ -3694,6 +3810,7 @@ class EdgarClient(BaseAPIClient):
             "alignment_warnings": alignment_warnings,
         }
 
+    @point_in_time
     def trend(self, identifier: str | int, metric: str, periods: int = 8,
               period_type: str = "quarterly", as_of: Optional[str] = None) -> dict:
         """Multi-period trend on a metric: facts list + slope + categorical label."""
@@ -3718,6 +3835,7 @@ class EdgarClient(BaseAPIClient):
             "summary": summary,
         }
 
+    @point_in_time
     def growth(self, identifier: str | int, metric: str,
                basis: Optional[list[str]] = None, period_type: str = "annual",
                periods: int = 8, as_of: Optional[str] = None) -> dict:
@@ -3786,6 +3904,7 @@ class EdgarClient(BaseAPIClient):
                 })
         return out
 
+    @point_in_time
     def reconstruct(self, identifier: str | int, target: str, period_type: str = "annual",
                     as_of: Optional[str] = None) -> dict:
         """Reconstruct a derived line item not directly tagged by SEC."""
@@ -3837,6 +3956,7 @@ class EdgarClient(BaseAPIClient):
             **envelope,
         }
 
+    @point_in_time
     def compare_concept(self, identifiers: list[str], concept: str, taxonomy: Optional[str] = None,
                         unit: Optional[str] = None, periods: int = 4,
                         period_type: Optional[str] = None,
@@ -3905,7 +4025,9 @@ class EdgarClient(BaseAPIClient):
             "companies": companies,
         }
 
-    def metrics(self, identifier: str | int, bundle: Optional[list[str]] = None) -> dict:
+    @point_in_time
+    def metrics(self, identifier: str | int, bundle: Optional[list[str]] = None,
+                as_of: Optional[str] = None) -> dict:
         """Return a bundle of canonical metrics for one company."""
         profile = self.submissions(identifier, limit=5)
         if "error" in profile:
@@ -4006,7 +4128,9 @@ class EdgarClient(BaseAPIClient):
             "newest_fact_filed": newest_fact_filed,
         }
 
-    def brief(self, identifier: str | int) -> dict:
+    @point_in_time
+    def brief(self, identifier: str | int,
+              as_of: Optional[str] = None) -> dict:
         """Build a compact company brief."""
         profile = self.submissions(identifier, limit=5)
         if "error" in profile:
@@ -4603,21 +4727,8 @@ def first_snippet(text: str, keywords: list[str], width: int = 260) -> str:
 
 
 def event_types_from_items(items: str) -> set[str]:
-    event_types = set()
-    item_set = {item.strip() for item in (items or "").split(",") if item.strip()}
-    if "2.02" in item_set:
-        event_types.add("earnings")
-    if "2.01" in item_set or "5.01" in item_set:
-        event_types.add("merger")
-    if "2.03" in item_set:
-        event_types.add("debt")
-    if "3.01" in item_set:
-        event_types.add("delisting")
-    if "5.02" in item_set:
-        event_types.add("leadership")
-    if "5.03" in item_set or "3.03" in item_set:
-        event_types.add("capitalization")
-    return event_types
+    from edgar.events_classifier import event_types_from_items as classify_items
+    return classify_items(items)
 
 
 def extract_earnings_highlights(text: str) -> list[dict]:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sys
 import webbrowser
 from pathlib import Path
@@ -121,14 +122,22 @@ def _validate_date_option(ctx, param, value):
         return value
     from datetime import datetime
     try:
+        if param.name == "as_of":
+            from edgar.point_in_time import parse_cutoff
+            return parse_cutoff(value).normalized
         datetime.strptime(value, "%Y-%m-%d")
     except (ValueError, TypeError):
-        raise click.BadParameter(f"{value!r} is not a valid YYYY-MM-DD date", param=param)
+        raise click.BadParameter(f"{value!r} is not a valid YYYY-MM-DD date or timezone-aware as-of timestamp", param=param)
     return value
 
 
 PositiveInt = click.IntRange(min=1)
 PositiveOrZeroInt = click.IntRange(min=0)
+
+
+def as_of_option(fn):
+    return click.option("--as-of", default=None, callback=_validate_date_option,
+                        help="SEC availability cutoff: YYYY-MM-DD or ISO timestamp with timezone")(fn)
 
 
 def _format_citation(row: dict, ticker: str = "", name: str = "") -> str:
@@ -202,6 +211,9 @@ def _finalize_batch(client, results: list, key: str = "results", cite: bool = Fa
     if cite:
         results = [_add_citations(r) if isinstance(r, dict) else r for r in results]
     payload = {key: results}
+    cutoffs = {r.get("as_of") for r in results if isinstance(r, dict) and r.get("as_of")}
+    if len(cutoffs) == 1:
+        payload["as_of"] = next(iter(cutoffs))
     envelope = getattr(client, "_envelope", None)
     return envelope(payload) if envelope else payload
 
@@ -489,9 +501,10 @@ def search_companies(ctx, query, limit, markdown, json_output, ndjson):
 @compact_option
 @since_last_fetch_option
 @output_options
+@as_of_option
 @click.pass_context
 def company(ctx, identifier, limit, form_type, start_date, end_date, all_history, show_urls,
-            form_class_flag, cite, compact, since_last_fetch, markdown, json_output, ndjson):
+            form_class_flag, cite, compact, since_last_fetch, markdown, json_output, ndjson, as_of):
     """Show company profile and recent filings for a ticker or CIK."""
     client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
     state_store = StateStore() if since_last_fetch else None
@@ -499,7 +512,7 @@ def company(ctx, identifier, limit, form_type, start_date, end_date, all_history
         identifier, limit=limit, form=form_type, start_date=start_date,
         end_date=end_date, all_history=all_history,
         since_last_fetch=since_last_fetch, state_store=state_store,
-        form_class=form_class_flag,
+        form_class=form_class_flag, **({"as_of": as_of} if as_of else {}),
     )
     result = _compact(_finalize(client, result, cite=cite), compact and _machine_output(json_output, markdown, ndjson))
     _output_company(result, json_output, markdown, ndjson, show_urls=show_urls)
@@ -523,9 +536,10 @@ def company(ctx, identifier, limit, form_type, start_date, end_date, all_history
 @compact_option
 @since_last_fetch_option
 @output_options
+@as_of_option
 @click.pass_context
 def filings(ctx, identifier, limit, form_type, start_date, end_date, all_history, show_urls,
-            form_class_flag, cite, compact, since_last_fetch, markdown, json_output, ndjson):
+            form_class_flag, cite, compact, since_last_fetch, markdown, json_output, ndjson, as_of):
     """Show recent filings for a ticker or CIK."""
     client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
     state_store = StateStore() if since_last_fetch else None
@@ -533,7 +547,7 @@ def filings(ctx, identifier, limit, form_type, start_date, end_date, all_history
         identifier, limit=limit, form=form_type, start_date=start_date,
         end_date=end_date, all_history=all_history,
         since_last_fetch=since_last_fetch, state_store=state_store,
-        form_class=form_class_flag,
+        form_class=form_class_flag, **({"as_of": as_of} if as_of else {}),
     )
     result = _compact(_finalize(client, result, cite=cite), compact and _machine_output(json_output, markdown, ndjson))
     _output_filings(result, f"Recent Filings: {identifier}", json_output, markdown, ndjson, show_urls=show_urls)
@@ -615,6 +629,7 @@ def concept(ctx, args, unit, limit, deltas, annual, quarterly, ytd, instant,
         if explain and len(terms) == 1:
             result["_explain"] = client.explain_concept(
                 identifier, terms[0], unit=unit, period_type=period_type,
+                **({"as_of": as_of} if as_of else {}),
             )
         results.append(result)
     if len(results) == 1 and not batch_mode:
@@ -712,12 +727,13 @@ def earnings(ctx, identifier, cite, markdown, json_output, ndjson):
 @click.option("--limit", "-n", default=20, show_default=True, type=PositiveInt,
               help="Recent current reports (8-K and 6-K) to inspect")
 @click.option("--no-exhibits", is_flag=True,
-              help="Never read a 6-K's EX-99 exhibit when its own text classifies nothing")
+              help="Never read EX-99 fallback exhibits for 8-K or 6-K reports")
 @cite_option
 @since_last_fetch_option
 @output_options
+@as_of_option
 @click.pass_context
-def events(ctx, identifier, limit, no_exhibits, cite, since_last_fetch, markdown, json_output, ndjson):
+def events(ctx, identifier, limit, no_exhibits, cite, since_last_fetch, markdown, json_output, ndjson, as_of):
     """Detect notable recent events from 8-K and 6-K current reports.
 
     8-Ks are classified from their item numbers and keywords. 6-Ks (foreign
@@ -730,7 +746,7 @@ def events(ctx, identifier, limit, no_exhibits, cite, since_last_fetch, markdown
     result = client.events(
         identifier, limit=limit,
         since_last_fetch=since_last_fetch, state_store=state_store,
-        read_exhibits=not no_exhibits,
+        read_exhibits=not no_exhibits, **({"as_of": as_of} if as_of else {}),
     )
     result = _finalize(client, result, cite=cite)
     _output_events(result, json_output, markdown, ndjson)
@@ -773,8 +789,9 @@ def compare(ctx, identifiers, concept, taxonomy, unit, periods, annual, quarterl
 @batch_options
 @cite_option
 @output_options
+@as_of_option
 @click.pass_context
-def metrics(ctx, identifier, bundle, tickers, input_file, batch, cite, markdown, json_output, ndjson):
+def metrics(ctx, identifier, bundle, tickers, input_file, batch, cite, markdown, json_output, ndjson, as_of):
     """Return a bundled canonical metric set for one company.
 
     `--bundle` accepts comma-separated alias names AND named bundle groups:
@@ -795,7 +812,7 @@ def metrics(ctx, identifier, bundle, tickers, input_file, batch, cite, markdown,
     client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
     results = []
     for value in identifiers:
-        result = client.metrics(value, labels)
+        result = client.metrics(value, labels, **({"as_of": as_of} if as_of else {}))
         result.setdefault("identifier", value)
         results.append(result)
     if len(results) == 1 and not (tickers or input_file or batch):
@@ -813,14 +830,15 @@ def metrics(ctx, identifier, bundle, tickers, input_file, batch, cite, markdown,
 @cite_option
 @compact_option
 @output_options
+@as_of_option
 @click.pass_context
-def brief(ctx, identifier, tickers, input_file, batch, cite, compact, markdown, json_output, ndjson):
+def brief(ctx, identifier, tickers, input_file, batch, cite, compact, markdown, json_output, ndjson, as_of):
     """Build a compact company brief."""
     identifiers = _collect_identifiers(identifier, tickers, input_file, batch)
     client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
     results = []
     for value in identifiers:
-        result = client.brief(value)
+        result = client.brief(value, **({"as_of": as_of} if as_of else {}))
         result.setdefault("identifier", value)
         results.append(result)
     if len(results) == 1 and not (tickers or input_file or batch):
@@ -1324,6 +1342,9 @@ PRIMARY_ROW_KEYS: dict = {
     "item": None,
     "text": "documents",
     "dilution": None,
+    "float": None,
+    "forensics": None,
+    "feed": "filings",
     "holdings": "rows",
     "holders": "rows",
     "insiders": "transactions",
@@ -1541,6 +1562,20 @@ def _output_schemas() -> dict:
             },
         },
     }
+    for name, required, properties in (
+        ("float", ["shares_outstanding", "beneficial_owners", "insider_holdings"],
+         {"shares_outstanding": {"type": "object"}, "stated_non_affiliate_shares": {"type": "object"},
+          "entity_public_float": {"type": ["object", "null"]}, "pending_unclosed_shares": {"type": "array"},
+          "beneficial_owners": {"type": "array"}, "insider_holdings": {"type": "array"}}),
+        ("forensics", ["entity", "share_supply", "shelves_and_capacity", "financial_distress", "recent_catalysts_and_risks"],
+         {"entity": {"type": "object"}, "share_supply": {"type": "object"},
+          "shelves_and_capacity": {"type": "object"}, "warrant_overhang": {"type": "object"},
+          "financial_distress": {"type": "object"}, "recent_catalysts_and_risks": {"type": "array"},
+          "coverage": {"type": "object"}, "performance": {"type": "object"}}),
+        ("feed", ["filings", "coverage"], {"filings": {"type": "array", "items": {"type": "object", "required": ["accession", "cik", "form", "acceptance_datetime", "filing_url"]}}, "coverage": {"type": "object"}}),
+    ):
+        schemas[name] = {"type": "object", "required": required,
+                         "properties": {**envelope_meta, **properties, "as_of": {"type": "string"}, "warnings": {"type": "array"}}}
     for command, row_key in PRIMARY_ROW_KEYS.items():
         if command in schemas:
             schemas[command]["primary_row_key"] = row_key
@@ -1556,6 +1591,116 @@ def _output_schemas() -> dict:
             "coarse": True,
         }
     return schemas
+
+
+def _output_research(result, json_output, markdown, ndjson):
+    _error_exit(result)
+    if ndjson:
+        _ndjson([result])
+    elif markdown:
+        click.echo("```json\n" + json.dumps(result, indent=2, default=str) + "\n```")
+    else:
+        _json(result)
+
+
+def _validate_price_option(ctx, param, value):
+    if value is not None and not math.isfinite(value):
+        raise click.BadParameter("must be a finite positive price", ctx=ctx, param=param)
+    return value
+
+
+def research_options(fn):
+    fn = click.option("--max-filings", default=10, type=PositiveInt, show_default=True)(fn)
+    fn = click.option("--max-supplements", default=3, type=PositiveOrZeroInt, show_default=True)(fn)
+    fn = click.option("--max-ownership-filings", default=5, type=PositiveOrZeroInt, show_default=True)(fn)
+    fn = click.option("--include-periodic", is_flag=True)(fn)
+    fn = click.option("--include-shelf", is_flag=True)(fn)
+    return fn
+
+
+@main.command("float")
+@click.argument("identifier")
+@click.option("--price", type=click.FloatRange(min=0, min_open=True), default=None, callback=_validate_price_option,
+              help="Caller price scenario in USD; no market-price verification")
+@as_of_option
+@research_options
+@output_options
+@click.pass_context
+def float_cmd(ctx, identifier, price, as_of, max_filings, max_supplements,
+              max_ownership_filings, include_periodic, include_shelf, markdown, json_output, ndjson):
+    """Dated share-supply and ownership evidence, without inferred tradable float."""
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.float(identifier, price=price, as_of=as_of, max_filings=max_filings,
+                          max_supplements=max_supplements, max_ownership_filings=max_ownership_filings,
+                          include_periodic=include_periodic, include_shelf=include_shelf)
+    _output_research(_finalize(client, result), json_output, markdown, ndjson)
+
+
+@main.command("forensics")
+@click.argument("identifier")
+@click.option("--price", type=click.FloatRange(min=0, min_open=True), default=None, callback=_validate_price_option,
+              help="Caller price scenario in USD")
+@click.option("--high-60d", type=click.FloatRange(min=0, min_open=True), default=None, callback=_validate_price_option,
+              help="Caller-supplied 60-day reference price scenario in USD")
+@as_of_option
+@research_options
+@output_options
+@click.pass_context
+def forensics_cmd(ctx, identifier, price, high_60d, as_of, max_filings, max_supplements,
+                  max_ownership_filings, include_periodic, include_shelf, markdown, json_output, ndjson):
+    """Combine share supply, financing capacity, distress and filing catalysts."""
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    result = client.forensics(identifier, price=price, high_60d=high_60d, as_of=as_of,
+                              max_filings=max_filings, max_supplements=max_supplements,
+                              max_ownership_filings=max_ownership_filings,
+                              include_periodic=include_periodic, include_shelf=include_shelf)
+    _output_research(_finalize(client, result), json_output, markdown, ndjson)
+
+
+@main.command("feed")
+@click.option("--forms", default="8-K,6-K,424B5,S-3,F-3,S-1,F-1,EFFECT,RW", show_default=True)
+@click.option("--since-minutes", default=15, type=PositiveInt, show_default=True)
+@click.option("--max-pages", default=10, type=click.IntRange(1, 100), show_default=True)
+@click.option("--use-state", is_flag=True, help="Acknowledge complete output to the global feed cursor")
+@click.option("--reset-state", is_flag=True, help="With --use-state, discard this form scope's cursor before polling; older gaps may be lost")
+@output_options
+@click.pass_context
+def feed_cmd(ctx, forms, since_minutes, max_pages, use_state, reset_state, markdown, json_output, ndjson):
+    """Poll the bounded SEC recent-filings Atom window across all issuers."""
+    from edgar.feed import ack_feed, reset_feed_cursor
+    if reset_state and not use_state:
+        raise click.UsageError("--reset-state requires --use-state")
+    client = get_client(use_cache=not ctx.obj["no_cache"], cache_max_mb=ctx.obj.get("cache_max_mb"))
+    state = StateStore() if use_state else None
+    reset = None
+    if reset_state:
+        try:
+            reset = reset_feed_cursor(forms, state_store=state)
+        except (OSError, ValueError, TypeError) as exc:
+            _error_exit({"error": f"Could not reset feed cursor: {exc}"})
+    result = _finalize(client, client.feed(forms=forms, since_minutes=since_minutes,
+                                          max_pages=max_pages, use_state=use_state, state_store=state))
+    if reset is not None:
+        result["state_reset"] = reset
+        result.setdefault("warnings", []).append(reset["warning"])
+    _error_exit(result)
+    if ndjson:
+        _ndjson(result.get("filings", []))
+        _echo_warnings(result, False, False, True)
+        # Row streams cannot carry the envelope's bounded-coverage disclosure.
+        if result.get("coverage") and not result["coverage"].get("complete", False):
+            click.echo("Feed coverage is incomplete; the delivery cursor was not advanced.", err=True)
+    elif markdown:
+        click.echo(_markdown_table(["Accepted (UTC)", "Ticker", "Form", "Accession"], [
+            [r.get("acceptance_datetime", ""), r.get("ticker", ""), r.get("form", ""), r.get("accession", "")]
+            for r in result.get("filings", [])]))
+        _echo_warnings(result, False, True, False)
+    else:
+        _json(result)
+    sys.stdout.flush()
+    if use_state:
+        ack_feed(result, state_store=state)
+    _exit_if_no_data(result, "filings")
 
 
 @main.command()
@@ -1678,12 +1823,13 @@ def search(ctx, query, db_path, form, since, until, tickers, mode, limit,
 @main.command()
 @click.argument("identifier")
 @output_options
+@as_of_option
 @click.pass_context
-def dashboard(ctx, identifier, markdown, json_output, ndjson):
+def dashboard(ctx, identifier, markdown, json_output, ndjson, as_of):
     """One-call composite snapshot: profile + metrics + ratios + events + quality."""
     client = get_client(use_cache=not ctx.obj["no_cache"],
                        cache_max_mb=ctx.obj.get("cache_max_mb"))
-    result = client.dashboard(identifier)
+    result = client.dashboard(identifier, **({"as_of": as_of} if as_of else {}))
     result = _finalize(client, result)
     _error_exit(result)
     if ndjson:
@@ -1868,6 +2014,7 @@ _DILUTION_SECTIONS = [
     ("warrants", "Warrants"),
     ("reverse_splits", "Reverse splits"),
     ("going_concern", "Going concern"),
+    ("agents", "Placement and sales agents"),
 ]
 
 
@@ -1879,9 +2026,12 @@ _DILUTION_SECTIONS = [
               help="Most recent current reports (6-K, 8-K) to read")
 @click.option("--max-supplements", default=3, show_default=True, type=PositiveOrZeroInt,
               help="Most recent prospectus supplements (424B) to read")
+@click.option("--include-periodic", is_flag=True, help="Read the latest periodic report's financing/equity/liquidity sentences")
+@click.option("--include-shelf", is_flag=True, help="Read registration covers without prospectus supplements")
 @output_options
+@as_of_option
 @click.pass_context
-def dilution(ctx, identifier, since, max_filings, max_supplements, markdown, json_output, ndjson):
+def dilution(ctx, identifier, since, max_filings, max_supplements, markdown, json_output, ndjson, as_of, include_periodic, include_shelf):
     """Gather what bears on share supply, every figure with its source sentence.
 
     Sections: stated shares outstanding, shelf registrations (effectiveness,
@@ -1895,7 +2045,10 @@ def dilution(ctx, identifier, since, max_filings, max_supplements, markdown, jso
     client = get_client(use_cache=not ctx.obj["no_cache"],
                        cache_max_mb=ctx.obj.get("cache_max_mb"))
     result = client.dilution(identifier, since=since, max_filings=max_filings,
-                             max_supplements=max_supplements)
+                             max_supplements=max_supplements,
+                             **({"include_periodic": True} if include_periodic else {}),
+                             **({"include_shelf": True} if include_shelf else {}),
+                             **({"as_of": as_of} if as_of else {}))
     result = _finalize(client, result)
     _error_exit(result)
     _output_dilution(result, json_output, markdown, ndjson)
@@ -2126,8 +2279,9 @@ def holders(ctx, identifier, candidates, cusip, quarter, top_n, max_filers,
 @click.option("--max-fetch", default=50, show_default=True, type=PositiveInt,
               help="Max Form 3/4/5 filings to download (hard ceiling 200)")
 @output_options
+@as_of_option
 @click.pass_context
-def insiders(ctx, identifier, since, limit, max_fetch, markdown, json_output, ndjson):
+def insiders(ctx, identifier, since, limit, max_fetch, markdown, json_output, ndjson, as_of):
     """Aggregate insider ownership filings: Form 4/5 transactions, Form 3 holdings.
 
     With no transactions the result explains itself in `hint` and lists any
@@ -2136,7 +2290,7 @@ def insiders(ctx, identifier, since, limit, max_fetch, markdown, json_output, nd
     client = get_client(use_cache=not ctx.obj["no_cache"],
                        cache_max_mb=ctx.obj.get("cache_max_mb"))
     result = client.insiders(identifier, since=since, limit=limit,
-                              max_form4_fetches=max_fetch)
+                              max_form4_fetches=max_fetch, **({"as_of": as_of} if as_of else {}))
     result = _finalize(client, result)
     _error_exit(result)
     _output_insiders(result, identifier, json_output, markdown, ndjson)

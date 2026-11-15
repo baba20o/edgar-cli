@@ -37,6 +37,7 @@ DEFAULT_TTL = 900
 NEGATIVE_TTL = 3600
 
 ENDPOINT_TTLS: list[tuple[re.Pattern, int]] = [
+    (re.compile(r"/Archives/edgar/data/"), 30 * 86400),
     (re.compile(r"/files/company_tickers_exchange\.json$"), 7 * 86400),
     (re.compile(r"/api/xbrl/companyfacts/CIK\d+\.json$"), 86400),
     (re.compile(r"/api/xbrl/companyconcept/CIK\d+/"), 86400),
