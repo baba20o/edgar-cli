@@ -7,8 +7,7 @@ Live queue for owed-by-us follow-ups that could silently slip if the session end
 | Item | Status | Our pending action | Waiting on | UAF link |
 |---|---|---|---|---|
 | Handoff implementation | Done | Functional scope verified; 544 tests passed, 2 optional skips. Corrections and unmet default forensics timing targets recorded in docs/handoff-implementation.md. | None | mission_e671cc0567b54aa9a089564492d5e948 / task_8160a6c67019477781867a5c480130be |
-
-| Commit and push handoff | Active | Finish opposite-brand review, apply ignore rules, create independently checked logical slices and push origin/main | Our work | task_b7f1af40727c47d48c60cae957baa2f5 |
+| Commit and push handoff | Done | Opposite-brand review findings repaired; 572 tests passed, 2 optional skips. Four logical slices pushed to origin/main through d276ba5; final UAF integrity and sync checks passed. Unrelated original files preserved byte-for-byte. | None | task_b7f1af40727c47d48c60cae957baa2f5 |
 
 ## Snippets
 
