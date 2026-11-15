@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "template_id": "ship-it",
+  "name": "Ship It",
+  "summary": "A commit-readiness workflow for non-trivial UAF work.",
+  "max_rounds": 2,
+  "combo": {
+    "version": 1,
+    "description": "Commit-readiness combo: sync, objective tests, opposite-brand review, and final UAF check.",
+    "roles": {
+      "reviewer": {
+        "allowed_brands": ["claude", "codex"],
+        "default": "claude",
+        "profile_by_brand": {
+          "codex": "codex-scan",
+          "claude": "claude-scan"
+        }
+      },
+      "smoker": {
+        "allowed_brands": ["codex", "claude"],
+        "default": "codex"
+      },
+      "rollup": {
+        "allowed_brands": ["codex", "claude"],
+        "default": "codex"
+      }
+    },
+    "cross_model": [["smoker", "reviewer"]],
+    "artifact_aliases": {
+      "sync.md": "phase.sync-check.final",
+      "tests.md": "phase.test.final",
+      "review.md": "phase.adversarial-review.final",
+      "final.md": "phase.final-check.final"
+    }
+  },
+  "phases": [
+    {
+      "id": "sync-check",
+      "title": "Generated Instruction Sync",
+      "lane": "verify",
+      "role": "orchestrator",
+      "action": "Check generated agent files before claiming the repo is ready.",
+      "command": "uaf sync --check",
+      "verifier": "Sync check exits successfully.",
+      "stop_condition": "AGENTS.md and CLAUDE.md are in sync."
+    },
+    {
+      "id": "test",
+      "title": "Default UAF Check",
+      "lane": "verify",
+      "role": "orchestrator",
+      "combo_role": "smoker",
+      "profile": "codex",
+      "action": "Run the default UAF structural verifier. Replace this phase with a project test verifier when one is configured.",
+      "command": "uaf verify --id uaf-check --claim latest",
+      "verifier": "The UAF structural verifier records a passed verification event.",
+      "stop_condition": "Default verifier evidence is available."
+    },
+    {
+      "id": "adversarial-review",
+      "title": "Opposite-Brand Adversarial Review",
+      "lane": "redteam",
+      "role": "reviewer",
+      "combo_role": "reviewer",
+      "profile": "claude-scan",
+      "action": "Use the opposite reviewer brand to challenge the finished slice before commit.",
+      "command": "uaf adversarial-review --from codex --brand {{combo_brand}} --mission {{mission_id}} --scope \"<scope>\" --prompt \"Review this completed slice for blockers, false rigor, missing tests, and unsafe UAF state changes.\" --profile {{profile}} --timeout-ms 1800000",
+      "verifier": "Review is recorded, blockers are repaired, and orchestrator decision is accepted.",
+      "stop_condition": "No blocking review finding remains."
+    },
+    {
+      "id": "final-check",
+      "title": "Final UAF Check",
+      "lane": "verify",
+      "role": "orchestrator",
+      "combo_role": "rollup",
+      "profile": "codex",
+      "action": "Run UAF structural validation after review and repairs.",
+      "command": "uaf check",
+      "verifier": "uaf check exits successfully.",
+      "stop_condition": "Repo state is structurally valid and ready for commit."
+    }
+  ]
+}

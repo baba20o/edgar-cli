@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "root": "templates",
+  "hashes": {
+    "missions/atlas.md": "d73727c30950bd3b8f9d017c2c842f39129eaae3dbb6b32df943f15e43a70d75",
+    "missions/execution.md": "7bb0c6f18ef06e65cdbb5b1827a6ef7fe6bbedc2cc72a25c1663fb803f1ca271",
+    "missions/heavy.md": "2745c9f6ce59515ec30c7a6dd53b4750fd54e335cea09b5f60c62afbfed546e6",
+    "missions/light.md": "03996b56c2ba9ff450fe2ec2a9ee973bf73ddd9cbb065ff77777abb3dfc9d6d8",
+    "missions/meta-control.md": "7ce995a8dd93f4fcd1b9462467f36edcf199d7cd04d2f3c0068796484d463441",
+    "missions/redteam.md": "ebc74427527758de00f64025f68a05347afecfc6fbe78214d33f1a0762d685a6",
+    "missions/standard.md": "5854645a7f72bbf6a4c93084513a22a282aff3a7b3cb6c47d1de6676088f8a4f",
+    "reviews/dual-tier.json": "dbad97fecd27874eb3c6f9d8101dc2b6351b1174b229ca789f02ce5dcef62d9f",
+    "workers/assignment.md": "c03620d1fcd763aaf4bbb5b5ff7d783a9e1912641d56b6867eb7b086edeedb5c",
+    "workflows/council-investigate.json": "9a89a12d720d3b1fd3f2adadb9093d55746f0b1a499aec91b4799db4004fc275",
+    "workflows/cross-brand-audit.json": "885774af6903e51f0857676c4ed9204ae8b877ec8e41ea267bd5820f78e70d9a",
+    "workflows/deep-design-review.json": "810f13c52b5c59af1b05a6fc952d51e888800a6e4997a50e05f5190f7af364fd",
+    "workflows/divergence-debate.json": "dbdbe35213a149e90df3e41a23a653f2794331e549d7bdfbfd7044264f1dfef9",
+    "workflows/doctrine-compliance.json": "22eeaabffe928c2b0fd6555e79209cd799d79a31bc05f71db231412163284971",
+    "workflows/implement-review-fix.json": "1ce29580d716a48186233158befd648e78842424ccb26ad190aa9354f389b97f",
+    "workflows/ship-it.json": "46bc9e31f914c75ef4d427456f5c6f4c21297074bd12c753d31d5e8c090b241f"
+  }
+}

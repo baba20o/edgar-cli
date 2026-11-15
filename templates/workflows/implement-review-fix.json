@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "template_id": "implement-review-fix",
+  "name": "Implement, Review, Fix",
+  "summary": "A bounded implementation loop with worker output, adversarial review, repair, and verifier-backed closeout.",
+  "max_rounds": 3,
+  "combo": {
+    "version": 1,
+    "description": "Build, adversarially review, repair if requested, verify, and close with evidence.",
+    "roles": {
+      "builder": {
+        "allowed_brands": ["codex", "claude"],
+        "default": "codex"
+      },
+      "reviewer": {
+        "allowed_brands": ["claude", "codex"],
+        "default": "claude",
+        "profile_by_brand": {
+          "codex": "codex-scan",
+          "claude": "claude-scan"
+        }
+      },
+      "smoker": {
+        "allowed_brands": ["codex", "claude"],
+        "default": "codex"
+      },
+      "rollup": {
+        "allowed_brands": ["codex", "claude"],
+        "default": "codex"
+      }
+    },
+    "cross_model": [["builder", "reviewer"]],
+    "artifact_aliases": {
+      "implementation.md": "phase.implement.final",
+      "review.md": "phase.review.final",
+      "verification.md": "phase.verify.final",
+      "final.md": "phase.close.final"
+    }
+  },
+  "phases": [
+    {
+      "id": "frame",
+      "title": "Frame Mission State",
+      "lane": "meta-control",
+      "role": "orchestrator",
+      "action": "Inspect mission queues, open gates, existing runtime runs, and verifier coverage before delegation.",
+      "command": "uaf ops --mission {{mission_id}}",
+      "verifier": "Operator confirms the next delegation target and objective verifier.",
+      "stop_condition": "Mission has a clear implement scope, review scope, and verifier."
+    },
+    {
+      "id": "implement",
+      "title": "Delegate Implementation",
+      "lane": "implement",
+      "role": "worker",
+      "combo_role": "builder",
+      "profile": "codex",
+      "action": "Launch or assign a bounded implementation worker.",
+      "command": "uaf delegate --mission {{mission_id}} --lane implement --scope \"<scope>\" --launch --profile {{profile}} --report",
+      "verifier": "Worker report exists, but integrated work is not yet verified.",
+      "stop_condition": "Worker report has changed files, commands run, limits, and risks."
+    },
+    {
+      "id": "review",
+      "title": "Opposite-Brand Review",
+      "lane": "review",
+      "role": "reviewer",
+      "combo_role": "reviewer",
+      "profile": "claude-scan",
+      "action": "Run the opposite reviewer brand against the implementation.",
+      "command": "uaf adversarial-review --from codex --brand {{combo_brand}} --mission {{mission_id}} --scope \"<scope>\" --prompt \"Review this implementation for blockers, regressions, missing tests, and UAF closeout gaps.\" --profile {{profile}} --timeout-ms 1800000",
+      "verifier": "Reviewer verdict is recorded and orchestrator decision accepts, rejects, or requests changes.",
+      "stop_condition": "Review findings are triaged by the orchestrator."
+    },
+    {
+      "id": "repair",
+      "title": "Repair Findings",
+      "lane": "implement",
+      "role": "orchestrator",
+      "when": {
+        "phase_id": "review",
+        "verdict": "changes_requested"
+      },
+      "action": "Address blocker findings or explicitly defer non-blocking follow-ups.",
+      "command": "uaf ops --mission {{mission_id}}",
+      "verifier": "Blockers are fixed or moved to accepted risk with human approval.",
+      "stop_condition": "No unresolved blocker remains."
+    },
+    {
+      "id": "verify",
+      "title": "Run Objective Verifiers",
+      "lane": "verify",
+      "role": "orchestrator",
+      "combo_role": "smoker",
+      "profile": "codex",
+      "action": "Run the configured verifier that proves the integrated change.",
+      "command": "uaf verify --id uaf-check --claim latest",
+      "verifier": "Verifier event has result passed.",
+      "stop_condition": "Passing verifier evidence exists."
+    },
+    {
+      "id": "close",
+      "title": "Close and Promote",
+      "lane": "meta-control",
+      "role": "orchestrator",
+      "combo_role": "rollup",
+      "profile": "codex",
+      "action": "Close the task with evidence and promote durable lessons only if reusable.",
+      "command": "uaf close --task <task-id> --summary \"<done>\"",
+      "verifier": "Completion references supporting evidence and uaf check passes.",
+      "stop_condition": "Task is closed or explicitly blocked."
+    }
+  ]
+}

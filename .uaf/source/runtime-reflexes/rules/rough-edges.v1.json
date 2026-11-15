@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "id": "rough-edges.v1",
+  "enabled": true,
+  "description": "Collect concise, model-reported operational rough edges at a bounded work-cycle cadence.",
+  "scope": {
+    "kind": "bound_subject"
+  },
+  "trigger": {
+    "kind": "prospective_work_cycle",
+    "default_every": 10,
+    "default_offset": 0,
+    "min_every": 1,
+    "max_every": 1000
+  },
+  "template": {
+    "id": "rough-edges.v1",
+    "sha256": "15ecb9d61df75f6f7134d0d58d39e3792ca217fecaec10216ed1a8f8e51bf779"
+  },
+  "delivery": {
+    "mode": "inline_next_boundary",
+    "placement": "broker_controlled_user_prefix"
+  },
+  "capture": {
+    "mode": "marked_text_envelope",
+    "format": "json",
+    "sink": "runtime_artifact",
+    "max_bytes": 8192
+  },
+  "feedback": {
+    "mode": "no_controller_reinjection"
+  },
+  "commit": {
+    "reset_on": "provider_completed",
+    "max_capture_retries": 0
+  },
+  "budget": {
+    "max_occurrences": 5,
+    "max_added_prompt_bytes": 12288,
+    "max_dispatch_attempts": 2,
+    "deadline_ms": 600000
+  },
+  "priority": 100,
+  "template_variables": [
+    "occurrence_id",
+    "assignment_event_id",
+    "prospective_work_cycle"
+  ]
+}

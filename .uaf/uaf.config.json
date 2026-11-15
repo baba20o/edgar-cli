@@ -1,0 +1,205 @@
+{
+  "schema_version": 1,
+  "template_version": "0.2.1",
+  "minimum_cli_version": "0.2.1",
+  "source": {
+    "root": ".uaf/source",
+    "shared": [
+      "agent-kernel.md",
+      "doctrine.md",
+      "memory-contract.md",
+      "checkpoint-contract.md",
+      "kernel.md",
+      "ledger-contract.md",
+      "runtime-reflexes/rules/rough-edges.v1.json",
+      "runtime-reflexes/templates/rough-edges.v1.md",
+      "verifier-contract.md",
+      "sync-rules.md"
+    ],
+    "agent_shared": [
+      "agent-kernel.md"
+    ],
+    "manifest": ".uaf/source/manifest.json"
+  },
+  "agents": {
+    "codex": {
+      "output": "AGENTS.md",
+      "adapter": ".uaf/source/adapters/codex.md"
+    },
+    "claude": {
+      "output": "CLAUDE.md",
+      "adapter": ".uaf/source/adapters/claude.md"
+    }
+  },
+  "memory": {
+    "map": ".uaf/memory.md",
+    "records": ".uaf/memory.jsonl"
+  },
+  "ledger": {
+    "records": ".uaf/ledger.jsonl"
+  },
+  "install": {
+    "mode": "tracked"
+  },
+  "runtime": {
+    "adversarial_review": {
+      "profiles": {
+        "codex": "codex-scan",
+        "claude": "claude-scan"
+      }
+    },
+    "provider_profiles": {
+      "codex": {
+        "adapter": "codex-sdk"
+      },
+      "codex-scan": {
+        "adapter": "codex-sdk",
+        "sandbox": "read-only",
+        "side_turn_sandbox": "read-only",
+        "approval": "never",
+        "network": "disabled",
+        "timeout_ms": 1800000,
+        "skip_git_repo_check": true,
+        "command_policy": [
+          "Read-only repository scan.",
+          "Prefer rg, find, sed, cat, wc, and git status.",
+          "Do not write files, install packages, mutate UAF state, or modify external mounts."
+        ]
+      },
+      "claude-wsl": {
+        "adapter": "claude-sdk",
+        "permission_mode": "default"
+      },
+      "claude-scan": {
+        "adapter": "claude-sdk",
+        "provider_tmpdir": "/tmp",
+        "permission_mode": "default",
+        "sandbox": "read-only",
+        "side_turn_sandbox": "read-only",
+        "approval": "never",
+        "network": "disabled",
+        "timeout_ms": 1800000,
+        "tools": [
+          "Read",
+          "Grep",
+          "Glob",
+          "Bash"
+        ],
+        "allowed_tools": [
+          "Read",
+          "Grep",
+          "Glob",
+          "Bash"
+        ],
+        "command_policy": [
+          "Read-only repository scan.",
+          "Use shell only for read/search commands such as rg, find, sed, cat, wc, pwd, ls, and git status.",
+          "Do not write files, install packages, mutate UAF state, or modify external mounts.",
+          "Network remains disabled by UAF policy; do not browse or fetch dependencies."
+        ]
+      },
+      "copilot-scan": {
+        "adapter": "copilot-sdk",
+        "sandbox": "read-only",
+        "side_turn_sandbox": "read-only",
+        "approval": "never",
+        "network": "enabled",
+        "timeout_ms": 1800000,
+        "provider_stop_timeout_ms": 5000,
+        "allowed_tools": [
+          "builtin:*"
+        ],
+        "disallowed_tools": [
+          "builtin:ask_user",
+          "builtin:task",
+          "builtin:write_agent",
+          "builtin:send_inbox"
+        ],
+        "command_policy": [
+          "Experimental GitHub Copilot SDK repository scan.",
+          "SDK empty mode and a UAF permission handler reject writes, shell, MCP, URL, memory, hook, and custom-tool requests.",
+          "Network is enabled only for provider transport; tool-level URL and MCP requests remain denied.",
+          "Treat read-only as policy-enforced, not as an OS sandbox guarantee."
+        ]
+      },
+      "cursor-scan": {
+        "adapter": "cursor-sdk",
+        "sandbox": "read-only",
+        "side_turn_sandbox": "read-only",
+        "approval": "never",
+        "network": "enabled",
+        "timeout_ms": 1800000,
+        "subagent_policy": "disabled",
+        "tools": [
+          "read",
+          "grep",
+          "glob",
+          "ls"
+        ],
+        "command_policy": [
+          "Experimental local Cursor SDK scan. Explicit catalog model required.",
+          "Read/search tools only; shell, mutation, MCP, nested agents and ambient settings are disabled.",
+          "Network is enabled for Cursor inference transport. Broad reads may disclose ignored or external files.",
+          "This is provider-controlled tool policy, not a read-only OS sandbox."
+        ]
+      },
+      "antigravity-scan": {
+        "adapter": "antigravity-cli",
+        "sandbox": "read-only",
+        "side_turn_sandbox": "read-only",
+        "approval": "never",
+        "network": "disabled",
+        "timeout_ms": 1800000,
+        "agy_sandbox": true,
+        "command_policy": [
+          "Experimental Antigravity read-only repository scan.",
+          "Use agy sandbox mode and UAF read-only launch policy.",
+          "Do not write files, install packages, mutate UAF state, or modify external mounts.",
+          "Session identity, terminal status, usage, and live text/tool events come from agy stream-json; transcript.jsonl is optional richer history."
+        ]
+      }
+    }
+  },
+  "verifiers": [
+    {
+      "id": "sync-check",
+      "cmd": "node",
+      "args": [
+        "{uafCli}",
+        "sync",
+        "--check"
+      ],
+      "cwd": "{repoRoot}",
+      "shell": false,
+      "timeout_ms": 120000,
+      "network": false
+    },
+    {
+      "id": "uaf-check",
+      "cmd": "node",
+      "args": [
+        "{uafCli}",
+        "check"
+      ],
+      "cwd": "{repoRoot}",
+      "shell": false,
+      "timeout_ms": 120000,
+      "network": false
+    },
+    {
+      "id": "pytest",
+      "cmd": ".venv/bin/python",
+      "args": [
+        "-E",
+        "-m",
+        "pytest",
+        "tests/",
+        "-q"
+      ],
+      "cwd": "{repoRoot}",
+      "shell": false,
+      "timeout_ms": 120000,
+      "network": false
+    }
+  ]
+}

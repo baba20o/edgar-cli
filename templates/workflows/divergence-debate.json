@@ -1,0 +1,209 @@
+{
+  "schema_version": 1,
+  "template_id": "divergence-debate",
+  "name": "Divergence Debate",
+  "summary": "Resolve a judgment divergence through at most three explicit cross-brand rounds, then require a human tiebreaker.",
+  "max_rounds": 1,
+  "combo": {
+    "version": 1,
+    "description": "Two opposite brands use up to three explicit rounds to resolve a judgment divergence. A clerical alignment check may confirm explicit mutual assent but may not choose a winner; unresolved judgment reaches a human gate. Brand separation is not proof of independence. Debate is not ceremony: concede in the first round when the merits are clear.",
+    "roles": {
+      "proponent": {
+        "allowed_brands": ["claude", "codex"],
+        "default": "claude",
+        "profile_by_brand": {
+          "codex": "codex-scan",
+          "claude": "claude-scan"
+        }
+      },
+      "opponent": {
+        "allowed_brands": ["codex", "claude"],
+        "default": "codex",
+        "profile_by_brand": {
+          "codex": "codex-scan",
+          "claude": "claude-scan"
+        }
+      }
+    },
+    "cross_model": [
+      ["proponent", "opponent"]
+    ],
+    "artifact_aliases": {
+      "position.md": "phase.position.final",
+      "rebuttal.md": "phase.rebuttal-1.final",
+      "response-1.md": "phase.response-1.final",
+      "response-2.md": "phase.response-2.final",
+      "response-3.md": "phase.response-3.final",
+      "decision.md": "phase.record-decision.final",
+      "human-decision.md": "phase.record-human-decision.final"
+    }
+  },
+  "phases": [
+    {
+      "id": "position",
+      "title": "Opening Position",
+      "lane": "atlas",
+      "role": "debater",
+      "combo_role": "proponent",
+      "profile": "claude-scan",
+      "action": "State the judgment position, reasoning, trade-off, and initial concessions. Do not argue a factual dispute; stop and test it.",
+      "command": "uaf delegate --task {{task_id}} --lane atlas --role debater --scope \"Opening position for judgment divergence in workflow {{workflow_id}}; inspect the workflow summary and mission context.\" --details \"You represent the proponent position for this turn. State the judgment position, reasoning, trade-off, and initial concessions. Do not argue a factual dispute; stop and test it. Read the referenced workflow and prior party artifacts before responding. Preserve both positions honestly; concede on the merits without inventing agreement. Remain read-only, do not mutate UAF state, and do not adjudicate or declare completion.\" --output-contract \"The report states the position, reasons, concessions, and unresolved judgment without presenting untested factual claims as settled. Return a bounded report with positions, reasons, concessions, proposed outcome or exact remaining split, evidence references, and limitations. Explicitly state whether you adopt the other party's proposed outcome. Reports are claims, not verifier evidence.\" --verifier \"The report states the position, reasons, concessions, and unresolved judgment without presenting untested factual claims as settled.\" --stop \"A bounded opening position is recorded.\" --abort \"Stop and report if the dispute is factual and needs testing, required context is missing, or scope or authority is unclear. Do not resolve factual claims by debate.\" --launch --profile {{profile}} --report --timeout-ms 0 --subagents disabled",
+      "verifier": "The report states the position, reasons, concessions, and unresolved judgment without presenting untested factual claims as settled.",
+      "stop_condition": "A bounded opening position is recorded."
+    },
+    {
+      "id": "rebuttal-1",
+      "title": "Round 1 Rebuttal",
+      "lane": "redteam",
+      "role": "debater",
+      "combo_role": "opponent",
+      "profile": "codex-scan",
+      "action": "Inspect the opening position, concede what is right, and rebut only the remaining judgment divergence.",
+      "command": "uaf delegate --task {{task_id}} --lane redteam --role debater --scope \"Round 1 rebuttal for workflow {{workflow_id}}; inspect phase position output.\" --details \"You represent the opponent position for this turn. Inspect the opening position, concede what is right, and rebut only the remaining judgment divergence. Read the referenced workflow and prior party artifacts before responding. Preserve both positions honestly; concede on the merits without inventing agreement. Remain read-only, do not mutate UAF state, and do not adjudicate or declare completion.\" --output-contract \"The rebuttal addresses the position point by point and separates judgment from testable fact. Return a bounded report with positions, reasons, concessions, proposed outcome or exact remaining split, evidence references, and limitations. Explicitly state whether you adopt the other party's proposed outcome. Reports are claims, not verifier evidence.\" --verifier \"The rebuttal addresses the position point by point and separates judgment from testable fact.\" --stop \"The opponent records concessions and the exact remaining disagreement.\" --abort \"Stop and report if the dispute is factual and needs testing, required context is missing, or scope or authority is unclear. Do not resolve factual claims by debate.\" --launch --profile {{profile}} --report --timeout-ms 0 --subagents disabled",
+      "verifier": "The rebuttal addresses the position point by point and separates judgment from testable fact.",
+      "stop_condition": "The opponent records concessions and the exact remaining disagreement."
+    },
+    {
+      "id": "response-1",
+      "title": "Round 1 Response",
+      "lane": "review",
+      "role": "debater",
+      "combo_role": "proponent",
+      "profile": "claude-scan",
+      "action": "Respond on the merits: concede, refine, or maintain, and state the proposed aligned outcome or exact remaining split.",
+      "command": "uaf delegate --task {{task_id}} --lane review --role debater --scope \"Round 1 response for workflow {{workflow_id}}; inspect phase rebuttal-1 output and state movement plus the proposed aligned outcome or remaining split.\" --details \"You represent the proponent position for this turn. Respond on the merits: concede, refine, or maintain, and state the proposed aligned outcome or exact remaining split. Read the referenced workflow and prior party artifacts before responding. Preserve both positions honestly; concede on the merits without inventing agreement. Remain read-only, do not mutate UAF state, and do not adjudicate or declare completion.\" --output-contract \"The response records both positions, who moved and why, and a proposed outcome or precise remaining split. Return a bounded report with positions, reasons, concessions, proposed outcome or exact remaining split, evidence references, and limitations. Explicitly state whether you adopt the other party's proposed outcome. Reports are claims, not verifier evidence.\" --verifier \"The response records both positions, who moved and why, and a proposed outcome or precise remaining split.\" --stop \"The proponent's response is recorded for alignment checking.\" --abort \"Stop and report if the dispute is factual and needs testing, required context is missing, or scope or authority is unclear. Do not resolve factual claims by debate.\" --launch --profile {{profile}} --report --timeout-ms 0 --subagents disabled",
+      "verifier": "The response records both positions, who moved and why, and a proposed outcome or precise remaining split.",
+      "stop_condition": "The proponent's response is recorded for alignment checking."
+    },
+    {
+      "id": "align-1",
+      "title": "Round 1 Alignment Check",
+      "lane": "meta-control",
+      "role": "orchestrator",
+      "action": "The orchestrator performs this clerical check; no independent checker is launched. Check only for explicit mutual assent in the two party artifacts; do not choose a winner, infer tacit agreement, or synthesize a compromise. Use approved only when both sides state the same outcome; otherwise use changes_requested.",
+      "verifier": "Both party artifacts explicitly adopt the same outcome and identify who moved, or the remaining judgment is preserved unchanged.",
+      "stop_condition": "Advance with approved for explicit mutual alignment or changes_requested for another round.",
+      "loop": {
+        "max_rounds": 1,
+        "until_verdict": ["approved", "changes_requested"]
+      }
+    },
+    {
+      "id": "response-2",
+      "title": "Round 2 Response",
+      "lane": "review",
+      "role": "debater",
+      "combo_role": "opponent",
+      "profile": "codex-scan",
+      "when": {
+        "phase_id": "align-1",
+        "verdict": "changes_requested"
+      },
+      "action": "Answer the remaining split from round 1, moving on the merits where warranted and stating a proposed aligned outcome or exact remaining split.",
+      "command": "uaf delegate --task {{task_id}} --lane review --role debater --scope \"Round 2 response for workflow {{workflow_id}}; inspect phases response-1 and align-1, then address the remaining judgment.\" --details \"You represent the opponent position for this turn. Answer the remaining split from round 1, moving on the merits where warranted and stating a proposed aligned outcome or exact remaining split. Read the referenced workflow and prior party artifacts before responding. Preserve both positions honestly; concede on the merits without inventing agreement. Remain read-only, do not mutate UAF state, and do not adjudicate or declare completion.\" --output-contract \"The response addresses every unresolved point and records movement with reasons. Return a bounded report with positions, reasons, concessions, proposed outcome or exact remaining split, evidence references, and limitations. Explicitly state whether you adopt the other party's proposed outcome. Reports are claims, not verifier evidence.\" --verifier \"The response addresses every unresolved point and records movement with reasons.\" --stop \"The round 2 response is recorded for alignment checking.\" --abort \"Stop and report if the dispute is factual and needs testing, required context is missing, or scope or authority is unclear. Do not resolve factual claims by debate.\" --launch --profile {{profile}} --report --timeout-ms 0 --subagents disabled",
+      "verifier": "The response addresses every unresolved point and records movement with reasons.",
+      "stop_condition": "The round 2 response is recorded for alignment checking."
+    },
+    {
+      "id": "align-2",
+      "title": "Round 2 Alignment Check",
+      "lane": "meta-control",
+      "role": "orchestrator",
+      "when": {
+        "phase_id": "response-2",
+        "phase_status": "completed"
+      },
+      "action": "The orchestrator performs this clerical check; no independent checker is launched. Check only for explicit mutual assent; do not adjudicate. Use approved only when both sides state the same outcome; otherwise use changes_requested.",
+      "verifier": "Both parties explicitly agree, or the exact unresolved judgment is preserved for the final round.",
+      "stop_condition": "Advance with approved for explicit mutual alignment or changes_requested for the final round.",
+      "loop": {
+        "max_rounds": 1,
+        "until_verdict": ["approved", "changes_requested"]
+      }
+    },
+    {
+      "id": "response-3",
+      "title": "Round 3 Response",
+      "lane": "review",
+      "role": "debater",
+      "combo_role": "proponent",
+      "profile": "claude-scan",
+      "when": {
+        "phase_id": "align-2",
+        "verdict": "changes_requested"
+      },
+      "action": "Make the final bounded response and isolate any judgment that still needs a human tiebreaker.",
+      "command": "uaf delegate --task {{task_id}} --lane review --role debater --scope \"Round 3 response for workflow {{workflow_id}}; inspect phases response-2 and align-2, then state final movement or the exact unresolved judgment.\" --details \"You represent the proponent position for this turn. Make the final bounded response and isolate any judgment that still needs a human tiebreaker. Read the referenced workflow and prior party artifacts before responding. Preserve both positions honestly; concede on the merits without inventing agreement. Remain read-only, do not mutate UAF state, and do not adjudicate or declare completion.\" --output-contract \"The final response states the proposed aligned outcome or a concise human decision question. Return a bounded report with positions, reasons, concessions, proposed outcome or exact remaining split, evidence references, and limitations. Explicitly state whether you adopt the other party's proposed outcome. Reports are claims, not verifier evidence.\" --verifier \"The final response states the proposed aligned outcome or a concise human decision question.\" --stop \"The final response is recorded for alignment checking.\" --abort \"Stop and report if the dispute is factual and needs testing, required context is missing, or scope or authority is unclear. Do not resolve factual claims by debate.\" --launch --profile {{profile}} --report --timeout-ms 0 --subagents disabled",
+      "verifier": "The final response states the proposed aligned outcome or a concise human decision question.",
+      "stop_condition": "The final response is recorded for alignment checking."
+    },
+    {
+      "id": "align-3",
+      "title": "Round 3 Alignment Check",
+      "lane": "meta-control",
+      "role": "orchestrator",
+      "when": {
+        "phase_id": "response-3",
+        "phase_status": "completed"
+      },
+      "action": "The orchestrator performs this clerical check; no independent checker is launched. Check only for explicit mutual assent; do not choose a winner. Use approved only for explicit agreement; otherwise use changes_requested and escalate.",
+      "verifier": "Both parties explicitly agree, or the exact question requiring a human tiebreaker is preserved.",
+      "stop_condition": "Advance with approved for explicit mutual alignment or changes_requested for human escalation.",
+      "loop": {
+        "max_rounds": 1,
+        "until_verdict": ["approved", "changes_requested"]
+      }
+    },
+    {
+      "id": "record-decision",
+      "title": "Record Aligned Decision",
+      "lane": "meta-control",
+      "role": "orchestrator",
+      "when": {
+        "verdict": "approved"
+      },
+      "action": "Manual outcome capture: run uaf note --type decision --task {{task_id}} --summary '<actual negotiated outcome>' --details 'Workflow {{workflow_id}}; mission {{mission_id}}; positions, who changed and why, remaining limits. Advisory alignment only, not product approval or verifier evidence.' --related <comma-separated-worker-report-event-ids>. Replace every placeholder after inspecting both parties. Then advance without --execute and cite the decision event in --summary.",
+      "verifier": "An inspected decision ledger event states the actual negotiated outcome, movement and reasons, authority limits, and links the supporting worker reports. A generic alignment label is insufficient.",
+      "stop_condition": "Advance with approved only after recording and inspecting the explicit outcome and its report references; the workflow verdict does not validate the decision automatically.",
+      "loop": {
+        "max_rounds": 1,
+        "until_verdict": "approved"
+      }
+    },
+    {
+      "id": "human-gate",
+      "title": "Human Tiebreaker",
+      "lane": "meta-control",
+      "role": "orchestrator",
+      "when": {
+        "phase_id": "record-decision",
+        "phase_status": "skipped"
+      },
+      "action": "Open one human gate and execute once with verdict needs_review. Do not re-execute while waiting: each execution creates another gate. Confirm the actual ledger gate is approved before advancing without execution using approved. Use --changes or --defer for a continuing discussion. A human --reject terminally aborts the selected task (the entire mission root if that was selected); after rejection run uaf workflow cancel --workflow {{workflow_id}} to retire the active workflow and restore ownership integrity. An aborted task cannot be reopened.",
+      "command": "uaf gate --task {{task_id}} --related task-root --summary \"Divergence debate {{workflow_id}} remains unresolved. Use --changes or --defer unless you intend to terminally abort task {{task_id}} with --reject. After rejection run uaf workflow cancel --workflow {{workflow_id}}.\" --json",
+      "verifier": "A pending human gate linked to the task root exists and the final alignment artifact preserves the unresolved judgment.",
+      "stop_condition": "The workflow remains blocked on needs_review until the human tiebreaker is resolved.",
+      "loop": {
+        "max_rounds": 1,
+        "until_verdict": ["needs_review", "approved"]
+      }
+    },
+    {
+      "id": "record-human-decision",
+      "title": "Record Human Decision",
+      "lane": "meta-control",
+      "role": "orchestrator",
+      "when": {
+        "phase_id": "human-gate",
+        "verdict": "approved"
+      },
+      "action": "Manual outcome capture: inspect the approved ledger gate, then run uaf note --type decision --task {{task_id}} --summary '<actual human-selected outcome>' --details 'Workflow {{workflow_id}}; mission {{mission_id}}; prior positions, reasons, and remaining limits. This note does not establish human approval.' --related <approved-gate-and-worker-report-event-ids>. Replace every placeholder. Advance without --execute and cite this decision event in --summary only after inspecting the real gate approval.",
+      "verifier": "A decision event and approved human gate preserve the human-selected resolution.",
+      "stop_condition": "Advance with approved after inspecting the explicit decision event and real gate approval; a workflow verdict is not human approval.",
+      "loop": {
+        "max_rounds": 1,
+        "until_verdict": "approved"
+      }
+    }
+  ]
+}

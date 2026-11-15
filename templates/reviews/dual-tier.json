@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "summary": "Independent architecture and implementation review",
+  "scope": "current working tree",
+  "from": "orchestrator",
+  "max_parallel": 2,
+  "subagents": "disabled",
+  "reviewers": [
+    {
+      "id": "architecture",
+      "role": "architecture and trust-boundary reviewer",
+      "provider": "claude",
+      "model": "opus[1m]",
+      "profile": "claude-scan",
+      "prompt": "Review the whole change for architectural defects, trust-boundary failures, false rigor, and missing system-level tests. Findings first.",
+      "fallbacks": [
+        {
+          "provider": "claude",
+          "model": "sonnet",
+          "profile": "claude-scan"
+        }
+      ]
+    },
+    {
+      "id": "implementation",
+      "role": "implementation and regression reviewer",
+      "provider": "codex",
+      "model": "gpt-5.6-sol",
+      "profile": "codex-scan",
+      "prompt": "Inspect the changed code closely for correctness bugs, regressions, missing edge-case tests, and documentation drift. Findings first.",
+      "fallbacks": [
+        {
+          "provider": "codex",
+          "model": "gpt-5.6-terra",
+          "profile": "codex-scan"
+        }
+      ]
+    }
+  ]
+}

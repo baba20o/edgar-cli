@@ -1,0 +1,49 @@
+{
+  "schema_version": 2,
+  "template_version": "0.2.1",
+  "source_files": [
+    "agent-kernel.md",
+    "doctrine.md",
+    "memory-contract.md",
+    "checkpoint-contract.md",
+    "kernel.md",
+    "ledger-contract.md",
+    "runtime-reflexes/rules/rough-edges.v1.json",
+    "runtime-reflexes/templates/rough-edges.v1.md",
+    "verifier-contract.md",
+    "sync-rules.md"
+  ],
+  "adapters": {
+    "claude": "adapters/claude.md",
+    "codex": "adapters/codex.md"
+  },
+  "content_hashes": {
+    "adapters/claude.md": "cee9ef97b93171835315b4a248672d35223c6d8dc4a809d471ae15bd27f5c001",
+    "adapters/codex.md": "1b15e9fea824d004f770e3fc27175381974162f64d9673fc322b2ea8421785d8",
+    "agent-kernel.md": "e49b6a1b0195e6298f76f1b196ae72628365ab96169247e8ad086b0ec8669269",
+    "checkpoint-contract.md": "b16eae8ef20e57bc75a442094e7cdef115c2ae714130fc6d265ee921d44a5fbf",
+    "doctrine.md": "180acbbfe75225a6e4def0de57bda7ddbaa558a936f7185333074980861166e9",
+    "kernel.md": "5525097b237a889a73a9cf5e23ddc29b8f17d024cd91213ca2e5dc0b46db12c3",
+    "ledger-contract.md": "7398de47dc254bf68cae559ed9cef7fc6b4e1e738d30e1b755d4a3d973938bab",
+    "memory-contract.md": "511e59a313f3a863e9e0122856cc2e231366e0e9e5fad7622a753fb19cdab9a8",
+    "runtime-reflexes/rules/rough-edges.v1.json": "5a71298c4bc36426f27f4e599e688f9ce6b08d2ff191c794c17d2a249f8d0c97",
+    "runtime-reflexes/templates/rough-edges.v1.md": "15ecb9d61df75f6f7134d0d58d39e3792ca217fecaec10216ed1a8f8e51bf779",
+    "sync-rules.md": "25df74ba7bf537e8d31eaf8d97f636f48667fe268b563bcab610f08b98a34649",
+    "verifier-contract.md": "c64c304f97ed1f3d226327bddd662e383dcc885eb53557293001c9b15a46ad85"
+  },
+  "template_baseline": "trusted",
+  "template_hashes": {
+    "adapters/claude.md": "cee9ef97b93171835315b4a248672d35223c6d8dc4a809d471ae15bd27f5c001",
+    "adapters/codex.md": "1b15e9fea824d004f770e3fc27175381974162f64d9673fc322b2ea8421785d8",
+    "agent-kernel.md": "e49b6a1b0195e6298f76f1b196ae72628365ab96169247e8ad086b0ec8669269",
+    "checkpoint-contract.md": "b16eae8ef20e57bc75a442094e7cdef115c2ae714130fc6d265ee921d44a5fbf",
+    "doctrine.md": "180acbbfe75225a6e4def0de57bda7ddbaa558a936f7185333074980861166e9",
+    "kernel.md": "5525097b237a889a73a9cf5e23ddc29b8f17d024cd91213ca2e5dc0b46db12c3",
+    "ledger-contract.md": "7398de47dc254bf68cae559ed9cef7fc6b4e1e738d30e1b755d4a3d973938bab",
+    "memory-contract.md": "511e59a313f3a863e9e0122856cc2e231366e0e9e5fad7622a753fb19cdab9a8",
+    "runtime-reflexes/rules/rough-edges.v1.json": "5a71298c4bc36426f27f4e599e688f9ce6b08d2ff191c794c17d2a249f8d0c97",
+    "runtime-reflexes/templates/rough-edges.v1.md": "15ecb9d61df75f6f7134d0d58d39e3792ca217fecaec10216ed1a8f8e51bf779",
+    "sync-rules.md": "25df74ba7bf537e8d31eaf8d97f636f48667fe268b563bcab610f08b98a34649",
+    "verifier-contract.md": "c64c304f97ed1f3d226327bddd662e383dcc885eb53557293001c9b15a46ad85"
+  }
+}

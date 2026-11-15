@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "template_id": "cross-brand-audit",
+  "name": "Cross-Brand Audit",
+  "summary": "A reusable paired Codex/Claude read-only audit with peer interrogation and orchestrator closeout.",
+  "max_rounds": 2,
+  "combo": {
+    "version": 1,
+    "description": "Fan out cross-brand scans, challenge each report with the peer's blind spots, then consolidate and close review reports explicitly.",
+    "roles": {
+      "codex_auditor": {
+        "allowed_brands": ["codex"],
+        "default": "codex",
+        "profile_by_brand": {
+          "codex": "codex-scan"
+        }
+      },
+      "claude_auditor": {
+        "allowed_brands": ["claude"],
+        "default": "claude",
+        "profile_by_brand": {
+          "claude": "claude-scan"
+        }
+      },
+      "interrogator": {
+        "allowed_brands": ["codex", "claude"],
+        "default": "codex",
+        "profile_by_brand": {
+          "codex": "codex-scan",
+          "claude": "claude-scan"
+        }
+      }
+    },
+    "cross_model": [["codex_auditor", "claude_auditor"]],
+    "artifact_aliases": {
+      "codex-audit.md": "phase.codex-scan.final",
+      "claude-audit.md": "phase.claude-scan.final",
+      "interrogation.md": "phase.peer-interrogate.final",
+      "audit-rollup.md": "phase.rollup.final"
+    }
+  },
+  "phases": [
+    {
+      "id": "codex-scan",
+      "title": "Codex Audit",
+      "lane": "review",
+      "role": "auditor",
+      "combo_role": "codex_auditor",
+      "profile": "codex-scan",
+      "action": "Launch a read-only Codex audit over the assigned scope.",
+      "command": "uaf delegate --mission {{mission_id}} --lane review --scope \"<audit scope>\" --detach --profile {{profile}} --report",
+      "verifier": "Worker report includes findings, evidence inspected, limits, and recommended verdict.",
+      "stop_condition": "Codex report is bridged into the ledger."
+    },
+    {
+      "id": "claude-scan",
+      "title": "Claude Audit",
+      "lane": "review",
+      "role": "auditor",
+      "combo_role": "claude_auditor",
+      "profile": "claude-scan",
+      "action": "Launch a read-only Claude audit over the assigned scope.",
+      "command": "uaf delegate --mission {{mission_id}} --lane review --scope \"<audit scope>\" --detach --profile {{profile}} --report",
+      "verifier": "Worker report includes findings, evidence inspected, limits, and recommended verdict.",
+      "stop_condition": "Claude report is bridged into the ledger."
+    },
+    {
+      "id": "peer-interrogate",
+      "title": "Peer Interrogation",
+      "lane": "redteam",
+      "role": "reviewer",
+      "combo_role": "interrogator",
+      "profile": "codex-scan",
+      "action": "Ask each brand to address the strongest contrary or missing findings from the other brand.",
+      "command": "uaf runtime message --latest --from orchestrator --message \"Compare your report against the peer report and state what you missed, concede, or dispute with evidence.\" --detach",
+      "verifier": "Interrogation responses are bridged and reviewed as claims.",
+      "stop_condition": "Disputed and conceded findings are explicit."
+    },
+    {
+      "id": "rollup",
+      "title": "Audit Rollup",
+      "lane": "meta-control",
+      "role": "orchestrator",
+      "action": "Consolidate accepted findings into a severity-ordered plan and close every worker report with a decision.",
+      "command": "uaf review close --latest --mission {{mission_id}} --verdict approved|changes_requested|blocked|rejected --summary \"<reviewed findings>\"",
+      "verifier": "Every worker report has an orchestrator decision, and accepted fixes have verifier targets.",
+      "stop_condition": "The audit can drive implementation without unresolved report queues."
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "template_id": "doctrine-compliance",
+  "name": "Doctrine Compliance",
+  "summary": "A cross-brand combo that probes whether a worker follows the UAF kernel and verifier-first doctrine.",
+  "max_rounds": 1,
+  "combo": {
+    "version": 1,
+    "description": "Native successor to Podium's TOMA compliance combo. One brand performs a bounded mission; the opposite brand judges the report against UAF doctrine.",
+    "roles": {
+      "builder": {
+        "allowed_brands": ["claude", "codex"],
+        "default": "claude"
+      },
+      "reviewer": {
+        "allowed_brands": ["codex", "claude"],
+        "default": "codex",
+        "profile_by_brand": {
+          "codex": "codex-scan",
+          "claude": "claude-scan"
+        }
+      }
+    },
+    "cross_model": [["builder", "reviewer"]],
+    "artifact_aliases": {
+      "run.md": "phase.probe.final",
+      "verdict.md": "phase.judge.final",
+      "final.md": "phase.judge.final"
+    }
+  },
+  "phases": [
+    {
+      "id": "probe",
+      "title": "Doctrine Probe",
+      "lane": "implement",
+      "role": "worker",
+      "combo_role": "builder",
+      "profile": "claude-wsl",
+      "action": "Launch a bounded worker mission that must follow the UAF kernel, report evidence, and avoid final completion claims.",
+      "command": "uaf delegate --mission {{mission_id}} --lane implement --scope \"<doctrine probe scope>\" --launch --profile {{profile}} --report --timeout-ms 0",
+      "verifier": "Worker report exists and remains local evidence only.",
+      "stop_condition": "Probe worker report is available for cross-brand judgment."
+    },
+    {
+      "id": "judge",
+      "title": "Cross-Brand Doctrine Judge",
+      "lane": "redteam",
+      "role": "reviewer",
+      "combo_role": "reviewer",
+      "profile": "codex-scan",
+      "action": "Have the opposite brand judge the probe report against UAF doctrine, evidence rules, and worker boundaries.",
+      "command": "uaf adversarial-review --from codex --brand {{combo_brand}} --mission {{mission_id}} --scope \"<probe report event or artifact>\" --prompt \"Judge whether the worker followed UAF doctrine. Check verifier-first behavior, local-vs-integrated claims, scope discipline, and evidence quality. Findings first; verdict approved, changes_requested, needs_review, or invalid.\" --profile {{profile}} --timeout-ms 0",
+      "verifier": "Judge report is reviewed and accepted or converted into changes requested.",
+      "stop_condition": "Cross-brand compliance verdict is recorded."
+    }
+  ]
+}

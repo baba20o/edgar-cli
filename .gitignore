@@ -8,3 +8,42 @@ __pycache__/
 .coverage
 dist/
 build/
+
+# Local environment variants (keep the distributable example)
+.env.*
+!.env.example
+
+# Python test, coverage and analysis output
+.coverage.*
+htmlcov/
+/coverage.xml
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# Repository-local EDGAR runtime data
+/.edgar/
+/.edgar_cache/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# UAF local coordination artifacts
+# UAF-GITIGNORE-START
+.uaf/.lock
+.uaf/.lock.reclaim
+.uaf/cache/
+.uaf/exports/
+.uaf/.tmp/
+.uaf/runtime/
+.uaf/inbox/
+.uaf/workflows/
+.uaf/conversations/
+.uaf/contacts/
+.uaf/context/
+.uaf/observers/
+.uaf/quarantine/
+.uaf/uaf.local.json
+# UAF-GITIGNORE-END

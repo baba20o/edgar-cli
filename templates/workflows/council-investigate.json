@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "template_id": "council-investigate",
+  "name": "Council Investigate",
+  "summary": "A multi-agent investigation workflow for absorption, design, or architecture decisions.",
+  "max_rounds": 2,
+  "combo": {
+    "version": 1,
+    "description": "Read-only mixed-model investigation with independent perspectives, synthesis, adversarial review, and final planning.",
+    "roles": {
+      "analyst": {
+        "allowed_brands": ["codex", "claude"],
+        "default": "codex",
+        "profile_by_brand": {
+          "codex": "codex-scan",
+          "claude": "claude-scan"
+        }
+      },
+      "reviewer": {
+        "allowed_brands": ["claude", "codex"],
+        "default": "claude",
+        "profile_by_brand": {
+          "codex": "codex-scan",
+          "claude": "claude-scan"
+        }
+      },
+      "critic": {
+        "allowed_brands": ["claude", "codex"],
+        "default": "claude",
+        "profile_by_brand": {
+          "codex": "codex-scan",
+          "claude": "claude-scan"
+        }
+      },
+      "rollup": {
+        "allowed_brands": ["codex", "claude"],
+        "default": "codex",
+        "profile_by_brand": {
+          "codex": "codex-scan",
+          "claude": "claude-scan"
+        }
+      }
+    },
+    "cross_model": [["analyst", "critic"]],
+    "artifact_aliases": {
+      "codex-perspective.md": "phase.scan-codex.final",
+      "claude-perspective.md": "phase.scan-claude.final",
+      "review.md": "phase.redteam.final",
+      "final.md": "phase.plan.final"
+    }
+  },
+  "phases": [
+    {
+      "id": "scan-codex",
+      "title": "Codex Scan",
+      "lane": "atlas",
+      "role": "investigator",
+      "combo_role": "analyst",
+      "profile": "codex-scan",
+      "action": "Launch a read-only Codex scan over configured external mounts.",
+      "command": "uaf delegate --mission {{mission_id}} --lane atlas --scope \"<scan scope>\" --launch --profile {{profile}} --report",
+      "verifier": "Worker report names inspected sources, evidence, limits, and absorption candidates.",
+      "stop_condition": "Codex scan report is imported or bridged."
+    },
+    {
+      "id": "scan-claude",
+      "title": "Claude Scan",
+      "lane": "atlas",
+      "role": "investigator",
+      "combo_role": "reviewer",
+      "profile": "claude-scan",
+      "action": "Launch a read-only Claude scan over configured external mounts.",
+      "command": "uaf delegate --mission {{mission_id}} --lane atlas --scope \"<scan scope>\" --launch --profile {{profile}} --report --timeout-ms 0",
+      "verifier": "Worker report names inspected sources, evidence, limits, and absorption candidates.",
+      "stop_condition": "Claude scan report is imported or bridged."
+    },
+    {
+      "id": "redteam",
+      "title": "Adversarial Synthesis",
+      "lane": "redteam",
+      "role": "reviewer",
+      "combo_role": "critic",
+      "profile": "claude-scan",
+      "action": "Use the selected critic brand to challenge the overlap, duplication risk, unsafe imports, and false-rigor failure modes.",
+      "command": "uaf adversarial-review --from codex --brand {{combo_brand}} --mission {{mission_id}} --scope \"<analysis scope>\" --prompt \"Adversarially review the absorption matrix and push back on duplication, unsafe imports, false rigor, and missing verifier contracts.\" --profile {{profile}} --timeout-ms 0",
+      "verifier": "Red-team report is reviewed and accepted or converted into change requests.",
+      "stop_condition": "Absorption risks are triaged."
+    },
+    {
+      "id": "matrix",
+      "title": "Absorption Matrix",
+      "lane": "meta-control",
+      "role": "orchestrator",
+      "action": "Turn source findings into keep, absorb, defer, or reject decisions.",
+      "command": "uaf ops --mission {{mission_id}}",
+      "verifier": "Decisions include scope, owner surface, verifier, and explicit non-goals.",
+      "stop_condition": "Matrix can drive implementation without reopening the whole scan."
+    },
+    {
+      "id": "plan",
+      "title": "Implementation Plan",
+      "lane": "meta-control",
+      "role": "orchestrator",
+      "combo_role": "rollup",
+      "profile": "codex-scan",
+      "action": "Break accepted candidates into implementation phases and verifier gates.",
+      "command": "uaf workflow start --template implement-review-fix --mission {{mission_id}} --summary \"Implement accepted absorption candidates\"",
+      "verifier": "Plan has bounded phases and a test/review closeout path.",
+      "stop_condition": "Implementation workflow is ready."
+    }
+  ]
+}

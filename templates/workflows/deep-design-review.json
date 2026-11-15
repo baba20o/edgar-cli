@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "template_id": "deep-design-review",
+  "name": "Deep Design Review",
+  "summary": "A read-only combo for design analysis, critique, and adversarial review before implementation.",
+  "max_rounds": 1,
+  "combo": {
+    "version": 1,
+    "description": "Podium-inspired analysis -> critique -> review combo for architecture, design, and absorption decisions.",
+    "roles": {
+      "analyst": {
+        "allowed_brands": ["codex", "claude"],
+        "default": "codex",
+        "profile_by_brand": {
+          "codex": "codex-scan",
+          "claude": "claude-scan"
+        }
+      },
+      "critic": {
+        "allowed_brands": ["codex", "claude"],
+        "default": "codex",
+        "profile_by_brand": {
+          "codex": "codex-scan",
+          "claude": "claude-scan"
+        }
+      },
+      "reviewer": {
+        "allowed_brands": ["claude", "codex"],
+        "default": "claude",
+        "profile_by_brand": {
+          "codex": "codex-scan",
+          "claude": "claude-scan"
+        }
+      }
+    },
+    "artifact_aliases": {
+      "analysis.md": "phase.analysis.final",
+      "critique.md": "phase.critique.final",
+      "review.md": "phase.review.final",
+      "final.md": "phase.review.final"
+    }
+  },
+  "phases": [
+    {
+      "id": "analysis",
+      "title": "Design Analysis",
+      "lane": "atlas",
+      "role": "analyst",
+      "combo_role": "analyst",
+      "profile": "codex-scan",
+      "action": "Analyze the target design, constraints, risks, and implementation options without editing files.",
+      "command": "uaf delegate --mission {{mission_id}} --lane atlas --scope \"<design scope>\" --launch --profile {{profile}} --report --timeout-ms 0",
+      "verifier": "Analysis report cites inspected files, decisions, risks, and recommended path.",
+      "stop_condition": "Analysis report is reviewed or bridged into the mission."
+    },
+    {
+      "id": "critique",
+      "title": "Design Critique",
+      "lane": "redteam",
+      "role": "critic",
+      "combo_role": "critic",
+      "profile": "codex-scan",
+      "action": "Challenge the analysis for hidden assumptions, duplication, unsafe scope, and weak verifiers.",
+      "command": "uaf delegate --mission {{mission_id}} --lane redteam --scope \"<analysis artifact or design scope>\" --launch --profile {{profile}} --report --timeout-ms 0",
+      "verifier": "Critique report identifies blockers, tradeoffs, and false-rigor risks.",
+      "stop_condition": "Critique is accepted, rejected, or converted into requested changes."
+    },
+    {
+      "id": "review",
+      "title": "Adversarial Review",
+      "lane": "review",
+      "role": "reviewer",
+      "combo_role": "reviewer",
+      "profile": "claude-scan",
+      "action": "Use the selected reviewer brand to review the analysis and critique, then recommend proceed, revise, or stop.",
+      "command": "uaf adversarial-review --from codex --brand {{combo_brand}} --mission {{mission_id}} --scope \"<design scope>\" --prompt \"Review the design analysis and critique. Findings first. Decide whether implementation should proceed, be revised, or stop.\" --profile {{profile}} --timeout-ms 0",
+      "verifier": "Reviewer verdict is recorded and orchestrator decision accepts or requests changes.",
+      "stop_condition": "No untriaged design blocker remains."
+    }
+  ]
+}
