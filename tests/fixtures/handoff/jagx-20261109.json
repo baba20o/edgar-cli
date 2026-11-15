@@ -1,0 +1,16 @@
+{
+  "source_url": "https://www.sec.gov/Archives/edgar/data/1585608/000119312526452741/d169732d424b5.htm",
+  "accession": "0001193125-26-452741",
+  "cik": "1585608",
+  "form": "424B5",
+  "retrieved_date": "2026-11-15",
+  "raw_sha256": "83dba067c0683a3e671a975115b957ccd63f20a62f861ddff14d49c00a3b6db4",
+  "transformation": "edgar.filing_text.document_to_text; paragraphs selected by literal regression terms; no numeric edits",
+  "paragraphs": [
+    "142,535 shares of common stock with dividend rights (the \"Eligible Warrants\") outstanding, at the close of business on October 13, 2026 (the \"Record Date\") (the \"Series R Preferred Stock Dividend\"). The ex-dividend date for the Series R Preferred Stock Dividend, as determined by Nasdaq, was October 16, 2026. The Series R Preferred Stock Dividend was paid as of the close of business on October 15, 2026.",
+    "Pursuant to the terms of the Series R Certificate of Designation, on November 2, 2026, each of the then outstanding shares of Series R Preferred Stock automatically converted into five shares of the Company's common stock (the \"Conversion\"). Immediately upon completion of the Conversion, there were approximately 13,345,986 shares of common stock issued and outstanding.",
+    "13,345,986 shares",
+    "The number of shares of our common stock to be outstanding after this offering is based on 13,345,986 shares of our voting common stock and no shares of our non-voting common stock outstanding as of November 4, 2026, and excludes the following:",
+    "On October 2, 2026, the Company announced that its board of directors declared a special one-time dividend of one share of Series R Preferred Stock for each one share of common stock outstanding, plus each one share issuable upon exercise of certain warrants and pre-funded warrants to purchase, in aggregate, up to 142,535 shares of common stock with dividend rights (the \"Eligible Warrants\") outstanding, at the close of business on October 13, 2026 (the \"Record Date\") (the \"Series R Preferred Stock Dividend\"). The ex-dividend date for the Series R Preferred Stock Dividend, as determined by Nasdaq, was October 16, 2026. The Series R Preferred Stock Dividend was paid as of the close of business on October 15, 2026."
+  ]
+}

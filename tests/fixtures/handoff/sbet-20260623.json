@@ -1,0 +1,14 @@
+{
+  "source_url": "https://www.sec.gov/Archives/edgar/data/1981535/000149315226029734/form424b5.htm",
+  "accession": "0001493152-26-029734",
+  "cik": "1981535",
+  "form": "424B5",
+  "retrieved_date": "2026-11-15",
+  "raw_sha256": "d02d82f98f6f5f3bbcbcfd5472b48a77505d7e5e2b131def020e8a4fed9d877f",
+  "transformation": "edgar.filing_text.document_to_text; paragraphs selected by literal regression terms; no numeric edits",
+  "paragraphs": [
+    "202,382,019 shares of Common Stock.",
+    "Unless otherwise indicated, the number of shares of Common Stock to be outstanding after this offering is based on 202,382,019 shares of Common Stock outstanding as of June 18, 2026, and assumes no exercise of the Warrants being offered in this Offering. The number of shares of Common Stock outstanding after this offering also excludes:",
+    "\u25cf 11,762,236 shares of Common Stock underlying outstanding warrants (including 5,542,952 pre-funded warrants)."
+  ]
+}

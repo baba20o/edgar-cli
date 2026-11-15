@@ -52,6 +52,11 @@ def parse_form4_xml(xml_bytes: bytes | str) -> dict:
     except ET.ParseError as exc:
         return {"error": f"Form 4 XML parse error: {exc}"}
 
+    if root.tag.split("}")[-1] != "ownershipDocument":
+        return {"error": "Expected an ownershipDocument XML root for Form 3/4/5"}
+    for element in root.iter():
+        element.tag = element.tag.split("}")[-1]
+
     def _text(el, path):
         node = el.find(path) if el is not None else None
         if node is None:
@@ -191,6 +196,8 @@ def _parse_transaction(tx, derivative: bool = False) -> dict:
         "price_per_share": price,
         "transaction_value": value,
         "shares_after": _f(shares_after_raw),
+        "ownership": _v(tx, "ownershipNature/directOrIndirectOwnership"),
+        "nature_of_ownership": _v(tx, "ownershipNature/natureOfOwnership"),
         "is_derivative": derivative,
     }
 

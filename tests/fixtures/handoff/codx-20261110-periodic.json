@@ -1,0 +1,19 @@
+{
+  "source_url": "https://www.sec.gov/Archives/edgar/data/1692415/000149315226050963/form10-q.htm",
+  "accession": "0001493152-26-050963",
+  "cik": "1692415",
+  "form": "10-Q",
+  "retrieved_date": "2026-11-15",
+  "raw_sha256": "ceac80f76deeed5b498c5cb36d7ff4f1cd243f9c43088a7c32d66eb8cf6ed874",
+  "transformation": "document_to_text; selected exact normalized paragraphs by regression terms",
+  "paragraphs": [
+    "As of November 6, 2026, there were 10,512,190 shares of common stock, par value $0.001 per share, outstanding.",
+    "Cash and cash equivalents $ 714,803 $ 11,884,607",
+    "Net cash used in operating activities (20,683,301 ) (22,937,629 )",
+    "Cash and cash equivalents at end of period $ 714,803 $ 11,443,943",
+    "Cash $ 714,803 $ - $ 714,803 $ 714,803 $ -",
+    "Total $ 714,803 $ - $ 714,803 $ 714,803 $ -",
+    "Note 13 - Subsequent Events",
+    "Subsequent to September 30, 2026, the Company entered into a senior secured convertible debt financing arrangement with J.J. Astor & Co., pursuant to which the Company received approximately $2.0 million in initial net cash proceeds before other transaction expenses. The financing provides for up to an additional $1.0 million in funding, subject to the satisfaction of specified conditions. The financing imposes certain restrictions on the Company's liquidity, including minimum cash requirements, installment payment obligations and the application of proceeds from sales under the Company's at-the-market equity offering program toward repayment of the indebtedness. As a result, the proceeds available to the Company from future sales under its at-the-market program may be substantially reduced. Although this financing provided additional near-term liquidity, the Company will require additional capital to fund its ongoing operations, and there can be no assurance that additional financing will be available on acceptable terms, or at all."
+  ]
+}

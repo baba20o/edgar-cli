@@ -1,0 +1,15 @@
+{
+  "source_url": "https://www.sec.gov/Archives/edgar/data/1981535/000164117225013081/ex99-1.htm",
+  "accession": "0001641172-25-013081",
+  "cik": "1981535",
+  "form": "EX-99.1",
+  "filed": "2025-05-30",
+  "retrieved_date": "2026-11-15",
+  "raw_sha256": "7411092b1963a85d8ea8ea2c3f94a85a152854360ec6ab3ea6ce07d86d88ed67",
+  "transformation": "document_to_text; selected paragraph excerpts",
+  "paragraphs": [
+    "MINNEAPOLIS - May 27, 2025 - SharpLink Gaming, Inc. (NASDAQ:SBET) (the \"Company\" or \"SharpLink\") today announced that it has entered into securities purchase agreements for a private investment in public equity (PIPE) for the purchase and sale of 69,100,313 shares of common stock (or common stock equivalents in lieu thereof) at a price of $6.15 per share ($6.72 per share for certain members of the Company's management team), for expected aggregate gross proceeds of approximately $425,000,000, before deducting placement agent fees and other offering expenses.",
+    "The closing of the offering is expected to occur on or about May 29, 2025, subject to the satisfaction of customary closing conditions. The Company intends to use the funds to acquire the native cryptocurrency of the Ethereum blockchain commonly referred to as \"ETH\" pending identification of working capital needs and other general corporate purposes. ETH will serve as the Company's primary treasury reserve asset.",
+    "A.G.P./Alliance Global Partners is acting as the sole placement agent in connection with the offering."
+  ]
+}
