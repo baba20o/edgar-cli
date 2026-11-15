@@ -53,7 +53,7 @@ edgar metrics AAPL --bundle revenue,net_income | jq '{schema_version, cache}'
 edgar concept NVDA revenue --limit 1 --cite | jq '.facts[].citation'
 # "NVIDIA CORP FY2026 10-K · 0001045810-26-000021 · filed 2026-02-25"
 
-# Point-in-time queries. Eliminates look-ahead bias for backtests.
+# Point-in-time queries filter SEC filings and facts by availability.
 edgar concept NVDA revenue --as-of 2024-01-01 | jq '.facts[0]'
 
 # Batch fan-out across one CLI invocation.
@@ -76,15 +76,16 @@ edgar pending --ndjson    # streams new filings since last drain
 | 4    | SEC outage / 403 / unavailable service |
 | 5    | Validation error (malformed input) |
 
-`events`, `insiders`, `text` and `dilution` still print their JSON envelope
+`events`, `insiders`, `text` and `dilution` print their JSON envelope
 when they have nothing to return, then exit 2: stdout carries a `hint` that
 says why (for example the forms the filer does file), stderr repeats it.
+An empty `feed` also exits 2; its JSON envelope retains coverage metadata.
 
 ### Envelope on every JSON response
 
 ```json
 {
-  "schema_version": "1.2.0",
+  "schema_version": "1.3.0",
   "cli_version": "0.1.0",
   "cache": {"calls": 10, "hits": 7, "misses": 3, "ttl_min_remaining": 52867,
             "last_key": "...", "last_hit": false, "last_etag": null},
@@ -228,6 +229,57 @@ edgar metrics OMH --bundle revenue  # warns when SEC's XBRL API lags a filing
   in it is inferred, and share counts are never adjusted across a split.
   `--since`, `--max-filings` and `--max-supplements` bound what is read.
 
+### Share supply and forensics
+
+```bash
+edgar dilution CODX --include-periodic --include-shelf
+edgar float CODX --as-of 2026-11-15 --price 2.10
+edgar forensics CODX --price 2.10 --high-60d 3.25
+edgar forensics SBET --as-of 2025-05-30T21:00:00Z --max-filings 10
+edgar schema float
+edgar schema forensics
+```
+
+`dilution` separates outstanding-share statements from shares underlying
+warrants or other derivatives, retains pre-offering baselines, and warns about
+large unexplained disagreements with XBRL share counts. It extracts I.B.6 / I.B.5
+baby-shelf disclosures without treating smaller-reporting-company thresholds as
+capacity. The `agents` section preserves named placement/sales agents,
+underwriters, equity-line investors and stated commissions.
+
+Offering rows carry sentence-scoped `closing_status`, any stated closing date,
+and registration language. An earlier announcement can be superseded by a later
+closing; these fields do not establish current tradeability. Registration rows
+retain EFFECT, POS AM, withdrawal requests and rescissions. An RW alone does
+not prove that the entire registration was withdrawn.
+
+`--include-periodic` reads financing, equity, warrant and liquidity sentences
+from the latest periodic report. `--include-shelf` reads the first 60 sentences
+of eligible registrations without supplements. These are bounded text scans;
+`filings_read`, `filings_not_read` and individual errors describe the coverage.
+
+`float` returns separate dated XBRL and filing-stated share counts, non-affiliate
+shares when explicitly disclosed, EntityPublicFloat in dollars, closed issuance
+evidence after the selected share-count baseline, pending/ambiguous offering
+evidence, and recent 13D/G and officer/director holdings. Overlapping beneficial
+ownership and different share classes are not summed into an inferred float.
+
+`forensics` combines entity metadata, share supply, shelf capacity, warrant
+statements, cash-runway scenarios and recent events in one JSON envelope. It
+uses four workers sharing a rate limiter, document cache and per-call request
+memo. Both commands expose `--max-filings` (default 10), `--max-supplements`
+(default 3), `--max-ownership-filings` (default 5), `--include-periodic` and
+`--include-shelf` to control scope. The Python `float` API defaults are broader
+(25 current reports and 10 ownership filings).
+
+Prices are caller-supplied USD scenarios, not market data. `--high-60d` takes
+precedence over `--price` for the baby-shelf scenario; it does not verify the
+60-day price window. Calculations include formulas, dated inputs, caveats and
+missing-input explanations. See [definitions](docs/definitions.md) and the
+[handoff implementation report](docs/handoff-implementation.md) for corrected
+source claims and limits. `performance.elapsed_ms` measures the API call;
+latency depends on scan bounds, cache state and SEC responses.
+
 ### Concepts
 
 ```bash
@@ -246,6 +298,11 @@ edgar diff AAPL MSFT --concept revenue --periods 3  # period-aligned
 `compare` and `diff` align on `frame`/`calendar_period` so filers with
 different fiscal calendars (AAPL FY ends Sep, MSFT FY ends Jun) still pair on
 the same row.
+
+Core aliases append `ifrs-full` candidates after existing US-GAAP/DEI
+candidates. Reported currencies are preserved; no currency conversion is
+performed. IFRS `NumberOfSharesOutstanding` is a share count; `IssuedCapital`
+is monetary and is not used for shares.
 
 ### Computed metrics — formula + provenance
 
@@ -294,10 +351,32 @@ edgar amendments AAPL --since 2025-01-01                  # primary↔/A pairs
 edgar delta NVDA --use-state                              # new + restated since last fetch
 ```
 
-Add `--as-of YYYY-MM-DD` to `concept`, `compare`, `diff`, `ttm`, `ratios`,
-`trend`, `growth`, or `reconstruct` to filter to facts filed on or before
-that date — eliminates look-ahead bias. `delta` has no `--as-of`; scope it
-with `--since YYYY-MM-DD` or `--use-state`.
+`--as-of` accepts a calendar date or an ISO timestamp with `Z` or an
+explicit UTC offset. It is available on `company`, `filings`, `text`, `events`,
+`dilution`, `insiders`, `metrics`, `brief`, `dashboard`, `float`, `forensics`,
+and the existing concept/computed-metric commands.
+
+```bash
+edgar dilution CODX --as-of 2026-10-13T06:00:00-04:00
+edgar metrics CODX --bundle cash,debt --as-of 2026-10-13T10:00:00Z
+```
+
+Dates include the entire UTC day. Intraday queries use SEC acceptance time,
+including for XBRL facts joined to their filing accession; if acceptance time
+is unavailable, the filing date must be earlier than the previous UTC day
+(one full extra calendar day of margin). An exhibit's
+older dateline does not make it available before the parent SEC filing.
+Historical submission chunks are searched for replay, and unavailable chunks
+produce coverage warnings. Failed submissions lookups fail closed for facts;
+incomplete history excludes unknown-accession facts from intraday replay.
+Explicit accessions obey the cutoff too.
+
+The response echoes normalized `as_of` and explains the policy in
+`point_in_time`. Entity names, ticker mappings and other current SEC metadata
+are not reconstructed historically. This isolates filing/fact availability;
+it does not reconstruct a historical exchange universe or unfiled issuer news.
+`--as-of` cannot be combined with `--since-last-fetch`. `delta` has no
+`--as-of`; scope it with `--since YYYY-MM-DD` or `--use-state`.
 
 ### Search / mirror
 
@@ -327,7 +406,49 @@ edgar mark-seen AAPL 0000320193-26-000011 --form 8-K
 edgar subscribe remove AAPL --form 8-K
 ```
 
-State lives in `~/.edgar/state.json` keyed by `(cik, form)`.
+Watchlist state lives in `~/.edgar/state.json` keyed by `(cik, form)`.
+
+### Global recent-filings feed
+
+```bash
+edgar feed --forms 8-K,6-K,424B5 --since-minutes 15
+edgar feed --forms 8-K,6-K,424B5 --since-minutes 15 --use-state --ndjson
+edgar feed --max-pages 20 --use-state
+edgar schema feed
+```
+
+`feed` polls SEC's uncached current-filings Atom feed and joins the cached
+company ticker map. Rows include accession, CIK, form, filing URL and a UTC
+`acceptance_datetime` whose source is explicitly `atom.updated`. When a CIK
+maps to several share classes, `listings`, `tickers` and `exchanges` preserve
+that ambiguity instead of choosing one ticker.
+
+The source has a finite retention window. `coverage` reports whether the
+requested boundary was reached, pages read and any gap. `--max-pages` defaults
+to 10 (100 entries per page). A page cap, missing timestamp, ordering problem,
+parse failure or retention gap prevents cursor advancement. Unknown-time
+entries remain separate in `unresolved_filings`.
+
+With `--use-state`, cursors are scoped by the normalized form filter and stored
+in the same state file as watchlists. The CLI acknowledges only complete polls
+after output is successfully written and flushed. Timestamp ties and a
+`--since-minutes` overlap are deduplicated by accession/CIK; arrivals older than
+that overlap are not guaranteed. Python callers use `client.feed(...)` and
+then `edgar.feed.ack_feed(result)` after successful delivery. This is a bounded
+poller, not a complete historical filing archive or a delivery-time guarantee.
+
+Complete stateful polls save the time scanned through, including empty polls.
+This keeps a quiet form filter from losing continuity between polling windows.
+The full `--since-minutes` overlap is retained behind the prior watermark, even
+when polls are farther apart. An empty response cannot advance an older cursor
+across an unscanned gap.
+After investigating a retention gap, `edgar feed --forms RW --use-state --reset-state --since-minutes 60` explicitly discards only that form filter's
+cursor before a fresh lookback. Reset does not recover older undelivered filings;
+the output includes a warning. Other watchlist/subscription state is retained.
+
+Use a separate `get_client()` instance for each independent concurrent top-level
+Python request. Internal forensics workers share only the controlled cache,
+limiter and request snapshot; a client is not a general concurrent-request API.
 
 ### Cache
 
@@ -339,8 +460,22 @@ edgar clear-cache
 ```
 
 The cache is endpoint-aware (ticker map 7d, companyfacts/concept 1d, frames
-90d, recent submissions 1h, 404s 1h). Conditional `If-None-Match` /
-`If-Modified-Since` requests refresh entries without re-downloading.
+90d, recent submissions 1h, 404s 1h, filing documents under
+`/Archives/edgar/data/` 30d). HTML, XML and byte consumers share the cached
+document bytes. Normalized filing text is also cached by exact source-content
+hash and parser version; source bytes are retrieved/revalidated before its use.
+Documents over 4 MiB are fetched but not stored; the LRU size
+bound still applies. Failed, empty and viewer-shell responses are not stored.
+Conditional `If-None-Match` / `If-Modified-Since` requests revalidate expired
+entries when validators are available.
+
+The 30-day TTL is a cache policy: SEC can correct or remove accepted documents.
+Use `--no-cache` to bypass document, normalized-text and JSON caches. Each document lookup,
+including failures and bypasses, contributes to the envelope's cache summary.
+Those counters describe logical lookups, not physical HTTP attempts: retries
+and conditional revalidation can send requests, and composite fact reads can
+be served from a prefetched companyfacts payload. Fresh cached document hits
+avoid both network access and rate-limiter waits.
 
 ### Other
 
@@ -363,8 +498,10 @@ edgar concept NVDA revenue --export-csv rev.csv     # CSV alongside JSON
 | `--json-output` / `-j` | Pretty JSON envelope (force) | Forced JSON |
 | `--ndjson` | Newline-delimited rows | Streaming, `jq`, `head` |
 
-NDJSON rows are flat and self-describing — each line carries enough metadata
-to be processed independently.
+NDJSON row commands emit self-describing records. `float` and `forensics`
+emit one complete nested envelope per line; their default output is JSON even
+on a TTY, and `--markdown` wraps that envelope in a JSON code block. Feed NDJSON
+contains filing rows; coverage warnings go to stderr.
 
 ## API scope
 
@@ -384,7 +521,7 @@ The authenticated EDGAR Next filer APIs are out of scope. Market-data ratios
 
 ```bash
 pip install -e ".[dev]"
-pytest tests/ -v
+python -E -m pytest tests/ -v
 python -m edgar --help
 ```
 
@@ -395,7 +532,7 @@ python -m edgar --help
 - Cache lives at `~/.edgar_cache`. Use `--no-cache` to bypass per call,
   `cache invalidate` for surgical busting, `--cache-max-mb` for LRU bound.
 - Filing commands search SEC's recent filing set by default; pass `--all`
-  to fetch historical chunks from `filings.files[]`.
+  for historical chunks. `--as-of` replay searches history automatically.
 - `concept` suggests similar issuer-specific tags when SEC returns 404.
 - `concept --deltas` skips adjacent rows with mismatched period lengths.
 - Exhibit downloads use the same User-Agent and shared rate limiter; so do
@@ -403,9 +540,13 @@ python -m edgar --help
 - Runs on Linux, macOS, WSL and Windows. The cache lock is `flock` on POSIX
   and a byte-range lock on Windows.
 - `acceptance_datetime` is UTC (SEC's filing index pages show US Eastern).
-- `events` classifies 8-Ks from item numbers and keywords, and 6-Ks from
-  their text; `dilution` reads text too. Both quote the sentence behind
-  every statement so a claim can be checked against the filing.
+- `events` combines 8-K item metadata with sentence evidence, excluding
+  forward-looking boilerplate and reading an EX-99 lead when the body only
+  incorporates a release. Item evidence is labeled separately from text
+  evidence. 6-Ks remain classified from their own text.
+- Text extraction has bounded coverage and can miss unfamiliar wording.
+  Dated evidence is retained; active warrant totals, legal resale eligibility
+  and current freely tradable float are not inferred.
 - Shipped-feature history and open ideas live in
   [docs/BACKLOG.md](docs/BACKLOG.md); live test-drive findings and their
   fixes in [docs/FINDINGS.md](docs/FINDINGS.md).

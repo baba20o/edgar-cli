@@ -3,7 +3,51 @@
 This tracks test-drive feedback and the next command ideas. Priorities favor
 misleading-output fixes before convenience features.
 
-## Last Shipped — Foreign Filers, Filing Text, Dilution
+## Current Implementation — Handoff Forensics (schema 1.3.0)
+
+The November 15 handoff is implemented in the working tree. Final verification
+and performance measurements are recorded in
+[handoff-implementation.md](handoff-implementation.md); the original
+[`handoff.md`](../handoff.md) is preserved.
+
+- **B1/B2:** derivative-underlying shares excluded from outstanding baselines;
+  pre-offering counts retained; I.B.6/I.B.5 capacity evidence separated from
+  filer-status boilerplate, with discrepancy warnings.
+- **B3:** shared raw-document cache for text/bytes/XML, 30-day artifact TTL,
+  bounded entries, conditional revalidation, no-cache bypass and telemetry.
+- **B4/B5:** 8-K sentence classification with item evidence and EX-99 fallback;
+  core IFRS alias fallbacks retaining currency and US-GAAP/DEI precedence.
+- **F1:** UTC date/intraday availability cutoffs for filings, XBRL and composite
+  research paths, including historical chunks and explicit accessions.
+- **F2:** named agents and commissions, sentence-scoped closing/registration
+  evidence, withdrawal/rescission histories, optional periodic/shelf reads.
+- **F3/F4:** baby-shelf and cash-runway scenarios with formula/input envelopes;
+  separate dated share-supply, beneficial-owner and insider evidence in `float`.
+- **F5:** four-worker `forensics` composite and bounded global Atom `feed`,
+  with output schemas and delivery-aware, form-scoped cursors.
+
+The handoff's permanent $75M exemption, zero-debt substitution, unconditional
+withdrawn status from RW, universal cold-latency guarantee and May 27 SEC
+availability of SBET's May 30 filing are not adopted. The report gives primary
+sources and corrected arithmetic.
+
+Remaining limits and follow-ups:
+
+- Extractor coverage remains heuristic; expand real filing fixtures across
+  more legacy ownership covers, ADS classes and unusual financing structures.
+- Active warrant balances and transaction identity across successive filings
+  require reconciliation beyond sentence extraction; current output preserves
+  evidence and uncertainty rather than inferring active totals.
+- Historical entity/ticker metadata and external issuer-news publication times
+  are not reconstructed by `--as-of`.
+- The current-filings Atom source is finite. A historical backfill source and
+  durable downstream acknowledgements would be needed for archive-grade
+  ingestion beyond the feed's retention window and overlap.
+- Full filing XBRL ingestion remains open when SEC companyfacts omits facts.
+- Measure performance for explicit scan bounds and cache states; four workers
+  do not remove SEC rate limits or parsing cost.
+
+## Previously Shipped — Foreign Filers, Filing Text, Dilution
 
 First real use on a foreign micro-cap (OMH, a 6-K / 20-F / F-3 filer)
 produced the second half of [FINDINGS.md](FINDINGS.md): six gaps, all
@@ -40,18 +84,9 @@ Open follow-ups from this pass:
   extracted instance document (`*_htm.xml`) carries the facts. A
   `--from-filing ACCESSION` path for `facts` / `concept` would close the
   gap the coverage warning only reports.
-- **`dilution` does not open the registration statement or the annual
-  report**: shelf size comes from what supplements say about it, and
-  going-concern language from supplements and current reports only. An
-  opt-in `--include-annual` / `--include-shelf` read would cover a filer
-  with a shelf but no takedown yet.
-- **`dilution` and the 6-K classifier are tuned on one filer's filings.**
-  At-the-market programs, convertible notes, underwritten offerings and the
-  8-K path are covered by patterns but were not exercised against live
-  filings. Add fixtures from two or three more filers (one domestic 8-K
-  filer with an ATM, one ADS issuer) before trusting recall.
-- **`events` on 8-Ks is still keyword snippets**, not sentences; moving it
-  to the sentence classifier would give domestic filers the same evidence.
+- **Periodic/shelf coverage and domestic 8-K classification:** addressed by
+  the current handoff implementation above. CODX, SBET and JAGX source excerpts
+  complement the original OMH fixtures; broader recall still needs more issuers.
 - **`research-cli-base`**: `FileCache.set` renames its temp file with
   `Path.rename`, which fails on Windows when the entry already exists.
   `edgar` does not call it (it has its own cache writes), but any other CLI
@@ -292,8 +327,8 @@ for the genuinely multi-day projects.
 - `edgar concept-info ALIAS_OR_TAG` shows candidate tags + label + freshness.
 
 **Point-in-time & audit**
-- `--as-of YYYY-MM-DD` on `concept` (and through `concept_alias`, `ttm`, `ratios`, `trend`, `growth`, `reconstruct`, `delta`) — eliminates look-ahead bias.
-- `--canonical` flag on `concept` unions across all candidate tags (deduped on `(start, end, accn)`).
+- `--as-of YYYY-MM-DD` on `concept` and computed-metric commands filters filing availability; UTC intraday support is described in the current handoff section. `delta` uses `--since` or `--use-state`.
+- `--canonical` flag on `concept` unions across candidate tags, retaining distinct units when deduplicating periods/accessions.
 - `edgar audit-trail TICKER -c CONCEPT --period CYxxxx` lists every filing reporting a fact, with restatement detection.
 - `edgar amendments TICKER --since DATE` pairs primary filings to their `/A` amendments.
 - `edgar delta TICKER [--use-state]` returns `{new_filings, restated_facts, summary}`.
@@ -424,7 +459,7 @@ agents on edge cases. Each has a brief note on what would be needed.
 
 ## Point-In-Time And Audit
 
-- [x] Add `--as-of YYYY-MM-DD` to every data command (concept, ttm, ratios, trend, growth, reconstruct, delta).
+- [x] Add date/UTC intraday `--as-of` to filing, concept, computed-metric and forensics research commands. `delta` uses `--since`/`--use-state`; the live feed has its own lookback and cursor.
 - [x] Add `edgar audit-trail TICKER --concept ALIAS --period CY2024` with restatement detection.
 - [x] Walk same-period sibling facts to populate `is_restated`, `superseded_by`, `latest_known_value`, and `prior_values` on every fact returned by `concept`.
 - [x] Add `edgar amendments TICKER --since YYYY-MM-DD` to chain primary filings to their `/A` amendments. (Reports the chain; section-level diff between amendment and primary is part of the deferred `edgar changes`.)
@@ -473,10 +508,13 @@ Foundation principle: every derived number returns `{value, formula, inputs:[{ta
 
 ## Cache And Delta
 
-Cache today is a flat 15-minute TTL. That is wrong on both sides — over-caches stable endpoints (frames, ticker map) and under-caches volatile ones (recent filings during earnings). It is also opaque: agents cannot tell hit from miss or reason about freshness. Delta detection does not exist as a primitive, so every long-running run is full-refresh.
+The original flat 15-minute cache was replaced by endpoint-specific TTLs,
+conditional revalidation and lookup telemetry. Filing document bytes now share
+that cache with a 30-day policy and a 4 MiB per-document storage cap; freshness
+is a policy rather than a guarantee that accepted documents never change.
 
 - [x] Add `cache` metadata to every JSON envelope: `{calls, hits, misses, age_max_seconds, age_min_seconds, ttl_min_remaining, last_key, last_hit, last_etag}`. Lets agents branch on freshness without a separate observability command.
-- [x] Endpoint-aware TTL defaults: ticker map 7d, companyfacts 1d, companyconcept 1d, frames 90d, recent submissions 1h, historical chunks 7d.
+- [x] Endpoint-aware TTL defaults: ticker map 7d, companyfacts 1d, companyconcept 1d, frames 90d, recent submissions 1h, historical chunks 7d, filing documents 30d.
 - [x] Conditional GET via `If-Modified-Since`/`If-None-Match` when SEC sends `Last-Modified`/`ETag`. On 304, extend TTL without re-downloading the body. Cuts SEC traffic 5-10× for typical agent workloads.
 - [x] Negative caching for 404s and 403s so typos and dead concepts do not burn rate-limit slots on every retry.
 - [x] Bounded cache with LRU eviction via `--cache-max-mb` constructor flag.
