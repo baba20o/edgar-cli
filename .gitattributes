@@ -1,0 +1,11 @@
+# Keep source and documentation consistent across Windows and Linux checkouts.
+* text=auto eol=lf
+
+# Historical evidence includes byte hashes; preserve the captured files exactly.
+/Insights/** -text
+/findings/** -text
+/CLI-ROUGH-EDGES.md -text
+
+# Newly authored navigation pages follow the normal documentation policy.
+/Insights/README.md text eol=lf
+/findings/README.md text eol=lf

@@ -30,6 +30,9 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
+# Downloaded historical filings; compact evidence and provenance remain tracked.
+/Insights/ai-infrastructure-2026-09-06/documents/
+
 # UAF local coordination artifacts
 # UAF-GITIGNORE-START
 .uaf/.lock
