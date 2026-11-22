@@ -134,6 +134,8 @@ Every concept/frame fact ships with:
 
 - `@dow30` — current Dow Jones 30 (static list)
 - `@sic:NNNN` — every filer in a SIC code (dynamic from the ticker map)
+- `@13f-top` — a curated, non-exhaustive list of large 13F filers (static
+  list; the default `holders` candidate set)
 
 `edgar resolve @dow30` expands a group to its concrete CIKs.
 
@@ -319,7 +321,16 @@ edgar trend NVDA --metric revenue --periods 8       # slope + label
 edgar growth NVDA --metric revenue --basis yoy,qoq,cagr3
 edgar reconstruct NVDA --metric ebitda              # ebitda|fcf|net_debt|nwc|tangible_book
 edgar brief AAPL                                    # profile + metrics + events
+edgar statements NVDA --statement balance           # income|balance|cash line items
+edgar quality NVDA                                  # earnings-quality flags
+edgar verify NVDA --period-type quarterly           # cross-statement consistency checks
 ```
+
+`statements`, `quality` and `verify` take `--period-type annual|quarterly|ytd`
+(default `annual`). `statements` anchors every line to one period end: a line
+with no fact, or whose fact falls outside that period, stays in `lines` with
+`value: null` and `missing: true` (`period_misaligned` when rejected), and
+`coverage` drops accordingly.
 
 `metrics --bundle` accepts named groups: `income-statement`,
 `balance-sheet`, `cash-flow`, `liquidity`, `capital-structure`, `quality`.
@@ -352,9 +363,10 @@ edgar delta NVDA --use-state                              # new + restated since
 ```
 
 `--as-of` accepts a calendar date or an ISO timestamp with `Z` or an
-explicit UTC offset. It is available on `company`, `filings`, `text`, `events`,
-`dilution`, `insiders`, `metrics`, `brief`, `dashboard`, `float`, `forensics`,
-and the existing concept/computed-metric commands.
+explicit UTC offset. It is available on `company`, `filings`, `text`, `item`,
+`events`, `dilution`, `insiders`, `metrics`, `brief`, `dashboard`, `float`,
+`forensics`, `statements`, `quality`, `verify`, and the existing
+concept/computed-metric commands.
 
 ```bash
 edgar dilution CODX --as-of 2026-10-13T06:00:00-04:00
@@ -387,8 +399,15 @@ edgar search "supply chain" --db ./edgar.sqlite       # local FTS5 over bodies
 edgar item NVDA --form 10-K --section "Risk Factors"  # one Item's body text
 edgar insiders NVDA --since 2026-01-01                # Form 4/5 aggregation, Form 3 statements
 edgar holdings BRK-A --top 10                         # 13F portfolio
+edgar holders AAPL --top 10                           # which 13F filers hold AAPL
 edgar governance AAPL                                 # DEF 14A extraction
 ```
+
+`holders` scans only a candidate set of 13F filers (`--candidates`, default
+`@13f-top`; at most `--max-filers`, default 30), not every institution. It
+matches each filer's latest 13F-HR (or `--quarter`) by issuer-name substring;
+`--cusip` also matches that CUSIP. `candidates_scanned` and
+`candidates_skipped` report coverage.
 
 Live EFTS searches default to the last 5 years (disclosed via
 `applied_default_since`; override with `--since 2001-01-01`) and return
